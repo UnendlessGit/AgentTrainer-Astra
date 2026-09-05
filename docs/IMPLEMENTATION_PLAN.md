@@ -17,8 +17,8 @@ The user's full requested scope remains active. A passing component check or a p
 
 | Area | Required evidence | Status |
 |---|---|---|
-| Independence | Baseline Git commit precedes original audit; audit coverage and reconciliation | Pending |
-| Original integrity | Original source/Git state unchanged by Astra work | Pending |
+| Independence | Baseline Git commit precedes original audit; audit coverage and reconciliation | Baseline 505ec37; complete audit mapped in LEGACY_AUDIT.md; ADR 0002 |
+| Original integrity | Original source/Git state unchanged by Astra work | 57 tracked hashes match, HEAD unchanged and Git clean after audit; recheck at release |
 | Build | Clean native and Python build; reproducible locked dependencies | Pending |
 | Packaging | Installed app has all MLX/native/Metal resources; no developer-machine runtime dependencies | Pending |
 | Capture/control | Window/app/display/desktop sources; geometry; monotonic timing; actual input effects | Pending |
@@ -53,4 +53,4 @@ The user's full requested scope remains active. A passing component check or a p
 
 ## Current state
 
-The independent baseline has been written. Its first commit and the original audit are the next work. No application or learning workflow has been implemented or verified yet.
+The independent baseline was committed/pushed as 505ec37 before original inspection. Source/documentation/test audit and isolated release-UI observation are complete; ADR 0002 records product additions. MLX 0.32.2 performs real Conv/GRU gradient updates on this Mac (see verification/initial-mlx-probe.md). Native application and full learning workflows remain unimplemented; next is the platform/data contract foundation and packaged-runtime qualification.
