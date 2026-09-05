@@ -19,8 +19,8 @@ The user's full requested scope remains active. A passing component check or a p
 |---|---|---|
 | Independence | Baseline Git commit precedes original audit; audit coverage and reconciliation | Baseline 505ec37; complete audit mapped in LEGACY_AUDIT.md; ADR 0002 |
 | Original integrity | Original source/Git state unchanged by Astra work | 57 tracked hashes match, HEAD unchanged and Git clean after audit; recheck at release |
-| Build | Clean native and Python build; reproducible locked dependencies | Pending |
-| Packaging | Installed app has all MLX/native/Metal resources; no developer-machine runtime dependencies | Pending |
+| Build | Clean native and Python build; reproducible locked dependencies | Foundation builds; uv.lock; 13 Swift + 8 Python checks pass. Final clean release pending |
+| Packaging | Installed app has all MLX/native/Metal resources; no developer-machine runtime dependencies | Frozen diagnostic helper passes offline Metal/GRU/NumPy/IPC inside signed development bundle; full workflows pending |
 | Capture/control | Window/app/display/desktop sources; geometry; monotonic timing; actual input effects | Pending |
 | Permissions | Denied/granted/revoked behavior and installed-bundle helper attribution | Pending |
 | Cleanup | UI/helper/actor/learner failures, emergency stop, takeover, sleep; no remaining owned holds or stale commands | Pending |
@@ -53,4 +53,6 @@ The user's full requested scope remains active. A passing component check or a p
 
 ## Current state
 
-The independent baseline was committed/pushed as 505ec37 before original inspection. Source/documentation/test audit and isolated release-UI observation are complete; ADR 0002 records product additions. MLX 0.32.2 performs real Conv/GRU gradient updates on this Mac (see verification/initial-mlx-probe.md). Native application and full learning workflows remain unimplemented; next is the platform/data contract foundation and packaged-runtime qualification.
+The baseline and complete audit are committed/pushed (505ec37, cdd0f4c); do not restart that work. The foundation now includes SwiftUI agent/library navigation and durable agent creation, native geometry/action/lease/IPC contracts, checksummed lossless frame blocks with prefix recovery, serialized SQLite transactions/backups, and a frozen MLX diagnostic helper. See verification/native-foundation.md for exact checks and limits.
+
+Next: implement native capture/input helper and bounded transport/recording sessions; replace the empty development workspace sections with real workflows; implement the actual default ConvNeXt/detail/GRU policy, timed-action canonicalizer/distribution, BC/PPO engines, checkpoint/evaluation infrastructure, and full UI. The compute helper currently advertises diagnostics only; it does not implement training/inference yet. No end-to-end recording/learning/control gate or release DMG is complete. Parallel audit work was used; later collaboration resumption returned an agent-thread limit, so primary work continues without relying on unavailable agents.

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.unendless.agenttrainer.astra</string>
+  <key>CFBundleName</key><string>AgentTrainer Astra</string>
+  <key>CFBundleDisplayName</key><string>AgentTrainer Astra</string>
+  <key>CFBundleExecutable</key><string>AgentTrainerAstra</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>LSMinimumSystemVersion</key><string>15.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSScreenCaptureUsageDescription</key><string>Astra observes the environment you select to record demonstrations and run local agents.</string>
+  <key>NSInputMonitoringUsageDescription</key><string>Astra records your demonstrated controls and detects when you take back control.</string>
+  <key>NSAccessibilityUsageDescription</key><string>Astra sends the keyboard and pointer actions you authorize for a local agent.</string>
+</dict></plist>
