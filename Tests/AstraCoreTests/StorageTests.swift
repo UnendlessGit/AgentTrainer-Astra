@@ -61,3 +61,58 @@ import Testing
     #expect(result.incompleteTail)
     #expect(result.error?.contains("integrity") == true)
 }
+
+@Test func databaseBackupNeverOverwritesAnExistingOrCompetingDestination() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = try SQLiteDatabase(url: root.appendingPathComponent("first.sqlite"))
+    let second = try SQLiteDatabase(url: root.appendingPathComponent("second.sqlite"))
+    for (index, database) in [first, second].enumerated() {
+        try database.execute("CREATE TABLE value (number INTEGER NOT NULL, data BLOB NOT NULL)")
+        try database.execute("INSERT INTO value VALUES(?,?)", [.integer(Int64(index)), .blob(Data(repeating: UInt8(index), count: 1_048_576))])
+    }
+    let existing = root.appendingPathComponent("keep.txt")
+    let content = Data("Retain this unrelated file".utf8)
+    try content.write(to: existing)
+    #expect(throws: AstraError.self) { try first.backup(to: existing) }
+    #expect(try Data(contentsOf: existing) == content)
+    let destination = root.appendingPathComponent("race.sqlite")
+    let outcomes = await withTaskGroup(of: Bool.self) { group in
+        for database in [first, second] {
+            group.addTask {
+                do { try database.backup(to: destination); return true }
+                catch { return false }
+            }
+        }
+        var values: [Bool] = []
+        for await value in group { values.append(value) }
+        return values
+    }
+    #expect(outcomes.filter { $0 }.count == 1)
+    let backup = try SQLiteDatabase(url: destination, readOnly: true)
+    #expect(try backup.query("SELECT number FROM value").count == 1)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: root.path).allSatisfy { !$0.hasPrefix(".astra-backup-") })
+    let failed = root.appendingPathComponent("missing/failed.sqlite")
+    #expect(throws: AstraError.self) { try first.backup(to: failed) }
+    #expect(!FileManager.default.fileExists(atPath: failed.path))
+}
+
+@Test func databaseReportsBusyCheckpointAndHonorsExplicitClose() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let url = root.appendingPathComponent("library.sqlite")
+    let writer = try SQLiteDatabase(url: url)
+    try writer.execute("PRAGMA busy_timeout=1")
+    try writer.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+    try writer.execute("INSERT INTO items VALUES(1)")
+    let reader = try SQLiteDatabase(url: url, readOnly: true)
+    try reader.execute("BEGIN")
+    _ = try reader.query("SELECT id FROM items")
+    try writer.execute("INSERT INTO items VALUES(2)")
+    #expect(throws: AstraError.self) { try writer.checkpoint() }
+    try reader.execute("COMMIT"); try reader.close()
+    try writer.checkpoint(); try writer.close()
+    #expect(throws: AstraError.self) { try writer.query("SELECT id FROM items") }
+    #expect(throws: AstraError.self) { try writer.backup(to: root.appendingPathComponent("closed.sqlite")) }
+    try writer.close()
+}

@@ -1,5 +1,6 @@
 import Foundation
 import CSQLite
+import Darwin
 
 public enum SQLValue: Sendable, Equatable {
     case integer(Int64), real(Double), text(String), blob(Data), null
@@ -15,10 +16,10 @@ public final class SQLiteDatabase: @unchecked Sendable {
     private let lock = NSRecursiveLock()
     private var inTransaction = false
 
-    public init(url: URL) throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    public init(url: URL, readOnly: Bool = false) throws {
+        if !readOnly { try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true) }
         let result = sqlite3_open_v2(url.path, &connection,
-                                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil)
+                                    (readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) | SQLITE_OPEN_FULLMUTEX, nil)
         guard result == SQLITE_OK, connection != nil else {
             let message = connection.map { String(cString: sqlite3_errmsg($0)) } ?? "Cannot open database."
             if let connection { sqlite3_close_v2(connection) }
@@ -28,8 +29,11 @@ public final class SQLiteDatabase: @unchecked Sendable {
         do {
             sqlite3_busy_timeout(connection, 5_000)
             try execute("PRAGMA foreign_keys = ON")
-            try execute("PRAGMA journal_mode = WAL")
-            try execute("PRAGMA synchronous = FULL")
+            if readOnly { try execute("PRAGMA query_only = ON") }
+            else {
+                try execute("PRAGMA journal_mode = WAL")
+                try execute("PRAGMA synchronous = FULL")
+            }
         } catch {
             if let connection { sqlite3_close_v2(connection) }
             connection = nil
@@ -38,6 +42,15 @@ public final class SQLiteDatabase: @unchecked Sendable {
     }
 
     deinit { if let connection { sqlite3_close_v2(connection) } }
+
+    public func close() throws {
+        try lock.withLock {
+            guard !inTransaction else { throw AstraError("storage.transaction", "A database cannot close inside a transaction.") }
+            guard let handle = connection else { return }
+            guard sqlite3_close(handle) == SQLITE_OK else { throw failure("storage.close") }
+            connection = nil
+        }
+    }
 
     public func execute(_ sql: String, _ bindings: [SQLValue] = []) throws {
         try lock.withLock {
@@ -103,24 +116,60 @@ public final class SQLiteDatabase: @unchecked Sendable {
         }
     }
 
-    public func checkpoint() throws { try execute("PRAGMA wal_checkpoint(TRUNCATE)") }
+    public func checkpoint() throws {
+        let rows = try query("PRAGMA wal_checkpoint(TRUNCATE)")
+        guard rows.first?["busy"]?.integer == 0 else {
+            throw AstraError("storage.checkpointBusy", "The database checkpoint is waiting for an active reader or writer.")
+        }
+    }
 
     public func backup(to url: URL) throws {
         try lock.withLock {
+            guard let source = connection else { throw AstraError("storage.closed", "The database is closed.") }
+            guard !inTransaction else {
+                throw AstraError("storage.backupTransaction", "A backup cannot begin inside a write transaction.")
+            }
             guard !FileManager.default.fileExists(atPath: url.path) else {
                 throw AstraError("storage.destinationExists", "The backup destination already exists.")
             }
+            // All incomplete work stays in an exclusively created sibling.
+            // link(2) publishes without replacing a destination created by a
+            // competing writer; cleanup never removes the destination path.
+            let staging = url.deletingLastPathComponent().appendingPathComponent(".astra-backup-\(UUID().uuidString).sqlite")
+            let descriptor = open(staging.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR)
+            guard descriptor >= 0 else { throw AstraError("storage.backup", "Cannot create the backup staging file.") }
+            Darwin.close(descriptor)
             var destination: OpaquePointer?
-            guard sqlite3_open_v2(url.path, &destination, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
-                  let destination else { throw AstraError("storage.backup", "Cannot create the backup database.") }
-            defer { sqlite3_close_v2(destination) }
-            guard let backup = sqlite3_backup_init(destination, "main", connection, "main") else {
+            defer {
+                if let destination { sqlite3_close_v2(destination) }
+                for suffix in ["", "-journal", "-wal", "-shm"] {
+                    try? FileManager.default.removeItem(atPath: staging.path + suffix)
+                }
+            }
+            guard sqlite3_open_v2(staging.path, &destination, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+                  let handle = destination else { throw AstraError("storage.backup", "Cannot create the backup database.") }
+            guard let backup = sqlite3_backup_init(handle, "main", source, "main") else {
                 throw AstraError("storage.backup", "Cannot begin a consistent database backup.")
             }
             let result = sqlite3_backup_step(backup, -1)
             let finished = sqlite3_backup_finish(backup)
             guard result == SQLITE_DONE, finished == SQLITE_OK else {
                 throw AstraError("storage.backup", "The database backup did not complete.")
+            }
+            // The backup may inherit the source's WAL header. Publish a
+            // self-contained rollback-journal database so read-only consumers
+            // never need sidecars belonging to the temporary filename.
+            guard sqlite3_exec(handle, "PRAGMA journal_mode=DELETE", nil, nil, nil) == SQLITE_OK else {
+                throw AstraError("storage.backup", "Cannot seal the backup as a standalone database.")
+            }
+            guard sqlite3_close_v2(handle) == SQLITE_OK else { throw AstraError("storage.backup", "Cannot close the completed backup.") }
+            destination = nil
+            let file = try FileHandle(forWritingTo: staging)
+            do { try file.synchronize(); try file.close() }
+            catch { try? file.close(); throw error }
+            guard link(staging.path, url.path) == 0 else {
+                if errno == EEXIST { throw AstraError("storage.destinationExists", "The backup destination already exists.") }
+                throw AstraError("storage.backup", "Cannot publish the completed backup.")
             }
         }
     }
@@ -132,7 +181,7 @@ public final class SQLiteDatabase: @unchecked Sendable {
             throw failure("storage.statement")
         }
         do {
-            guard sqlite3_bind_parameter_count(statement) == Int32(bindings.count) else {
+            guard bindings.count <= Int(Int32.max), sqlite3_bind_parameter_count(statement) == Int32(bindings.count) else {
                 throw AstraError("storage.bindings", "The database statement has incorrect bindings.")
             }
             let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -145,7 +194,7 @@ public final class SQLiteDatabase: @unchecked Sendable {
                     guard value.isFinite else { throw AstraError("storage.nonFinite", "Nonfinite numbers cannot be stored.") }
                     result = sqlite3_bind_double(statement, index, value)
                 case .text(let value):
-                    result = value.withCString { sqlite3_bind_text(statement, index, $0, Int32(value.utf8.count), transient) }
+                    result = value.withCString { sqlite3_bind_text64(statement, index, $0, UInt64(value.utf8.count), transient, UInt8(SQLITE_UTF8)) }
                 case .blob(let data):
                     if data.isEmpty { result = sqlite3_bind_zeroblob(statement, index, 0) }
                     else { result = data.withUnsafeBytes { sqlite3_bind_blob64(statement, index, $0.baseAddress, UInt64($0.count), transient) } }

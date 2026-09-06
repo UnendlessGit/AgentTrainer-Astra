@@ -41,6 +41,15 @@ public struct ArchiveScan: Sendable {
     public var error: String?
 }
 
+public struct PreparedFrame: Sendable {
+    public let metadata: FrameMetadata
+    public let byteCount: Int
+    fileprivate let prefix: Data
+    fileprivate let metadataBytes: Data
+    fileprivate let payload: Data
+    fileprivate let digest: Data
+}
+
 /// Independently addressable, checksummed blocks. Scanning is read-only and keeps
 /// a corrupt/incomplete tail available for inspection rather than deleting data.
 public enum FrameArchive {
@@ -49,6 +58,12 @@ public enum FrameArchive {
     private static let maximumMetadataBytes = 65_536
 
     public static func append(pixels: Data, metadata original: FrameMetadata, to handle: FileHandle) throws -> FrameBlock {
+        try appendPrepared(prepare(pixels: pixels, metadata: original), to: handle)
+    }
+
+    /// Compression may run on bounded parallel workers; publication remains
+    /// ordered on the recording writer's single queue.
+    public static func prepare(pixels: Data, metadata original: FrameMetadata) throws -> PreparedFrame {
         var metadata = try original.validated()
         guard pixels.count == metadata.byteCount else { throw AstraError("recording.frameBytes", "The captured pixel buffer has the wrong length.") }
         let compressed = try (pixels as NSData).compressed(using: .lzfse) as Data
@@ -63,13 +78,17 @@ public enum FrameArchive {
         prefix.appendLittleEndian(UInt64(payload.count))
         var hash = SHA256(); hash.update(data: prefix); hash.update(data: metadataBytes); hash.update(data: payload)
         let digest = Data(hash.finalize())
+        return PreparedFrame(metadata: metadata, byteCount: prefix.count + metadataBytes.count + payload.count + digest.count,
+                             prefix: prefix, metadataBytes: metadataBytes, payload: payload, digest: digest)
+    }
+
+    public static func appendPrepared(_ frame: PreparedFrame, to handle: FileHandle) throws -> FrameBlock {
         let offset = try handle.offset()
-        try handle.write(contentsOf: prefix)
-        try handle.write(contentsOf: metadataBytes)
-        try handle.write(contentsOf: payload)
-        try handle.write(contentsOf: digest)
-        return FrameBlock(offset: offset, length: UInt64(prefix.count + metadataBytes.count + payload.count + digest.count),
-                          metadata: metadata, digest: digest.hex)
+        try handle.write(contentsOf: frame.prefix)
+        try handle.write(contentsOf: frame.metadataBytes)
+        try handle.write(contentsOf: frame.payload)
+        try handle.write(contentsOf: frame.digest)
+        return FrameBlock(offset: offset, length: UInt64(frame.byteCount), metadata: frame.metadata, digest: frame.digest.hex)
     }
 
     public static func read(from handle: FileHandle, offset: UInt64) throws -> (FrameBlock, Data)? {

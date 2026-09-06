@@ -1,17 +1,19 @@
 import SwiftUI
 import AppKit
 import AstraCore
+import AstraPlatform
 
 @main struct AgentTrainerAstraApp: App {
     @State private var model = WorkspaceModel()
+    @NSApplicationDelegateAdaptor(AstraAppDelegate.self) private var appDelegate
 
     init() { NSApplication.shared.setActivationPolicy(.regular) }
 
     var body: some Scene {
-        WindowGroup("AgentTrainer Astra", id: "workspace") {
+        Window("AgentTrainer Astra", id: "workspace") {
             WorkspaceView(model: model)
                 .frame(minWidth: 860, minHeight: 580)
-                .task { await model.start() }
+                .task { appDelegate.model = model; await model.start() }
         }
         .defaultSize(width: 1120, height: 760)
         .commands {
@@ -24,6 +26,41 @@ import AstraCore
             }
         }
         Settings { SettingsView(root: model.supportRoot) }
+        MenuBarExtra("AgentTrainer Astra", systemImage: model.isRecording ? "record.circle.fill" : "cpu") {
+            StatusMenu(model: model)
+        }
+    }
+}
+
+@MainActor private final class AstraAppDelegate: NSObject, NSApplicationDelegate {
+    weak var model: WorkspaceModel?
+    private var terminating = false
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model, model.isRecording || model.recordingStarting || model.recordingStopping else { return .terminateNow }
+        guard !terminating else { return .terminateLater }
+        terminating = true
+        Task {
+            await model.stopRecording()
+            while model.recordingStarting || model.recordingStopping {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
+private struct StatusMenu: View {
+    @Bindable var model: WorkspaceModel
+    @Environment(\.openWindow) private var openWindow
+    var body: some View {
+        Text(model.isRecording ? "Recording demonstration" : "No active recording")
+        if model.isRecording || model.recordingStarting {
+            Button("Stop Recording") { Task { await model.stopRecording() } }.disabled(model.recordingStopping)
+        }
+        Divider()
+        Button("Show AgentTrainer Astra") { openWindow(id: "workspace"); NSApp.activate(ignoringOtherApps: true) }
+        Button("Quit AgentTrainer Astra") { NSApp.terminate(nil) }
     }
 }
 
@@ -60,6 +97,7 @@ private struct WorkspaceView: View {
                 ProgressView("Opening your workspace…").frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 0) {
+                    if model.isRecording || model.recordingStarting { RecordingBanner(model: model) }
                     if !model.issues.isEmpty { recoveryBanner }
                     switch model.destination {
                     case .agent:
@@ -82,6 +120,7 @@ private struct WorkspaceView: View {
             }
         }
         .sheet(isPresented: $model.showingNewAgent) { NewAgentSheet(model: model) }
+        .sheet(isPresented: $model.showingRecorder) { RecorderSheet(model: model) }
         .alert("Workspace needs attention", isPresented: Binding(
             get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } }
         )) { Button("OK") { model.errorMessage = nil } } message: { Text(model.errorMessage ?? "") }
@@ -132,8 +171,16 @@ private struct AgentWorkspace: View {
             Group {
                 switch model.section {
                 case .demonstrations:
-                    ContentUnavailableView("No demonstrations yet", systemImage: "record.circle",
-                                           description: Text("Demonstrations and correction sessions linked to this agent will appear here."))
+                    VStack(alignment: .leading, spacing: 16) {
+                        HStack {
+                            Text("Teach by demonstration").font(.headline)
+                            Spacer()
+                            Button("Record…", systemImage: "record.circle") { model.showingRecorder = true }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(model.isRecording || model.recordingStarting || model.recordingStopping)
+                        }
+                        RecordingList(recordings: model.recordings.filter { model.recordingLinks[agent.id]?.contains($0.id) == true })
+                    }
                 case .training:
                     ContentUnavailableView("No training runs yet", systemImage: "chart.xyaxis.line",
                                            description: Text("Imitation and reinforcement experiments belong to this agent, with their own saved configurations and checkpoints."))
@@ -166,8 +213,12 @@ private struct LibraryOverview: View {
                 } description: { Text("Keep each experiment's demonstrations, checkpoints, and results together.") }
                 actions: { Button("Create Agent…") { model.showingNewAgent = true }.buttonStyle(.borderedProminent) }
             } else {
-                ContentUnavailableView("Your library is empty", systemImage: "square.stack.3d.up",
-                                       description: Text("Recorded sessions and reusable environments will appear here."))
+                HStack {
+                    Spacer()
+                    Button("Record…", systemImage: "record.circle") { model.showingRecorder = true }
+                        .disabled(model.isRecording || model.recordingStarting)
+                }
+                RecordingList(recordings: model.recordings)
             }
         }.padding(28).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }

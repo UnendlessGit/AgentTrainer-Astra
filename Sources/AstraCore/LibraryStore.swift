@@ -68,6 +68,7 @@ public struct LibraryIssue: Identifiable, Sendable {
 public struct LibrarySnapshot: Sendable {
     public var agents: [AgentDocument]
     public var environments: [EnvironmentDocument]
+    public var recordings: [RecordingManifest]
     public var issues: [LibraryIssue]
 }
 
@@ -85,6 +86,7 @@ public enum DocumentNames {
 public actor LibraryStore {
     public nonisolated let root: URL
     private let database: SQLiteDatabase
+    private var recoveryIssues: [LibraryIssue] = []
 
     public init(root: URL) throws {
         self.root = root.standardizedFileURL
@@ -99,6 +101,8 @@ public actor LibraryStore {
             try database.execute("CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+            try database.execute("CREATE TABLE IF NOT EXISTS recordings (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
+            try database.execute("CREATE TABLE IF NOT EXISTS agent_recordings (agent_id TEXT NOT NULL REFERENCES agents(id), recording_id TEXT NOT NULL REFERENCES recordings(id), PRIMARY KEY(agent_id,recording_id))")
         }
         for folder in ["Recordings", "Models", "Jobs", "Caches", "Logs"] {
             try FileManager.default.createDirectory(at: self.root.appendingPathComponent(folder), withIntermediateDirectories: true)
@@ -106,7 +110,7 @@ public actor LibraryStore {
     }
 
     public func snapshot() throws -> LibrarySnapshot {
-        var issues: [LibraryIssue] = []
+        var issues = recoveryIssues
         let agents: [AgentDocument] = try documents(table: "agents", issues: &issues).compactMap { (document: AgentDocument) -> AgentDocument? in
             do { return try document.validated() }
             catch { issues.append(.init(id: document.id.uuidString, collection: "agents", message: error.localizedDescription)); return nil }
@@ -115,7 +119,11 @@ public actor LibraryStore {
             do { return try document.validated() }
             catch { issues.append(.init(id: document.id.uuidString, collection: "environments", message: error.localizedDescription)); return nil }
         }
-        return LibrarySnapshot(agents: agents, environments: environments, issues: issues)
+        let recordings: [RecordingManifest] = try documents(table: "recordings", issues: &issues).compactMap { (document: RecordingManifest) -> RecordingManifest? in
+            do { return try document.validated() }
+            catch { issues.append(.init(id: document.id.uuidString, collection: "recordings", message: error.localizedDescription)); return nil }
+        }
+        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, issues: issues)
     }
 
     public func save(_ document: AgentDocument) throws {
@@ -129,6 +137,69 @@ public actor LibraryStore {
         try database.execute("INSERT INTO environments(id,name,document,created) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,document=excluded.document", [
             .text(value.id.uuidString), .text(value.name), .blob(try encode(value)), .real(value.createdAt.timeIntervalSince1970)
         ])
+    }
+
+    public nonisolated func recordingDirectory(id: UUID) -> URL {
+        root.appendingPathComponent("Recordings", isDirectory: true)
+            .appendingPathComponent(id.uuidString + ".astrarecord", isDirectory: true)
+    }
+
+    public func saveRecording(_ manifest: RecordingManifest, linkTo agentID: UUID? = nil) throws {
+        let value = try manifest.validated()
+        try database.transaction {
+            try database.execute("INSERT INTO recordings(id,name,document,created) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,document=excluded.document", [
+                .text(value.id.uuidString), .text(value.name), .blob(try encode(value)), .real(value.createdAt.timeIntervalSince1970)
+            ])
+            if let agentID {
+                try database.execute("INSERT OR IGNORE INTO agent_recordings VALUES(?,?)", [.text(agentID.uuidString), .text(value.id.uuidString)])
+            }
+        }
+    }
+
+    /// Call once when opening the workspace, before starting new jobs. Sealed
+    /// packages only need their manifest read; abandoned writers are recovered
+    /// under an exclusive package lock. Snapshot does not scan the filesystem.
+    @discardableResult
+    public func recoverInterruptedRecordings() throws -> [LibraryIssue] {
+        var issues: [LibraryIssue] = []
+        let documents: [RecordingManifest] = try documents(table: "recordings", includeArchived: true, issues: &issues)
+        let catalog = Dictionary(uniqueKeysWithValues: documents.map { ($0.id, $0) })
+        let packages = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("Recordings"),
+                                                                 includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        var seen: Set<UUID> = []
+        for directory in packages.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where directory.pathExtension == "astrarecord" {
+            guard let id = UUID(uuidString: directory.deletingPathExtension().lastPathComponent) else {
+                issues.append(.init(id: directory.lastPathComponent, collection: "recordings", message: "A recording package has an unrecognized name and was left untouched."))
+                continue
+            }
+            seen.insert(id)
+            do {
+                let result = try RecordingRecovery.recover(directory: directory, expectedID: id, fallback: catalog[id])
+                var agentID = result.manifest.recordedForAgentID
+                if let candidate = agentID, try database.query("SELECT id FROM agents WHERE id=?", [.text(candidate.uuidString)]).isEmpty {
+                    agentID = nil
+                    issues.append(.init(id: id.uuidString + ".agent", collection: "recordings", message: "The recording's original agent is unavailable; the shared source remains in the library."))
+                }
+                try saveRecording(result.manifest, linkTo: agentID)
+                if result.recovered || result.manifest.status == .failed || result.manifest.status == .interrupted {
+                    let detail = result.issues.first ?? result.manifest.issue ?? "The interrupted recording's durable source prefix was recovered."
+                    issues.append(.init(id: id.uuidString + ".recovery", collection: "recordings", message: "\(result.manifest.name): \(detail)"))
+                }
+            } catch {
+                if (error as? AstraError)?.code == "recording.busy" { continue }
+                issues.append(.init(id: id.uuidString + ".recovery", collection: "recordings", message: error.localizedDescription))
+            }
+        }
+        for document in documents where !seen.contains(document.id) {
+            issues.append(.init(id: document.id.uuidString + ".missing", collection: "recordings", message: "The source package for \(document.name) is unavailable. Its catalog entry and agent links were preserved."))
+        }
+        recoveryIssues = issues
+        return issues
+    }
+
+    public func recordingIDs(for agentID: UUID) throws -> Set<UUID> {
+        Set(try database.query("SELECT recording_id FROM agent_recordings WHERE agent_id=?", [.text(agentID.uuidString)])
+            .compactMap { $0["recording_id"]?.string.flatMap(UUID.init(uuidString:)) })
     }
 
     /// Archiving is reversible and leaves shared artifacts untouched.
@@ -146,14 +217,22 @@ public actor LibraryStore {
 
     public func checkpoint() throws { try database.checkpoint() }
 
-    private func documents<T: Decodable>(table: String, issues: inout [LibraryIssue]) throws -> [T] {
-        // Table is selected exclusively by the two private call sites above.
-        let rows = try database.query("SELECT id,document FROM \(table) WHERE archived=0 ORDER BY created DESC,id ASC")
+    private func documents<T: Decodable & Identifiable>(table: String, includeArchived: Bool = false, issues: inout [LibraryIssue]) throws -> [T] where T.ID == UUID {
+        // Table is selected exclusively by private call sites above.
+        let rows = try database.query("SELECT id,document FROM \(table) \(includeArchived ? "" : "WHERE archived=0") ORDER BY created DESC,id ASC")
+        var identities: Set<UUID> = []
         return rows.compactMap { row in
             do {
                 guard let data = row["document"]?.data else { throw AstraError("library.document", "An item has no document data.") }
                 let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
-                return try decoder.decode(T.self, from: data)
+                let value = try decoder.decode(T.self, from: data)
+                guard row["id"]?.string.flatMap(UUID.init(uuidString:)) == value.id else {
+                    throw AstraError("library.identity", "An item's document identity does not match its catalog entry.")
+                }
+                guard identities.insert(value.id).inserted else {
+                    throw AstraError("library.identity", "A duplicate document identity was preserved as a catalog issue.")
+                }
+                return value
             } catch {
                 issues.append(.init(id: row["id"]?.string ?? UUID().uuidString, collection: table, message: error.localizedDescription))
                 return nil

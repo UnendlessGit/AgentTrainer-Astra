@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "convnextTiny": {
+    "sourceURL": "https://dl.fbaipublicfiles.com/convnext/convnext_tiny_1k_224_ema.pth",
+    "sourceSHA256": "14f3164e3ea6ac32ab3f574f528ce817696c9176fad4221e0a77a905a7360595",
+    "sourceBytes": 114414741,
+    "sourceModel": "ConvNeXt Tiny, ImageNet-1K, 224, EMA",
+    "upstream": "https://github.com/facebookresearch/ConvNeXt",
+    "license": "MIT",
+    "licenseURL": "https://github.com/facebookresearch/ConvNeXt/blob/main/LICENSE",
+    "artifact": "convnext_tiny.safetensors",
+    "conversion": "scripts/prepare_weights.py; strict parameter names and shapes; NCHW kernels to NHWC; classification head excluded",
+    "normalization": {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]},
+    "note": "ImageNet initialization transfers visual features; it does not supply computer-use behavior. No runtime download is required."
+  }
+}

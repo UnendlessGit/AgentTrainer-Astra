@@ -206,15 +206,17 @@ public struct RawInputEvent: Codable, Hashable, Sendable {
     public var modifiers: UInt64?
     public var isDown: Bool?
     public var detail: String?
+    public var rawPlatformData: Data?
 
     public init(sequence: UInt64, eventNanos: UInt64, observedNanos: UInt64, origin: InputOrigin,
                 kind: RawInputKind, keyCode: Int? = nil, button: Int? = nil,
                 x: Double? = nil, y: Double? = nil, dx: Double? = nil, dy: Double? = nil,
                 scrollX: Double? = nil, scrollY: Double? = nil, modifiers: UInt64? = nil,
-                isDown: Bool? = nil, detail: String? = nil) {
+                isDown: Bool? = nil, detail: String? = nil, rawPlatformData: Data? = nil) {
         self.sequence = sequence; self.eventNanos = eventNanos; self.observedNanos = observedNanos
         self.origin = origin; self.kind = kind; self.keyCode = keyCode; self.button = button
         self.x = x; self.y = y; self.dx = dx; self.dy = dy; self.scrollX = scrollX; self.scrollY = scrollY
         self.modifiers = modifiers; self.isDown = isDown; self.detail = detail
+        self.rawPlatformData = rawPlatformData
     }
 }

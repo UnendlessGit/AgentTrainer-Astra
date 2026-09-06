@@ -1,0 +1,318 @@
+import AppKit
+import AstraCore
+import CoreMedia
+import CoreVideo
+@preconcurrency import ScreenCaptureKit
+
+public struct CaptureSource: Identifiable, Hashable, Sendable {
+    public var id: String
+    public var name: String
+    public var kind: TargetKind
+    public var displayID: UInt32?
+    public var windowID: UInt32?
+    public var applicationBundleID: String?
+    public var applicationPID: Int32?
+    public var applicationLaunchDate: Date? = nil
+    public var bounds: Rect2D
+    public var pixelWidth: Int
+    public var pixelHeight: Int
+}
+
+public enum CaptureDiscovery {
+    public static func sources() async throws -> [CaptureSource] {
+        guard CGPreflightScreenCaptureAccess() else {
+            throw AstraError("permission.screenRecording", "Allow Screen Recording for AgentTrainer Astra in System Settings to choose an environment.")
+        }
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        let displays = content.displays.map { display in
+            CaptureSource(id: "display:\(display.displayID)", name: "Display \(display.displayID)", kind: .display,
+                          displayID: display.displayID, bounds: Rect2D(CGDisplayBounds(display.displayID)),
+                          pixelWidth: CGDisplayPixelsWide(display.displayID), pixelHeight: CGDisplayPixelsHigh(display.displayID))
+        }
+        let windows = content.windows.filter { $0.windowLayer == 0 && $0.frame.width > 1 && $0.frame.height > 1 }.compactMap { window -> CaptureSource? in
+            guard let app = window.owningApplication, app.processID > 0 else { return nil }
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let scale = Double(filter.pointPixelScale)
+            let width = Double(filter.contentRect.width) * scale, height = Double(filter.contentRect.height) * scale
+            guard scale.isFinite, (1...4).contains(scale), width.isFinite, height.isFinite,
+                  (1...32_768).contains(width), (1...32_768).contains(height), Rect2D(window.frame).isValid else { return nil }
+            return CaptureSource(id: "window:\(window.windowID)",
+                                 name: [app.applicationName, window.title].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " — "),
+                                 kind: .window, windowID: window.windowID,
+                                 applicationBundleID: app.bundleIdentifier, applicationPID: app.processID,
+                                 applicationLaunchDate: NSRunningApplication(processIdentifier: app.processID)?.launchDate,
+                                 bounds: Rect2D(window.frame),
+                                 pixelWidth: Int(width.rounded(.up)), pixelHeight: Int(height.rounded(.up)))
+        }
+        return displays + windows.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+}
+
+public enum CaptureHealth: Sendable {
+    case starting, live, idle, unavailable(String), stopped
+}
+
+enum CaptureGeometry {
+    static func resolve(previous: SurfaceDescriptor, pixelWidth: Int, pixelHeight: Int,
+                        screenRect: CGRect?, contentRect: CGRect?, scaleFactor: Double?,
+                        contentScale: Double?) throws -> SurfaceDescriptor {
+        guard let screenRect, Rect2D(screenRect).isValid,
+              let contentRect, Rect2D(contentRect).isValid,
+              let scaleFactor, scaleFactor.isFinite, (1...4).contains(scaleFactor),
+              let contentScale, contentScale.isFinite, contentScale > 0 else {
+            throw AstraError("capture.geometry", "ScreenCaptureKit returned incomplete or invalid source geometry.")
+        }
+        // SCStream.h specifies contentRect in surface points. scaleFactor is
+        // pixels per point; contentScale is already reflected in that rect.
+        // Multiplying by contentScale again would apply resizing twice.
+        let pixels = Rect2D(x: contentRect.minX * scaleFactor, y: contentRect.minY * scaleFactor,
+                            width: contentRect.width * scaleFactor, height: contentRect.height * scaleFactor)
+        var descriptor = SurfaceDescriptor(id: previous.id, globalBounds: Rect2D(screenRect),
+                                           pixelWidth: pixelWidth, pixelHeight: pixelHeight,
+                                           contentBounds: pixels, geometryRevision: previous.geometryRevision)
+        _ = try descriptor.validated()
+        if previous.globalBounds != descriptor.globalBounds || previous.pixelWidth != descriptor.pixelWidth
+            || previous.pixelHeight != descriptor.pixelHeight || previous.contentBounds != descriptor.contentBounds {
+            guard previous.geometryRevision < UInt64.max else {
+                throw AstraError("capture.geometryRevision", "The capture geometry revision is exhausted.")
+            }
+            descriptor.geometryRevision += 1
+        }
+        return descriptor
+    }
+}
+
+/// The immutable buffer reference has explicit consumer ownership. Callers must
+/// bound admitted frames and release this before retaining more SCK surfaces.
+public struct CapturedFrame: @unchecked Sendable {
+    public let id: UUID
+    public let eventNanos: UInt64
+    public let observedNanos: UInt64
+    public let surface: SurfaceDescriptor
+    public let pixelBuffer: CVPixelBuffer
+
+    public func copyCompactPixels() throws -> Data {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
+            throw AstraError("capture.pixelFormat", "The capture stream returned an unsupported pixel format.")
+        }
+        let width = CVPixelBufferGetWidth(pixelBuffer), height = CVPixelBufferGetHeight(pixelBuffer)
+        let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+        let (byteCount, byteOverflow) = pixelCount.multipliedReportingOverflow(by: 4)
+        guard width > 0, height > 0, !pixelOverflow, !byteOverflow, byteCount <= FrameArchive.maximumFrameBytes else {
+            throw AstraError("capture.frameTooLarge", "This capture exceeds the configured frame memory limit.")
+        }
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+            throw AstraError("capture.pixelAccess", "The captured pixels are temporarily unavailable.")
+        }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let source = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw AstraError("capture.pixelAccess", "The capture buffer has no readable pixel data.")
+        }
+        let sourceStride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard sourceStride >= width * 4 else { throw AstraError("capture.stride", "Invalid capture row stride.") }
+        var pixels = Data(count: byteCount)
+        pixels.withUnsafeMutableBytes { destination in
+            for row in 0..<height {
+                destination.baseAddress!.advanced(by: row * width * 4)
+                    .copyMemory(from: source.advanced(by: row * sourceStride), byteCount: width * 4)
+            }
+        }
+        return pixels
+    }
+}
+
+public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    public typealias FrameHandler = @Sendable (CapturedFrame) -> Void
+    public typealias HealthHandler = @Sendable (CaptureHealth) -> Void
+    private let lock = NSLock()
+    private let outputQueue = DispatchQueue(label: "astra.capture.output", qos: .userInitiated)
+    private var stream: SCStream?
+    private var generation: UUID?
+    private var source: CaptureSource?
+    private var surface: SurfaceDescriptor?
+    private var frameHandler: FrameHandler?
+    private var healthHandler: HealthHandler?
+    private var startingCompletion: AsyncCompletion?
+    private var stopTask: Task<Void, Never>?
+
+    public override init() { super.init() }
+
+    public func start(source: CaptureSource, fps: Int, showsCursor: Bool,
+                      onFrame: @escaping FrameHandler, onHealth: @escaping HealthHandler) async throws {
+        guard CGPreflightScreenCaptureAccess() else {
+            throw AstraError("permission.screenRecording", "Screen Recording permission is required for this environment.")
+        }
+        guard (1...120).contains(fps) else { throw AstraError("capture.rate", "Choose a capture rate between 1 and 120 fps.") }
+        let initialSurface = try SurfaceDescriptor(id: source.id, globalBounds: source.bounds,
+                                                    pixelWidth: source.pixelWidth, pixelHeight: source.pixelHeight).validated()
+        guard source.pixelWidth * source.pixelHeight * 4 <= FrameArchive.maximumFrameBytes else {
+            throw AstraError("capture.frameTooLarge", "This capture exceeds the recording frame memory limit.")
+        }
+        let token = UUID()
+        let completion = AsyncCompletion()
+        try lock.withLock {
+            guard generation == nil, stopTask == nil else { throw AstraError("capture.busy", "A capture stream is already starting, running, or stopping.") }
+            generation = token; self.source = source; frameHandler = onFrame; healthHandler = onHealth
+            startingCompletion = completion
+        }
+        defer { completion.finish() }
+        onHealth(.starting)
+        var startedStream: SCStream?
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+            try Task.checkCancellation()
+            let filter: SCContentFilter
+            var resolvedSurface = initialSurface
+            if source.kind == .window, let id = source.windowID {
+                guard let window = content.windows.first(where: { $0.windowID == id && $0.owningApplication?.processID == source.applicationPID }) else {
+                    throw AstraError("capture.targetMissing", "The selected window is no longer available. Choose the target again.")
+                }
+                if let expectedLaunch = source.applicationLaunchDate {
+                    guard let pid = source.applicationPID,
+                          NSRunningApplication(processIdentifier: pid)?.launchDate == expectedLaunch else {
+                        throw AstraError("capture.targetReplaced", "The selected application restarted. Choose the target again.")
+                    }
+                }
+                filter = SCContentFilter(desktopIndependentWindow: window)
+                resolvedSurface.globalBounds = Rect2D(window.frame)
+            } else if source.kind == .display, let id = source.displayID {
+                guard let display = content.displays.first(where: { $0.displayID == id }) else {
+                    throw AstraError("capture.targetMissing", "The selected display is no longer connected.")
+                }
+                // The selected display is the observation scope, including
+                // Astra when visible. Excluding UI pixels while recording
+                // their global input would produce inconsistent examples.
+                filter = SCContentFilter(display: display, excludingWindows: [])
+                resolvedSurface.globalBounds = Rect2D(CGDisplayBounds(id))
+            } else {
+                throw AstraError("capture.source", "This source needs a supported capture binding.")
+            }
+            let nativeWidth = Double(filter.contentRect.width) * Double(filter.pointPixelScale)
+            let nativeHeight = Double(filter.contentRect.height) * Double(filter.pointPixelScale)
+            guard nativeWidth.isFinite, nativeHeight.isFinite,
+                  (1...32_768).contains(nativeWidth), (1...32_768).contains(nativeHeight) else {
+                throw AstraError("capture.nativeSize", "The selected source has no valid native pixel dimensions.")
+            }
+            resolvedSurface.pixelWidth = Int(nativeWidth.rounded(.up))
+            resolvedSurface.pixelHeight = Int(nativeHeight.rounded(.up))
+            resolvedSurface.contentBounds = Rect2D(x: 0, y: 0, width: Double(resolvedSurface.pixelWidth), height: Double(resolvedSurface.pixelHeight))
+            _ = try resolvedSurface.validated()
+            guard resolvedSurface.pixelWidth * resolvedSurface.pixelHeight * 4 <= FrameArchive.maximumFrameBytes else {
+                throw AstraError("capture.frameTooLarge", "The current capture size exceeds the recording frame memory limit.")
+            }
+            let configuration = SCStreamConfiguration()
+            configuration.width = resolvedSurface.pixelWidth; configuration.height = resolvedSurface.pixelHeight
+            configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(fps))
+            configuration.queueDepth = 4; configuration.pixelFormat = kCVPixelFormatType_32BGRA
+            configuration.colorSpaceName = CGColorSpace.sRGB
+            configuration.showsCursor = showsCursor; configuration.capturesAudio = false
+            configuration.ignoreShadowsSingleWindow = true; configuration.captureResolution = .best
+            configuration.scalesToFit = false; configuration.preservesAspectRatio = true
+            let candidate = SCStream(filter: filter, configuration: configuration, delegate: self)
+            startedStream = candidate
+            try candidate.addStreamOutput(self, type: .screen, sampleHandlerQueue: outputQueue)
+            let accepted = lock.withLock {
+                guard generation == token, stopTask == nil else { return false }
+                stream = candidate; surface = resolvedSurface
+                return true
+            }
+            guard accepted else { throw CancellationError() }
+            try await candidate.startCapture()
+            try Task.checkCancellation()
+            let stillActive = lock.withLock { generation == token && stopTask == nil }
+            if !stillActive { throw CancellationError() }
+        } catch {
+            if let startedStream {
+                try? await startedStream.stopCapture()
+                await withCheckedContinuation { continuation in outputQueue.async { continuation.resume() } }
+                try? startedStream.removeStreamOutput(self, type: .screen)
+            }
+            let notify = lock.withLock {
+                if generation == token {
+                    generation = nil; stream = nil; self.source = nil; surface = nil
+                    frameHandler = nil; healthHandler = nil
+                    return true
+                }
+                return false
+            }
+            if notify { onHealth(.unavailable(error.localizedDescription)) }
+            throw error
+        }
+    }
+
+    public func stop() async {
+        let task = lock.withLock { () -> Task<Void, Never> in
+            if let stopTask { return stopTask }
+            let previous = stream, callback = healthHandler
+            let completion = startingCompletion
+            generation = nil; stream = nil; frameHandler = nil; healthHandler = nil; source = nil; surface = nil
+            let task = Task { [self] in
+                // A concurrent start may not have called startCapture yet. Join
+                // it so no late stream can briefly revive after Stop returns.
+                await completion?.wait()
+                if let previous { try? await previous.stopCapture() }
+                await withCheckedContinuation { continuation in outputQueue.async { continuation.resume() } }
+                if let previous { try? previous.removeStreamOutput(self, type: .screen) }
+                callback?(.stopped)
+                lock.withLock { startingCompletion = nil; stopTask = nil }
+            }
+            stopTask = task
+            return task
+        }
+        await task.value
+    }
+
+    public func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        let callback = lock.withLock { () -> HealthHandler? in
+            guard self.stream === stream else { return nil }
+            return healthHandler
+        }
+        callback?(.unavailable(error.localizedDescription))
+    }
+
+    public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sampleBuffer.isValid else { return }
+        let observed = MonotonicClock.now
+        let attachments = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first
+        let status = (attachments?[.status] as? Int).flatMap(SCFrameStatus.init(rawValue:))
+        let snapshot = lock.withLock { () -> (SurfaceDescriptor, FrameHandler, HealthHandler)? in
+            guard self.stream === stream, generation != nil, let surface, let frameHandler, let healthHandler else { return nil }
+            return (surface, frameHandler, healthHandler)
+        }
+        guard let (initialDescriptor, frameCallback, healthCallback) = snapshot else { return }
+        if status == .idle { healthCallback(.idle); return }
+        if status == .started, sampleBuffer.imageBuffer == nil { healthCallback(.starting); return }
+        guard status == .complete || status == .started else {
+            healthCallback(.unavailable("The capture surface is unavailable.")); return
+        }
+        guard let pixels = sampleBuffer.imageBuffer,
+              let timestamp = (attachments?[.displayTime] as? NSNumber).map({ MonotonicClock.nanoseconds(fromMachTicks: $0.uint64Value) })
+                ?? MonotonicClock.nanoseconds(hostTime: sampleBuffer.presentationTimeStamp) else {
+            healthCallback(.unavailable("A capture frame has no valid timestamp or pixels.")); return
+        }
+        let width = CVPixelBufferGetWidth(pixels), height = CVPixelBufferGetHeight(pixels)
+        let descriptor: SurfaceDescriptor
+        do {
+            descriptor = try CaptureGeometry.resolve(previous: initialDescriptor, pixelWidth: width, pixelHeight: height,
+                                                      screenRect: Self.rect(attachments?[.screenRect]),
+                                                      contentRect: Self.rect(attachments?[.contentRect]),
+                                                      scaleFactor: (attachments?[.scaleFactor] as? NSNumber)?.doubleValue,
+                                                      contentScale: (attachments?[.contentScale] as? NSNumber)?.doubleValue)
+        } catch { healthCallback(.unavailable(error.localizedDescription)); return }
+        let accepted = lock.withLock {
+            guard self.stream === stream, generation != nil else { return false }
+            surface = descriptor
+            return true
+        }
+        guard accepted else { return }
+        healthCallback(.live)
+        frameCallback(CapturedFrame(id: UUID(), eventNanos: timestamp, observedNanos: observed,
+                                    surface: descriptor, pixelBuffer: pixels))
+    }
+
+    private static func rect(_ value: Any?) -> CGRect? {
+        if let rect = value as? CGRect { return rect }
+        if let dictionary = value as? NSDictionary { return CGRect(dictionaryRepresentation: dictionary) }
+        return nil
+    }
+}
