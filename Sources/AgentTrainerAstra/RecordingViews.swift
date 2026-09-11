@@ -26,12 +26,15 @@ struct RecordingBanner: View {
 
 struct RecordingList: View {
     let recordings: [RecordingManifest]
+    var onOpen: (RecordingManifest) -> Void = { _ in }
+    @State private var selection: UUID?
     var body: some View {
         if recordings.isEmpty {
             ContentUnavailableView("No demonstrations yet", systemImage: "record.circle",
                                    description: Text("Record a session in an environment to teach an agent how to act."))
         } else {
-            Table(recordings) {
+            VStack(alignment: .trailing, spacing: 8) {
+            Table(recordings, selection: $selection) {
                 TableColumn("Recording") { recording in
                     VStack(alignment: .leading, spacing: 4) {
                         Text(recording.name).fontWeight(.medium)
@@ -46,6 +49,17 @@ struct RecordingList: View {
                     Text(status(recording.status)).foregroundStyle(recording.status == .complete ? Color.secondary : Color.orange)
                         .help(recording.issue ?? status(recording.status))
                 }.width(min: 90, ideal: 110, max: 160)
+            }
+            .contextMenu(forSelectionType: UUID.self) { identifiers in
+                if let identifier = identifiers.first, let recording = recordings.first(where: { $0.id == identifier }) {
+                    Button("Review Recording") { onOpen(recording) }.disabled(recording.status == .recording)
+                }
+            } primaryAction: { identifiers in
+                if let identifier = identifiers.first, let recording = recordings.first(where: { $0.id == identifier }), recording.status != .recording { onOpen(recording) }
+            }
+            Button("Review Recording", systemImage: "play.rectangle") {
+                if let recording = recordings.first(where: { $0.id == selection }) { onOpen(recording) }
+            }.disabled(!recordings.contains { $0.id == selection && $0.status != .recording })
             }
         }
     }

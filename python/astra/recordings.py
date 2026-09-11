@@ -83,11 +83,13 @@ def validate_surface(value: dict) -> dict:
     return value
 
 
-def validate_frame(value: dict) -> dict:
+def validate_frame(value: dict, *, maximum_timestamp: int = 2**63 - 1) -> dict:
     if not isinstance(value, dict) or set(value) != {"id", "eventNanos", "observedNanos", "surface", "byteCount", "pixelFormat", "codec"}:
         raise RecordingError("Invalid frame metadata")
     uuid.UUID(value["id"])
-    _integer(value["eventNanos"]); _integer(value["observedNanos"])
+    if type(maximum_timestamp) is not int or maximum_timestamp not in (2**63 - 1, 2**64 - 1):
+        raise RecordingError("Invalid timestamp contract")
+    _integer(value["eventNanos"], maximum=maximum_timestamp); _integer(value["observedNanos"], maximum=maximum_timestamp)
     surface = validate_surface(value["surface"])
     size = _integer(value["byteCount"], 1, MAXIMUM_FRAME_BYTES)
     if size != surface["pixelWidth"] * surface["pixelHeight"] * 4 or value["pixelFormat"] != "bgra8-srgb" or value["codec"] not in ("raw", "lzfse"):
@@ -95,11 +97,14 @@ def validate_frame(value: dict) -> dict:
     return value
 
 
-def validate_event(value: dict) -> dict:
+def validate_event(value: dict, *, maximum_timestamp: int = 2**63 - 1) -> dict:
     if not isinstance(value, dict):
         raise RecordingError("Invalid raw event")
-    for field in ("sequence", "eventNanos", "observedNanos"):
-        _integer(value.get(field))
+    if type(maximum_timestamp) is not int or maximum_timestamp not in (2**63 - 1, 2**64 - 1):
+        raise RecordingError("Invalid timestamp contract")
+    _integer(value.get("sequence"))
+    for field in ("eventNanos", "observedNanos"):
+        _integer(value.get(field), maximum=maximum_timestamp)
     if value.get("origin") not in ("physical", "agent", "reconciliation", "boundary") or value.get("kind") not in (
         "keyDown", "keyUp", "keyRepeat", "buttonDown", "buttonUp", "pointer", "scroll", "flags", "gap"
     ):

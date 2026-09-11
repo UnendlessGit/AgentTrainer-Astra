@@ -29,6 +29,7 @@ import numpy as np
 from .model.actions import ActionVocabulary
 from .model.config import ModelConfig, MAXIMUM_PARAMETERS
 from .model.policy import AgentPolicy
+from .versions import CANONICALIZER_VERSION
 
 MAXIMUM_ARTIFACT_BYTES = 8 * 1024**3
 MAXIMUM_JSON_BYTES = 8 * 1024**2
@@ -250,10 +251,10 @@ def save_checkpoint(destination: Path, policy: AgentPolicy, *, kind: str, step: 
     trainable = dict(tree_flatten(policy.trainable_parameters()))
     config = policy.config.to_dict()
     vocabulary = policy.actions.vocabulary.to_dict()
-    identity = {"model": config, "actions": vocabulary, "canonicalizerVersion": 1}
+    identity = {"model": config, "actions": vocabulary, "canonicalizerVersion": CANONICALIZER_VERSION}
     manifest = {"schemaVersion": 1, "id": identifier, "createdAt": datetime.now(timezone.utc).isoformat(),
                 "kind": kind, "step": step, "parentID": parent_id, "datasetID": dataset_id,
-                "model": config, "actions": vocabulary, "canonicalizerVersion": 1,
+                "model": config, "actions": vocabulary, "canonicalizerVersion": CANONICALIZER_VERSION,
                 "frozenParameters": sorted(parameters.keys() - trainable.keys()),
                 "policySignature": hashlib.sha256(_json_bytes(identity)).hexdigest(),
                 "metrics": metrics or {}, "trainingConfig": training_config or {}, "artifacts": {}}
@@ -294,7 +295,7 @@ def load_checkpoint(directory: Path, *, include_training: bool = False) -> Loade
                 "canonicalizerVersion", "policySignature", "metrics", "trainingConfig", "artifacts", "frozenParameters"}
     if (not isinstance(manifest, dict) or set(manifest) != required
         or type(manifest["schemaVersion"]) is not int or manifest["schemaVersion"] != 1
-        or type(manifest["canonicalizerVersion"]) is not int or manifest["canonicalizerVersion"] != 1):
+        or type(manifest["canonicalizerVersion"]) is not int or manifest["canonicalizerVersion"] != CANONICALIZER_VERSION):
         raise CheckpointError("Unsupported checkpoint schema")
     if str(uuid.UUID(directory.name)) != manifest["id"] or manifest["kind"] not in ("initial", "behavioral", "reinforcement"):
         raise CheckpointError("Checkpoint identity or purpose is invalid")
@@ -305,7 +306,7 @@ def load_checkpoint(directory: Path, *, include_training: bool = False) -> Loade
         vocabulary = ActionVocabulary.from_dict(manifest["actions"])
     except (TypeError, ValueError) as error:
         raise CheckpointError(f"Invalid checkpoint configuration: {error}") from error
-    identity = {"model": config.to_dict(), "actions": vocabulary.to_dict(), "canonicalizerVersion": 1}
+    identity = {"model": config.to_dict(), "actions": vocabulary.to_dict(), "canonicalizerVersion": CANONICALIZER_VERSION}
     if hashlib.sha256(_json_bytes(identity)).hexdigest() != manifest["policySignature"]:
         raise CheckpointError("Checkpoint configuration signature does not match")
     artifacts = manifest["artifacts"]

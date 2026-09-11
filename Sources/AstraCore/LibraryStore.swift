@@ -69,6 +69,8 @@ public struct LibrarySnapshot: Sendable {
     public var agents: [AgentDocument]
     public var environments: [EnvironmentDocument]
     public var recordings: [RecordingManifest]
+    public var learningRuns: [LearningRunDocument]
+    public var checkpoints: [CheckpointDocument]
     public var issues: [LibraryIssue]
 }
 
@@ -87,6 +89,7 @@ public actor LibraryStore {
     public nonisolated let root: URL
     private let database: SQLiteDatabase
     private var recoveryIssues: [LibraryIssue] = []
+    private var inferenceIssues: [LibraryIssue] = []
 
     public init(root: URL) throws {
         self.root = root.standardizedFileURL
@@ -103,14 +106,17 @@ public actor LibraryStore {
             try database.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
             try database.execute("CREATE TABLE IF NOT EXISTS recordings (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS agent_recordings (agent_id TEXT NOT NULL REFERENCES agents(id), recording_id TEXT NOT NULL REFERENCES recordings(id), PRIMARY KEY(agent_id,recording_id))")
+            try database.execute("CREATE TABLE IF NOT EXISTS learning_runs (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
+            try database.execute("CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
+            try database.execute("CREATE TABLE IF NOT EXISTS agent_checkpoints (agent_id TEXT NOT NULL REFERENCES agents(id), checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id), PRIMARY KEY(agent_id,checkpoint_id))")
         }
-        for folder in ["Recordings", "Models", "Jobs", "Caches", "Logs"] {
+        for folder in ["Recordings", "Models", "Datasets", "Jobs", "Caches", "Logs"] {
             try FileManager.default.createDirectory(at: self.root.appendingPathComponent(folder), withIntermediateDirectories: true)
         }
     }
 
     public func snapshot() throws -> LibrarySnapshot {
-        var issues = recoveryIssues
+        var issues = recoveryIssues + inferenceIssues
         let agents: [AgentDocument] = try documents(table: "agents", issues: &issues).compactMap { (document: AgentDocument) -> AgentDocument? in
             do { return try document.validated() }
             catch { issues.append(.init(id: document.id.uuidString, collection: "agents", message: error.localizedDescription)); return nil }
@@ -123,7 +129,113 @@ public actor LibraryStore {
             do { return try document.validated() }
             catch { issues.append(.init(id: document.id.uuidString, collection: "recordings", message: error.localizedDescription)); return nil }
         }
-        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, issues: issues)
+        let runs: [LearningRunDocument] = try documents(table: "learning_runs", issues: &issues).compactMap { (value: LearningRunDocument) -> LearningRunDocument? in
+            do { return try value.validated() }
+            catch { issues.append(.init(id: value.id.uuidString, collection: "learning_runs", message: error.localizedDescription)); return nil }
+        }
+        let checkpoints: [CheckpointDocument] = try documents(table: "checkpoints", issues: &issues).compactMap { (value: CheckpointDocument) -> CheckpointDocument? in
+            do { return try value.validated() }
+            catch { issues.append(.init(id: value.id.uuidString, collection: "checkpoints", message: error.localizedDescription)); return nil }
+        }
+        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues)
+    }
+
+    public func saveLearningRun(_ document: LearningRunDocument) throws {
+        let value = try document.validated()
+        try database.execute("INSERT INTO learning_runs(id,name,document,created) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,document=excluded.document", [
+            .text(value.id.uuidString), .text(value.name), .blob(try encode(value)), .real(value.createdAt.timeIntervalSince1970)
+        ])
+    }
+
+    public func saveCheckpoint(_ document: CheckpointDocument) throws {
+        let value = try document.validated()
+        try database.transaction {
+            let existing = try database.query("SELECT document FROM checkpoints WHERE id=?", [.text(value.id.uuidString)])
+            if let bytes = existing.first?["document"]?.data {
+                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+                let previous = try decoder.decode(CheckpointDocument.self, from: bytes)
+                guard previous.agentID == value.agentID, previous.policySignature == value.policySignature,
+                      previous.trainingStep == value.trainingStep, previous.parameterCount == value.parameterCount,
+                      previous.kind == value.kind, previous.runID == value.runID else {
+                    throw AstraError("checkpoint.immutable", "A checkpoint's identity and model metadata cannot be overwritten.")
+                }
+            }
+            try database.execute("INSERT INTO checkpoints(id,name,document,created) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,document=excluded.document", [
+                .text(value.id.uuidString), .text(value.name), .blob(try encode(value)), .real(value.createdAt.timeIntervalSince1970)
+            ])
+            try database.execute("INSERT OR IGNORE INTO agent_checkpoints VALUES(?,?)", [.text(value.agentID.uuidString), .text(value.id.uuidString)])
+        }
+    }
+
+    public func checkpointIDs(for agentID: UUID) throws -> Set<UUID> {
+        // Creator rows remain usable when opening an older development catalog
+        // that predates explicit shared links.
+        let rows = try database.query("SELECT checkpoint_id AS id FROM agent_checkpoints WHERE agent_id=? UNION SELECT id FROM checkpoints WHERE json_extract(CAST(document AS TEXT),'$.agentID')=?",
+                                      [.text(agentID.uuidString), .text(agentID.uuidString)])
+        return Set(rows.compactMap { $0["id"]?.string.flatMap(UUID.init(uuidString:)) })
+    }
+
+    /// Call only after the coordinator has established an exclusive library
+    /// lease. Running children of a different coordinator must not be relabeled.
+    public func markAbandonedLearningRunsInterrupted() throws {
+        var issues: [LibraryIssue] = []
+        let runs: [LearningRunDocument] = try documents(table: "learning_runs", issues: &issues)
+        for var run in runs where [.preparing, .running, .cancelling].contains(run.status) {
+            run.status = .interrupted; run.modifiedAt = Date()
+            run.issue = "The previous compute session ended before this run was finalized. Any published checkpoint is preserved."
+            try saveLearningRun(run)
+        }
+    }
+
+    /// Restore persisted control-cleanup warnings after acquiring the library
+    /// lease. This is evidence presentation, not an assertion of OS key state.
+    public func inspectPriorInferenceRuns() throws {
+        inferenceIssues = []
+        do { try inspectInferenceHistory() }
+        catch {
+            inferenceIssues.append(.init(id: "inference.history", collection: "runs",
+                                        message: "Previous control cleanup could not be checked. " + error.localizedDescription))
+        }
+    }
+
+    private func inspectInferenceHistory() throws {
+        let folder = root.appendingPathComponent("Runs", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: folder.path) else { return }
+        let values = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw AstraError("inference.history", "The local run history must be a regular directory.")
+        }
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
+        let runs = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys)
+        guard runs.count <= 4096 else {
+            inferenceIssues = [.init(id: "inference.historyLimit", collection: "runs", message: "Run history is too large to check automatically. Review prior run results before starting live control.")]
+            return
+        }
+        for run in runs {
+            guard let identifier = UUID(uuidString: run.lastPathComponent) else { continue }
+            let values = try run.resourceValues(forKeys: Set(keys))
+            guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+            let result = run.appendingPathComponent("results.json")
+            var message: String?
+            if !FileManager.default.fileExists(atPath: result.path) {
+                message = "A previous agent run was interrupted before its cleanup result was saved. Verify that no controls remain held before starting live control."
+            } else {
+                do {
+                    let properties = try result.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+                    guard properties.isRegularFile == true, properties.isSymbolicLink != true, (properties.fileSize ?? .max) <= 262_144 else {
+                        throw AstraError("inference.history", "A previous run result is missing, linked or oversized.")
+                    }
+                    let value = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: result))
+                    guard case .object(let fields) = value, case .string(let runID) = fields["runID"], UUID(uuidString: runID) == identifier else {
+                        throw AstraError("inference.history", "A previous run result has an inconsistent identity.")
+                    }
+                    if fields["cleanupConfirmed"] != .bool(true) {
+                        message = "A previous control helper ended without confirmed cleanup. Release any remaining held controls manually before starting another run."
+                    }
+                } catch { message = error.localizedDescription }
+            }
+            if let message { inferenceIssues.append(.init(id: identifier.uuidString + ".controlCleanup", collection: "runs", message: message)) }
+        }
     }
 
     public func save(_ document: AgentDocument) throws {
@@ -211,7 +323,15 @@ public actor LibraryStore {
         var copy = source
         copy.id = UUID(); copy.name = String(source.name.prefix(150)) + " copy"
         copy.createdAt = Date(); copy.modifiedAt = copy.createdAt; copy.pinned = false
-        try save(copy)
+        try database.transaction {
+            try save(copy)
+            for identifier in try checkpointIDs(for: source.id) {
+                try database.execute("INSERT OR IGNORE INTO agent_checkpoints VALUES(?,?)", [.text(copy.id.uuidString), .text(identifier.uuidString)])
+            }
+            for identifier in try recordingIDs(for: source.id) {
+                try database.execute("INSERT OR IGNORE INTO agent_recordings VALUES(?,?)", [.text(copy.id.uuidString), .text(identifier.uuidString)])
+            }
+        }
         return copy
     }
 

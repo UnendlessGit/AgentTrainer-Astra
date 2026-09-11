@@ -2,9 +2,61 @@ import Foundation
 import CryptoKit
 import AstraCore
 
+private struct RingFixtureReport: Encodable {
+    let path: String
+    let reference: SharedFrameReference
+    let pixelSHA256: String
+    let pendingCloseRefused: Bool
+}
+private struct RingFixtureRelease: Decodable { let release: SharedFrameAcknowledgement }
+
+private func emit<T: Encodable>(_ value: T) throws {
+    let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+    try FileHandle.standardOutput.write(contentsOf: encoder.encode(value) + Data([10]))
+}
+
+private func readRingRelease() throws -> SharedFrameAcknowledgement {
+    var bytes = Data()
+    while bytes.count <= 4096 {
+        guard let byte = try FileHandle.standardInput.read(upToCount: 1), !byte.isEmpty else {
+            throw AstraError("fixture.eof", "Frame fixture ended before its lease acknowledgement.")
+        }
+        if byte[0] == 10 { return try JSONDecoder().decode(RingFixtureRelease.self, from: bytes).release }
+        bytes.append(byte)
+    }
+    throw AstraError("fixture.oversize", "Frame fixture acknowledgement exceeds its bound.")
+}
+
+private func runRingFixture(parent: URL) throws {
+    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+    let ring = try SharedFrameRing(url: parent.appendingPathComponent(UUID().uuidString + ".astraring"),
+                                   runID: UUID(), slotCount: 1, slotCapacity: 512)
+    for iteration in 0..<2 {
+        let pixels = Data((0..<140).map { UInt8(truncatingIfNeeded: $0 * 17) ^ (iteration == 0 ? 0 : 0xA5) })
+        let surface = SurfaceDescriptor(id: "display:α", globalBounds: .init(x: -1920.5, y: -0.0, width: 5.25, height: 3.75),
+                                        pixelWidth: 7, pixelHeight: 5,
+                                        contentBounds: .init(x: 0.25, y: 0.125, width: 6.5, height: 4.75), geometryRevision: 17)
+        let reference = try ring.publish(pixels: pixels, metadata: .init(eventNanos: UInt64(Int64.max) + 5,
+                                        observedNanos: UInt64(Int64.max) + 13, surface: surface, byteCount: pixels.count))
+        var refused = false
+        do { try ring.close() }
+        catch let error as AstraError where error.code == "frameRing.pendingLeases" { refused = true }
+        guard refused else { throw AstraError("fixture.lease", "A live frame lease was closed unexpectedly.") }
+        try emit(RingFixtureReport(path: ring.url.path, reference: reference, pixelSHA256: Data(SHA256.hash(data: pixels)).hex,
+                                   pendingCloseRefused: refused))
+        try ring.release(readRingRelease())
+    }
+    try ring.close()
+    try emit(["closed": true, "pathExists": FileManager.default.fileExists(atPath: ring.url.path)])
+}
+
 // Development-only interoperability fixture. No capture/input permissions,
 // user content, or recorded events are executed by this tool.
 do {
+    if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--frame-ring" {
+        try runRingFixture(parent: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true))
+        exit(0)
+    }
     guard CommandLine.arguments.count == 2 else {
         throw AstraError("fixture.arguments", "Usage: AstraFixture <output-parent-directory>")
     }

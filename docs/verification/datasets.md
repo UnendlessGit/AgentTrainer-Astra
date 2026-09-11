@@ -1,0 +1,51 @@
+# Causal dataset verification
+
+The 2026-09-06 independent review exercised the real `AstraFixture` native writer → `RecordingReader` → immutable dataset builder → `DatasetReader` → `training_batch` path. The fixture creates synthetic pixels and input records without Screen Recording, Input Monitoring or Accessibility permission; no recorded event is posted. It therefore qualifies storage and data flow, not live native capture/control.
+
+## Tested guarantees
+
+- Observation history is reduced in availability-time order at cutoff `t`; labels use a separate source-time cursor partitioned by the fixed execution grid. Canonicalizer v2 assigns the nearest representable integer-ms timestamp to `[t+L,t+L+T)`, preserving the raw timestamps. With a 20 ms lead, the fixture's first label releases a key that has not yet been observed pressed. Its first observation still has the original pointer and unheld key state. Later delivery of an older pointer event does not backdate that observation.
+- A mid-session selection reconstructs persistent held state and input age, while motion/scroll accumulators cover only the preceding decision interval. An explicit zero end time is honored rather than interpreted as an unspecified bound. Invalid/reversed selections fail before publication.
+- A source geometry change starts a new episode and resets recurrence. Training lanes reject skipped/repeated steps, missing resets at episode/geometry changes, and interior padding. A TBPTT chunk may begin at a nonzero step. Tail padding does not produce expert commands.
+- Session splits depend on complete source identity and a fixed seed, independently of selection order. Insufficient independent sessions have explicit warnings. Native fixture copies used in tests establish split mechanics, not independent behavioral evidence.
+- Every derived packet must fit both the semantic command capacity and the neural pointing/delta vocabulary before a revision is published. A late interval with 20 commands and a separately tested coarse coordinate vocabulary both reject the entire unpublished revision. Source files remain intact.
+- Motion simplification uses time as the independent variable, retains control anchors, and checks original sample times after millisecond quantization. Decoded relative trajectories reconstruct every tested cumulative raw-count sample within one count. Absolute knot quantization permits at most 0.25 logical point error, leaving 0.75 for trajectory reconstruction. Reconciliation does not become expert key/button presses.
+- Dataset manifests are size-checked before reading; indexes have checksums, bounded row lengths, schema/integrity/count checks, complete episode step sequences and consistent source splits. Loaded samples validate frame causality, source coverage, controls, context and command encoding before learning. Tests also reject malformed indexes whose checksums were recomputed after mutation.
+- Dataset readers retain at most four recording readers, evicting before opening another. Interleaved episode iterators survive eviction and reopen with source-manifest verification. Iterator cleanup precedes closing recording databases. Cancellation removes owned unpublished staging work and preserves source bytes exactly.
+
+The earlier 2026-09-06 review passed 32 focused data tests with warnings treated as errors. The 2026-09-08 version-2 partition review passed all 43 canonicalization, data-preparation and dataset tests; see the versioned partition evidence below. The integrated suite passed 152 tests at an earlier checkpoint; these historical counts are not a final release qualification. Focused reproduction:
+
+```sh
+.venv/bin/python -m pytest python/tests/test_canonicalization.py python/tests/test_data_preparation.py python/tests/test_datasets.py -q -W error
+```
+
+Dataset container schema remains 1. Each revision records the complete model configuration, action vocabulary, canonicalizer version, timing, source-manifest hashes and selections; loading an unsupported model-configuration version fails rather than silently changing learned visual semantics. The model padding review advances model configuration to version 2 without changing `LearningSample` or `training_batch` signatures.
+
+## Version-2 timestamp partition (2026-09-08)
+
+The independently reviewed correction replaces the version-1 rejection of discrete events in the final half millisecond. The shared `astra.versions.CANONICALIZER_VERSION` is now 2 and participates in dataset/checkpoint identity. Dataset container schema and native integer-ms wire commands are unchanged; a version-1 revision is rejected instead of silently reinterpreted.
+
+For each source selection, the fixed grid origin `O` is its first observation cutoff plus the configured lead. A source timestamp `s` maps to `O + 1,000,000 * floor((s - O + 500,000) / 1,000,000)` nanoseconds. Integer arithmetic avoids precision loss on large monotonic clocks. Ties go toward the later millisecond. Packet membership uses the quantized timestamp in a half-open execution interval. Thus a 99.8 ms transition belongs to the following packet at offset 0, with 0.2 ms error; it is neither clamped to 99 ms nor emitted twice. Same-time and rounded-time ties retain source-time/sequence order.
+
+The builder's one-event source lookahead is the streaming carry between packets. Both assignment and label-only boundary pointer state use that partition; the separate availability-ordered `ControlHistory` is unchanged. Raw events before the user's source selection can seed existing held state but cannot become new selected labels. Motion keeps its start anchor, ordered control-position anchors and terminal held-position knot, along with the original 0.75-point/count reconstruction and 0.25-point coordinate budgets. Reconciliation and boundary records never create expert commands. Any raw discontinuity within covered execution time rejects the revision even when its rounded timestamp lands just beyond the final packet.
+
+Each source manifest now includes a validated `labelPartition`: source/execution bounds, grid origin, assigned physical/discrete event counts, exact before/after exclusion counts and at most eight examples. Events inside the selected raw range whose nearest packet falls outside complete action coverage are explicitly excluded and summarized in a warning. This includes the initial lead and final incomplete/rounding tail. The report distinguishes discrete transitions from pointer observations and does not claim pointer samples are emitted one-for-one. Source recordings remain byte-for-byte unchanged.
+
+The warnings-as-errors regression campaign covers:
+
+- 10,000 discrete transitions jittered around 1,000 packet boundaries, including ±0.49 ms, exact ±0.5 ms ties, one-nanosecond offsets and an odd clock origin above `2**62`. Every transition appears exactly once with at most 0.5 ms error; the streaming test retains at most ten events plus one lookahead.
+- Representable boundary motion, the original start anchor, click position and relative original order at a shared rounded instant; existing fast-motion failures and cumulative relative-count reconstruction remain enforced.
+- A derivative of the actual permission-free native fixture: transitions at 61.8/62.2 ms move into the following packet at offset zero, while the observation still has the earlier key state. Initial-lead/final-tail exclusions have exact expected counts and examples, and source file hashes remain unchanged.
+- Raw selection edges: an event just before selection is not pulled in as a label by rounding, and a selected event rounded beyond the final complete packet is reported rather than silently lost.
+- Rejection of stale canonicalizer identities, malformed partition bounds/counts, and a raw discontinuity in the final rounding tail. Absolute action targets use half-open normalized coordinates `[0,1)`, matching native surface ownership.
+
+On 2026-09-08, `.venv/bin/python -m pytest python/tests/test_canonicalization.py python/tests/test_datasets.py -q -W error` passed **35 tests in 1.32 seconds**. The combined canonicalization/data-preparation/dataset command above then passed **43 tests in 1.07 seconds**, also with warnings treated as errors. These checks establish exact discrete partition mechanics and conservative motion qualification; they do not replace native live recording or cross-packet motion quality experiments.
+
+## Remaining gates and explicit limitations
+
+- The current native recorder and dataset builder operate on one stable surface role. Sources containing multiple roles are rejected instead of silently retaining only the latest surface. Aligned multi-surface observation groups remain required for full application/desktop coverage.
+- Each source currently has one contiguous selection and fixed context choices per revision. Multi-range exclusions, context changes, timeline/replay UI, correction data and library relocation still need product integration.
+- Fast fractional-time trajectories that cannot meet the spatial bound at 1 ms resolution still fail visibly. In particular, motion carried across a packet boundary is checked against original sample times and the explicit initial held-position anchor; a neighboring continuous-curve optimizer may preserve additional trajectories that conservative per-packet qualification currently rejects. Do not respond to such failures by loosening error tolerances or blindly increasing packet capacity. Cross-packet curve optimization and rejection frequency on representative human recordings remain empirical gates.
+- Absolute trajectories require an unambiguous observed surface, including their boundary position. Starting outside the selected surface can require an explicit trimmed selection until broader surface/control handling is integrated.
+- Resource admission bounds source-event batches, metadata, rows, episodes and open readers. Long-session throughput, aggregate preprocessing/batch memory, producer coverage watermarks, real storage faults and end-to-end installed-app recording/training remain separate release gates.
+- These checks establish causal and numerical data mechanics. They do not establish held-out generalization, meaningful reinforcement learning, real-time inference, or a finished application.

@@ -14,6 +14,15 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private(set) var environments: [EnvironmentDocument] = []
     private(set) var issues: [LibraryIssue] = []
     private(set) var recordings: [RecordingManifest] = []
+    private(set) var learningRuns: [LearningRunDocument] = []
+    private(set) var checkpoints: [CheckpointDocument] = []
+    private(set) var learning: LearningCoordinator?
+    private(set) var inference: InferenceCoordinator?
+    private(set) var refreshingSources = false
+    private(set) var sourceIssue: String?
+    private(set) var checkpointContextSizes: [Int] = []
+    private var checkpointContextGeneration = UUID()
+    private(set) var isClosing = false
     private(set) var sources: [CaptureSource] = []
     private(set) var permissions = PermissionSnapshot.current()
     private(set) var recordingProgress: RecordingProgress?
@@ -21,6 +30,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private(set) var recordingCountdown: Int?
     private(set) var recordingStopping = false
     var showingRecorder = false
+    var recordingToInspect: RecordingManifest?
     private(set) var loading = true
     private(set) var saving = false
     var destination: WorkspaceDestination? = .library
@@ -28,11 +38,18 @@ enum AgentSection: String, CaseIterable, Identifiable {
     var errorMessage: String?
     var showingNewAgent = false
     private var store: LibraryStore?
+    private var libraryLease: LibraryLease?
     private var started = false
+    private var acknowledgedUnconfirmedControlRun: UUID?
     private var recorder: RecordingSession?
     private var recordingAgentID: UUID?
     private var activeRecordingID: UUID?
     private(set) var recordingLinks: [UUID: Set<UUID>] = [:]
+    private(set) var checkpointLinks: [UUID: Set<UUID>] = [:]
+
+    init(inferenceCoordinator: InferenceCoordinator? = nil) {
+        self.inference = inferenceCoordinator
+    }
 
     var selectedAgent: AgentDocument? {
         guard case .agent(let id) = destination else { return nil }
@@ -52,8 +69,19 @@ enum AgentSection: String, CaseIterable, Identifiable {
         started = true
         do {
             let root = supportRoot
-            store = try await Task.detached { try LibraryStore(root: root) }.value
+            let opened = try await Task.detached {
+                let lease = try LibraryLease(root: root)
+                return (lease, try LibraryStore(root: root))
+            }.value
+            libraryLease = opened.0; store = opened.1
+            learning = LearningCoordinator(store: opened.1, root: root) { [weak self] in
+                do { try await self?.refresh() }
+                catch { self?.errorMessage = error.localizedDescription }
+            }
+            inference = InferenceCoordinator(store: opened.1, root: root)
             _ = try await store?.recoverInterruptedRecordings()
+            try await store?.markAbandonedLearningRunsInterrupted()
+            try await store?.inspectPriorInferenceRuns()
             try await refresh()
             if let first = agents.first { destination = .agent(first.id) }
         } catch { errorMessage = error.localizedDescription }
@@ -85,14 +113,21 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     func refreshPermissionsAndSources() async {
+        guard !refreshingSources else { return }
+        refreshingSources = true
+        defer { refreshingSources = false }
+        sourceIssue = nil
         permissions = PermissionSnapshot.current()
-        guard permissions.screenRecording else { sources = []; return }
+        guard permissions.screenRecording else {
+            sources = []; sourceIssue = "Allow Screen Recording for Astra in System Settings, then refresh environments."
+            return
+        }
         do { sources = try await CaptureDiscovery.sources() }
-        catch { errorMessage = error.localizedDescription }
+        catch { sources = []; sourceIssue = error.localizedDescription }
     }
 
     func startRecording(source: CaptureSource, name: String, fps: Int) async {
-        guard let store, !recordingStarting, !recordingStopping, recorder == nil else { return }
+        guard let store, !isClosing, !isRunningAgent, !recordingStarting, !recordingStopping, recorder == nil else { return }
         permissions = PermissionSnapshot.current()
         guard permissions.screenRecording && permissions.inputMonitoring else {
             errorMessage = "Screen Recording and Input Monitoring permissions are required to record a demonstration."
@@ -183,6 +218,99 @@ enum AgentSection: String, CaseIterable, Identifiable {
 
     var isRecording: Bool { recorder != nil }
 
+    var isLearning: Bool { learning?.isBusy == true }
+    var isRunningAgent: Bool { inference?.isBusy == true }
+
+    var inferenceUnavailableReason: String? {
+        if isClosing { return "The workspace is closing." }
+        if isRecording || recordingStarting || recordingStopping { return "Finish recording before running an agent." }
+        if isLearning { return "Finish learning before starting live control." }
+        return nil
+    }
+
+    func startInference(agent: AgentDocument, checkpoint: CheckpointDocument, source: CaptureSource, options: InferenceOptions) {
+        do {
+            guard inferenceUnavailableReason == nil else { throw AstraError("inference.busy", inferenceUnavailableReason!) }
+            guard let inference else { throw AstraError("inference.workspace", "The workspace is still opening.") }
+            try inference.start(agent: agent, checkpoint: checkpoint, source: source, options: options)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func inspectCheckpointContexts(_ id: UUID?, agentID: UUID) async {
+        let generation = UUID(); checkpointContextGeneration = generation; checkpointContextSizes = []
+        guard let id, checkpointLinks[agentID]?.contains(id) == true else { return }
+        do {
+            let metadata = try await LearningFiles.read(supportRoot.appendingPathComponent("Models").appendingPathComponent(id.uuidString.lowercased()).appendingPathComponent("manifest.json"))
+            guard case .array(let sizes) = metadata.fields?["model"]?.fields?["context_sizes"], sizes.count <= 32,
+                  sizes.allSatisfy({ $0.int.map { (1...65_536).contains($0) } == true }) else {
+                throw AstraError("inference.contexts", "The selected checkpoint's context configuration is invalid.")
+            }
+            if checkpointContextGeneration == generation { checkpointContextSizes = sizes.compactMap(\.int) }
+        } catch {
+            if checkpointContextGeneration == generation { errorMessage = error.localizedDescription }
+        }
+    }
+
+    func startBehaviorTraining(agent: AgentDocument, options: BehaviorOptions) {
+        do {
+            guard !isClosing, !isRunningAgent else { throw AstraError("learning.closing", "Stop live control before starting another learning operation.") }
+            guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
+            try learning.start(agent: agent, options: options,
+                               recordings: recordings.filter { recordingLinks[agent.id]?.contains($0.id) == true })
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func evaluateCheckpoint(_ checkpoint: CheckpointDocument, agentID: UUID, split: String) {
+        do {
+            guard !isClosing, !isRunningAgent else { throw AstraError("learning.closing", "Stop live control before starting evaluation.") }
+            guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
+            try learning.evaluate(checkpoint: checkpoint, agentID: agentID, split: split)
+        }
+        catch { errorMessage = error.localizedDescription }
+    }
+
+    func startReinforcementTraining(agent: AgentDocument, options: ReinforcementOptions) throws {
+        guard !isClosing, !isRunningAgent else { throw AstraError("learning.closing", "Stop live control before starting learning.") }
+        guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
+        try learning.startReinforcement(agent: agent, options: options)
+    }
+
+    func selectCheckpoint(_ id: UUID?, agentID: UUID) async {
+        guard let store, var agent = agents.first(where: { $0.id == agentID }) else { return }
+        if let id, checkpointLinks[agentID]?.contains(id) != true || !checkpoints.contains(where: { $0.id == id }) {
+            errorMessage = "This checkpoint is not linked to the selected agent."; return
+        }
+        do {
+            agent.selectedCheckpointID = id; agent.modifiedAt = Date()
+            try await store.save(agent); try await refresh()
+            await inspectCheckpointContexts(id, agentID: agentID)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func stopLearningAndWait() async { await learning?.stopAndWait() }
+
+    @discardableResult
+    func prepareForTermination() async -> Bool {
+        isClosing = true
+        // Both owners receive stop promptly. The application exits only after
+        // capture is sealed and learning has published its terminal checkpoint.
+        async let recording: Void = stopRecording()
+        async let learning: Void = stopLearningAndWait()
+        async let inferenceStop: Void = inference?.stopAndWait() ?? ()
+        _ = await (recording, learning, inferenceStop)
+        while recordingStarting || recordingStopping {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        if let inference, let run = inference.runID, !inference.cleanupConfirmed,
+           acknowledgedUnconfirmedControlRun != run {
+            acknowledgedUnconfirmedControlRun = run
+            isClosing = false
+            errorMessage = "The control helper exited before input cleanup could be confirmed. Release any held controls manually. Quit again when you are ready to close Astra."
+            return false
+        }
+        return true
+    }
+
     func duplicateSelectedAgent() async {
         guard let store, let selectedAgent else { return }
         do {
@@ -195,8 +323,12 @@ enum AgentSection: String, CaseIterable, Identifiable {
         guard let store else { return }
         let snapshot = try await store.snapshot()
         agents = snapshot.agents; environments = snapshot.environments; recordings = snapshot.recordings; issues = snapshot.issues
+        learningRuns = snapshot.learningRuns; checkpoints = snapshot.checkpoints
         var links: [UUID: Set<UUID>] = [:]
         for agent in agents { links[agent.id] = try await store.recordingIDs(for: agent.id) }
         recordingLinks = links
+        var models: [UUID: Set<UUID>] = [:]
+        for agent in agents { models[agent.id] = try await store.checkpointIDs(for: agent.id) }
+        checkpointLinks = models
     }
 }

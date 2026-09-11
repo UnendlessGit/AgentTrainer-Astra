@@ -35,16 +35,23 @@ import AstraPlatform
 @MainActor private final class AstraAppDelegate: NSObject, NSApplicationDelegate {
     weak var model: WorkspaceModel?
     private var terminating = false
+    private var terminationSignal: DispatchSourceSignal?
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Development relaunch and normal process termination must run the
+        // same save/disarm path as Quit, rather than interrupting a checkpoint.
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler { NSApplication.shared.terminate(nil) }
+        terminationSignal = source; source.resume()
+    }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model, model.isRecording || model.recordingStarting || model.recordingStopping else { return .terminateNow }
+        guard let model, model.isRecording || model.recordingStarting || model.recordingStopping || model.isLearning || model.isRunningAgent else { return .terminateNow }
         guard !terminating else { return .terminateLater }
         terminating = true
         Task {
-            await model.stopRecording()
-            while model.recordingStarting || model.recordingStopping {
-                try? await Task.sleep(for: .milliseconds(50))
-            }
-            sender.reply(toApplicationShouldTerminate: true)
+            let allowed = await model.prepareForTermination()
+            if !allowed { terminating = false }
+            sender.reply(toApplicationShouldTerminate: allowed)
         }
         return .terminateLater
     }
@@ -58,13 +65,21 @@ private struct StatusMenu: View {
         if model.isRecording || model.recordingStarting {
             Button("Stop Recording") { Task { await model.stopRecording() } }.disabled(model.recordingStopping)
         }
+        if let learning = model.learning, learning.isBusy {
+            Text(learning.phase)
+            Button("Stop Learning") { Task { await learning.requestStop() } }.disabled(learning.isStopping)
+        }
+        if let inference = model.inference, inference.isBusy {
+            Text(inference.phase)
+            Button("Stop Agent") { Task { await inference.stopAndWait() } }.disabled(inference.isStopping)
+        }
         Divider()
         Button("Show AgentTrainer Astra") { openWindow(id: "workspace"); NSApp.activate(ignoringOtherApps: true) }
         Button("Quit AgentTrainer Astra") { NSApp.terminate(nil) }
     }
 }
 
-private struct WorkspaceView: View {
+struct WorkspaceView: View {
     @Bindable var model: WorkspaceModel
 
     var body: some View {
@@ -98,6 +113,8 @@ private struct WorkspaceView: View {
             } else {
                 VStack(spacing: 0) {
                     if model.isRecording || model.recordingStarting { RecordingBanner(model: model) }
+                    if let learning = model.learning, learning.isBusy { LearningBanner(learning: learning) }
+                    if let inference = model.inference, inference.isBusy { InferenceBanner(coordinator: inference) }
                     if !model.issues.isEmpty { recoveryBanner }
                     switch model.destination {
                     case .agent:
@@ -105,8 +122,7 @@ private struct WorkspaceView: View {
                         else { welcome }
                     case .library: LibraryOverview(model: model)
                     case .activity:
-                        ContentUnavailableView("No activity yet", systemImage: "clock.arrow.circlepath",
-                                               description: Text("Training, evaluations, and execution sessions will appear here."))
+                        ScrollView { LearningRunList(runs: model.learningRuns, model: model).padding(28) }
                     case nil: welcome
                     }
                 }
@@ -121,6 +137,10 @@ private struct WorkspaceView: View {
         }
         .sheet(isPresented: $model.showingNewAgent) { NewAgentSheet(model: model) }
         .sheet(isPresented: $model.showingRecorder) { RecorderSheet(model: model) }
+        .sheet(item: $model.recordingToInspect) { recording in
+            RecordingInspector(recording: recording, directory: model.supportRoot.appendingPathComponent("Recordings")
+                .appendingPathComponent(recording.id.uuidString + ".astrarecord"))
+        }
         .alert("Workspace needs attention", isPresented: Binding(
             get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } }
         )) { Button("OK") { model.errorMessage = nil } } message: { Text(model.errorMessage ?? "") }
@@ -137,8 +157,8 @@ private struct WorkspaceView: View {
         HStack(alignment: .top) {
             Image(systemName: "exclamationmark.triangle")
             VStack(alignment: .leading, spacing: 3) {
-                Text("\(model.issues.count) library items need recovery").fontWeight(.medium)
-                Text("Their data has been preserved. \(model.issues.first?.message ?? "")")
+                Text("\(model.issues.count) workspace items need attention").fontWeight(.medium)
+                Text(model.issues.first?.message ?? "")
                     .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             }
             Spacer()
@@ -156,8 +176,16 @@ private struct AgentWorkspace: View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(agent.name).font(.largeTitle.weight(.semibold)).textSelection(.enabled)
-                    Text("\(environmentName)  ·  No checkpoint selected").foregroundStyle(.secondary)
+                    Text(agent.name).font(.largeTitle.weight(.semibold)).textSelection(.enabled).lineLimit(2).help(agent.name)
+                    Text(environmentName).foregroundStyle(.secondary)
+                    Picker("Checkpoint", selection: Binding(get: { agent.selectedCheckpointID }, set: { selected in
+                        Task { await model.selectCheckpoint(selected, agentID: agent.id) }
+                    })) {
+                        Text("No checkpoint selected").tag(nil as UUID?)
+                        ForEach(model.checkpoints.filter { model.checkpointLinks[agent.id]?.contains($0.id) == true }) { checkpoint in
+                            Text(checkpoint.name).tag(Optional(checkpoint.id))
+                        }
+                    }.frame(maxWidth: 400, alignment: .leading).disabled(model.checkpointLinks[agent.id]?.isEmpty != false)
                 }
                 Spacer()
                 Menu {
@@ -179,17 +207,22 @@ private struct AgentWorkspace: View {
                                 .buttonStyle(.borderedProminent)
                                 .disabled(model.isRecording || model.recordingStarting || model.recordingStopping)
                         }
-                        RecordingList(recordings: model.recordings.filter { model.recordingLinks[agent.id]?.contains($0.id) == true })
+                        RecordingList(recordings: model.recordings.filter { model.recordingLinks[agent.id]?.contains($0.id) == true }, onOpen: { model.recordingToInspect = $0 })
                     }
                 case .training:
-                    ContentUnavailableView("No training runs yet", systemImage: "chart.xyaxis.line",
-                                           description: Text("Imitation and reinforcement experiments belong to this agent, with their own saved configurations and checkpoints."))
+                    LearningTrainingView(agent: agent, model: model).id(agent.id)
                 case .evaluation:
-                    ContentUnavailableView("No evaluations yet", systemImage: "checkmark.seal",
-                                           description: Text("Compare frozen checkpoints using repeatable tasks and held-out demonstrations."))
+                    LearningEvaluationView(agent: agent, model: model).id(agent.id)
                 case .run:
-                    ContentUnavailableView("Select a trained checkpoint", systemImage: "play.circle",
-                                           description: Text("Live execution uses the selected checkpoint and a verified environment."))
+                    RunView(coordinator: model.inference,
+                            checkpoints: model.checkpoints.filter { model.checkpointLinks[agent.id]?.contains($0.id) == true },
+                            sources: model.sources, refreshingSources: model.refreshingSources, sourceIssue: model.sourceIssue,
+                            unavailableReason: model.inferenceUnavailableReason, contextSizes: model.checkpointContextSizes,
+                            selectedCheckpointID: agent.selectedCheckpointID,
+                            refreshSources: { Task { await model.refreshPermissionsAndSources() } },
+                            selectCheckpoint: { id in Task { await model.selectCheckpoint(id, agentID: agent.id) } },
+                            start: { checkpoint, source, options in model.startInference(agent: agent, checkpoint: checkpoint, source: source, options: options) })
+                        .task(id: agent.selectedCheckpointID) { await model.inspectCheckpointContexts(agent.selectedCheckpointID, agentID: agent.id) }
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -218,7 +251,7 @@ private struct LibraryOverview: View {
                     Button("Record…", systemImage: "record.circle") { model.showingRecorder = true }
                         .disabled(model.isRecording || model.recordingStarting)
                 }
-                RecordingList(recordings: model.recordings)
+                RecordingList(recordings: model.recordings, onOpen: { model.recordingToInspect = $0 })
             }
         }.padding(28).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }

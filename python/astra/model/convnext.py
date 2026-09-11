@@ -16,6 +16,24 @@ import numpy as np
 from .config import ModelConfig
 
 
+def content_mask(rect: mx.array, height: int, width: int) -> mx.array:
+    """Cells intersecting real content, as an NHWC-broadcastable Boolean mask.
+
+    Image-size masks use exact pixel bounds; stride masks retain partial edge
+    cells. The caller passes the same normalized content rectangle throughout
+    the pyramid, without stretching it to fill the padded canvas.
+    """
+    yy, xx = mx.meshgrid(mx.arange(height, dtype=mx.float32), mx.arange(width, dtype=mx.float32), indexing="ij")
+    low = mx.stack((xx / width, yy / height), axis=-1)[None]
+    high = mx.stack(((xx + 1) / width, (yy + 1) / height), axis=-1)[None]
+    origin, extent = rect[:, None, None, :2], rect[:, None, None, 2:]
+    return mx.all((high > origin) & (low < origin + extent) & (extent > 0), axis=-1)[..., None]
+
+
+def mask_content(value: mx.array, mask: mx.array | None) -> mx.array:
+    return value if mask is None else mx.where(mask, value, 0.0)
+
+
 class Downsample(nn.Module):
     def __init__(self, input_width: int, output_width: int, *, stem: bool = False):
         super().__init__()
@@ -23,8 +41,13 @@ class Downsample(nn.Module):
         self.conv = nn.Conv2d(input_width, output_width, 4 if stem else 2, stride=4 if stem else 2)
         self.norm = nn.LayerNorm(output_width if stem else input_width, eps=1e-6)
 
-    def __call__(self, x):
-        return self.norm(self.conv(x)) if self.stem else self.conv(self.norm(x))
+    def __call__(self, x, *, input_mask=None, output_mask=None):
+        x = mask_content(x, input_mask)
+        if self.stem:
+            return mask_content(self.norm(self.conv(x)), output_mask)
+        # Mask *after* normalization too: its trainable bias must not turn
+        # padding into an input to a neighboring valid convolution cell.
+        return mask_content(self.conv(mask_content(self.norm(x), input_mask)), output_mask)
 
 
 class ConvNeXtBlock(nn.Module):
@@ -36,9 +59,10 @@ class ConvNeXtBlock(nn.Module):
         self.contract = nn.Linear(4 * width, width)
         self.scale = mx.full((width,), 1e-6)
 
-    def __call__(self, x):
+    def __call__(self, x, *, mask=None):
+        x = mask_content(x, mask)
         residual = self.contract(nn.gelu(self.expand(self.norm(self.depthwise(x)))))
-        return x + residual * self.scale
+        return mask_content(x + residual * self.scale, mask)
 
 
 class ConvNeXtEncoder(nn.Module):
@@ -53,14 +77,22 @@ class ConvNeXtEncoder(nn.Module):
                        for width, depth in zip(self.dims, self.depths)]
         self.final_norm = nn.LayerNorm(self.dims[-1], eps=1e-6)
 
-    def __call__(self, x):
+    def __call__(self, x, content_rect: mx.array | None = None):
         if x.ndim != 4 or x.shape[-1] != 3 or min(x.shape[1:3]) < 32:
             raise ValueError("ConvNeXt expects NHWC RGB images at least 32 pixels per side")
         stages = []
+        mask = None
+        if content_rect is not None:
+            if content_rect.shape != (x.shape[0], 4):
+                raise ValueError("Backbone content rectangles must match its image batch")
+            mask = content_mask(content_rect, *x.shape[1:3])
         for downsample, blocks in zip(self.downsamples, self.stages):
-            x = downsample(x)
+            stride = 4 if downsample.stem else 2
+            next_mask = None if content_rect is None else content_mask(content_rect, x.shape[1] // stride, x.shape[2] // stride)
+            x = downsample(x, input_mask=mask, output_mask=next_mask)
+            mask = next_mask
             for block in blocks:
-                x = block(x)
+                x = block(x, mask=mask)
             stages.append(x)
         return stages
 

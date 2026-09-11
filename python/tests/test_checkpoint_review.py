@@ -109,7 +109,7 @@ def test_parameter_budget_rejects_before_constructing_any_model(tmp_path, monkey
     destination = tmp_path / str(uuid.uuid4())
     manifest = save_checkpoint(destination, _policy(), kind="initial", step=0)
     manifest["model"] = replace(ModelConfig.test_small(), recurrent_width=8192).to_dict()
-    identity = {"model": manifest["model"], "actions": manifest["actions"], "canonicalizerVersion": 1}
+    identity = {"model": manifest["model"], "actions": manifest["actions"], "canonicalizerVersion": manifest["canonicalizerVersion"]}
     manifest["policySignature"] = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     (destination / "manifest.json").write_text(json.dumps(manifest))
     constructions = []

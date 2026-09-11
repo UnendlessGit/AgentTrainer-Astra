@@ -1,0 +1,35 @@
+# Rollout boundaries and PPO math
+
+`python/astra/learning/rl.py` implements the return calculation and differentiable PPO objective used by the learner. It does not implement an actor, rollout collection, a recurrent training loop, reward authoring, or checkpoint activation. Those remain separate integration and release gates.
+
+## Rollout contract
+
+`Transition` is an immutable scalar record identifying the run, behavior policy, episode, step, observation, sampled packet, current and next decision cutoffs, reward window, exact old joint packet log probability, behavior value, bootstrap, outcome and recurrent reset. Immutable `Rollout.transitions` is a tuple from a single run/policy. Observation and packet identities are unique. Same-episode steps and decision windows are contiguous; missing intervals must appear explicitly as invalid transitions. The referenced observation/packet/state payloads remain in the rollout store.
+
+`RewardWindow(start_nanos, end_nanos, value)` must exactly match `[decision_nanos, next_decision_nanos)`. The execution lead never shifts this window. A valid continuing or truncated transition requires `BootstrapObservation(episode_id, policy_id, observation_id, cutoff_nanos, value)`, evaluated at the next cutoff using the same behavior policy and pre-reset recurrent state. Adjacent valid decisions check bootstrap observation/value agreement. Termination has zero bootstrap. Abort is invalid and cannot bootstrap. An invalid transition requires a reason and can omit unavailable reward/value/likelihood fields.
+
+New episodes require new identities, step zero and recurrent reset. Recurrence continues across ordinary chunk boundaries; a rollout beginning mid-episode requires `initial_state_id`. After an invalid interval, a continuing same-episode stream requires an explicit recurrent reset. Neither an episode change nor invalid data can silently propagate a GAE trace. The trainer remains responsible for loading the identified state and proving burn-in/full-prefix agreement.
+
+## Returns
+
+For duration `d` seconds, defaults are `gamma = 2 ** (-d / 30)` and `lambda = .95 ** (d / .1)`. The TD residual is `reward + gamma * bootstrap_value - behavior_value`. GAE adds `gamma * lambda * next_advantage` only across consecutive valid decisions in the same uninterrupted episode. A truncation uses its final observation value and breaks the trace before reset. A continuing final row bootstraps a rollout collection cutoff. Invalid rows produce zero targets with `valid=False`; prior valid rows may still use their independently valid bootstrap, but cannot propagate through the invalid row.
+
+`duration_aware_gae(Rollout, ReturnConfig())` returns read-only FP32 advantages/returns, Boolean validity, and discount/trace arrays. Calculations use FP64 host intermediates and reject nonfinite or out-of-FP32 targets. `normalize_advantages` operates once over valid rollout decisions before minibatch subdivision, leaving excluded rows zero.
+
+The estimator follows [generalized advantage estimation](https://arxiv.org/abs/1506.02438); explicit time-limit bootstrapping follows the distinction developed in [Time Limits in Reinforcement Learning](https://proceedings.mlr.press/v80/pardo18a.html). The duration scaling and concrete settings are Astra's initial ADR choices, subject to the planned experiments.
+
+## PPO objective and integration
+
+Call `ppo_loss(new_log_probabilities, new_values, conditional_entropies, old_log_probabilities=..., advantages=..., returns=..., valid=..., config=PPOConfig())`. Every equally shaped floating tensor entry is one complete decision, including in `(batch, time)` recurrent batches. Combine rollout validity with the loss-step mask to exclude burn-in and padding. Likelihoods must be `PacketDistributionResult.log_probability`, which sums END, timing and every active argument. Ratios are `exp(new_joint_log_prob - old_joint_log_prob)` and are clipped once per packet at `[.8, 1.2]`, following the [PPO clipped objective](https://arxiv.org/abs/1707.06347). No factor averaging or per-token clipping occurs.
+
+The returned `PPOLoss` reports the negative clipped policy objective, mean squared value error, raw packet entropy surrogate, and total `policy + .5 * value - .01 * entropy_scale * entropy`. Each term averages over valid decisions. Old likelihoods, advantages and returns have stopped gradients. Inputs are masked before arithmetic, so NaN padding cannot poison likelihood exponentiation or the loss.
+
+The entropy input is the **sum of conditional categorical entropies at visited packet prefixes**. Its expectation under sampled behavior prefixes is a surrogate, not the exact joint entropy of the updated policy. `entropy_scale` is a fixed per-run normalization (default 1); it must not vary with sampled packet length. Selection of its production weighting and measurement of action-length bias remain experimental work.
+
+Before the first update, `verify_behavior_log_probabilities(recorded, recomputed, valid)` rejects changed packet scoring, stale recurrence or random preprocessing drift. During updates, `sampled_kl = mean(expm1(log_ratio) - log_ratio)` estimates `KL(old || new)` with nonnegative summands. The signed `mean(old_log - new_log)` is also reported. The nonnegative estimate uses exact joint ratios, remains stable near ratio one, and is a sampled estimate rather than an exact divergence.
+
+Evaluate `PPOLoss.should_stop` **before applying gradients**. It is true when sampled KL exceeds .02, any valid objective input/result is nonfinite, or the batch has no valid loss decisions. Nonfinite valid ratios are not silently clamped. Check gradient finiteness separately, clip gradient norm in the trainer, and retain the pre-update parameters until admission succeeds. This loss primitive alone does not implement optimizer rollback or guarantee the next proposal. The actual recurrent trainer adds complete-rollout candidate validation and bounded backtracking before admitting weights and moments, as described in [the trainer qualification](recurrent-ppo.md). Diagnostics include valid count, ratio minimum/mean/maximum and clipping fraction.
+
+## Executed verification
+
+On September 6, 2026, `.venv/bin/python -m pytest python/tests/test_rl.py -q` passed all 32 focused tests. The combined RL, action-distribution and policy-core run passed all 51 tests. The focused tests cover hand-computed irregular-duration GAE, terminal/truncated/aborted/invalid boundaries, collection cutoffs, shifted reward rejection, recurrence/policy/observation identity errors, immutable targets, lambda endpoints, ratio one, positive/negative advantage clipping and its saturated gradients, whole-packet ratios, KL stopping, masked NaN inputs, finite gradients and stopped targets. An integration check samples real `PacketDecoder` packets, replays their likelihoods, differentiates the PPO objective through the decoder and verifies an objective-improving parameter step. It uses the small numerical-test model and is not evidence of successful full-policy RL training or closed-loop learning.

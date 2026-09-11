@@ -11,7 +11,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import ModelConfig
-from .convnext import ConvNeXtEncoder
+from .convnext import ConvNeXtEncoder, content_mask, mask_content
 from .observation import ObservationBatch, SurfaceBatch
 
 
@@ -35,12 +35,21 @@ def align_features(value: mx.array, height: int, width: int, source_rect: mx.arr
     destination = mx.stack((xx, yy), axis=-1)[None]
     surface = (destination - destination_rect[:, None, None, :2]) / mx.maximum(destination_rect[:, None, None, 2:], 1e-8)
     source = source_rect[:, None, None, :2] + surface * source_rect[:, None, None, 2:]
-    position = source * mx.array([value.shape[2], value.shape[1]]) - 0.5
+    grid = mx.array([value.shape[2], value.shape[1]])
+    position = source * grid - 0.5
+    # Extend the nearest real-content feature at its boundary. Clamping to
+    # canvas edges would interpolate extra masked cells when another sample
+    # enlarges a spatial batch bucket, changing the same observation's policy.
+    first = mx.clip(mx.floor(source_rect[:, :2] * grid), 0, grid - 1)
+    last = mx.clip(mx.ceil((source_rect[:, :2] + source_rect[:, 2:]) * grid) - 1, 0, grid - 1)
+    first, last = mx.stop_gradient(first), mx.stop_gradient(mx.maximum(first, last))
+    position = mx.minimum(mx.maximum(position, first[:, None, None]), last[:, None, None])
     lower = mx.floor(position)
     fraction = position - lower
     lower = mx.stop_gradient(lower.astype(mx.int32))
-    x0, y0 = mx.clip(lower[..., 0], 0, value.shape[2] - 1), mx.clip(lower[..., 1], 0, value.shape[1] - 1)
-    x1, y1 = mx.clip(lower[..., 0] + 1, 0, value.shape[2] - 1), mx.clip(lower[..., 1] + 1, 0, value.shape[1] - 1)
+    x0, y0 = lower[..., 0], lower[..., 1]
+    x1 = mx.minimum(lower[..., 0] + 1, last[:, None, None, 0]).astype(mx.int32)
+    y1 = mx.minimum(lower[..., 1] + 1, last[:, None, None, 1]).astype(mx.int32)
     batch = mx.arange(value.shape[0])[:, None, None]
     wx, wy = fraction[..., 0, None], fraction[..., 1, None]
     top = value[batch, y0, x0] * (1 - wx) + value[batch, y0, x1] * wx
@@ -73,11 +82,14 @@ class DetailEncoder(nn.Module):
         self.norms = [nn.LayerNorm(width) for width in channels]
         self.refine = [nn.Conv2d(width, width, 3, padding=1, groups=width) for width in channels]
 
-    def __call__(self, image: mx.array) -> mx.array:
-        x = image
+    def __call__(self, image: mx.array, content_rect: mx.array | None = None) -> mx.array:
+        mask = None if content_rect is None else content_mask(content_rect, *image.shape[1:3])
+        x = mask_content(image, mask)
         for conv, norm, refine in zip(self.convolutions, self.norms, self.refine):
-            x = nn.gelu(norm(conv(x)))
-            x = x + nn.gelu(refine(x))
+            x = conv(x)
+            mask = None if content_rect is None else content_mask(content_rect, *x.shape[1:3])
+            x = mask_content(nn.gelu(norm(x)), mask)
+            x = mask_content(x + nn.gelu(refine(x)), mask)
         return x
 
 
@@ -116,11 +128,11 @@ class VisualEncoder(nn.Module):
     def _surface(self, surface: SurfaceBatch, role: int, size: tuple[int, int]):
         batch, time = size
         flatten = lambda value: value.reshape(batch * time, *value.shape[2:])
-        stages = self.backbone(flatten(surface.global_image))
-        detail = self.detail(flatten(surface.detail_image))
-        height, width = detail.shape[1:3]
         global_rect = flatten(surface.global_content_rect)
         detail_rect = flatten(surface.content_rect)
+        stages = self.backbone(flatten(surface.global_image), global_rect)
+        detail = self.detail(flatten(surface.detail_image), detail_rect)
+        height, width = detail.shape[1:3]
         coarse = align_features(self.global_projection(self.global_norm(stages[-1])), height, width, global_rect, detail_rect)
         middle = align_features(self.middle_projection(self.middle_norm(stages[1])), height, width, global_rect, detail_rect)
         dense = self.fusion_norm(self.detail_projection(detail) + coarse + middle)
@@ -131,9 +143,13 @@ class VisualEncoder(nn.Module):
         geometry_token = self.geometry_projection(geometry)[:, None, :]
         dense = dense.reshape(batch * time, height * width, -1) + self.position_projection(positions) + role_token + geometry_token
         valid = valid & flatten(surface.available)[:, None]
-        crop = self.detail(flatten(surface.cursor_image))
-        crop_height, crop_width = crop.shape[1:3]
         crop_rect = flatten(surface.cursor_rect)
+        crop_extent = mx.maximum(crop_rect[:, 2:], 1e-8)
+        crop_low = mx.clip(-crop_rect[:, :2] / crop_extent, 0, 1)
+        crop_high = mx.clip((1 - crop_rect[:, :2]) / crop_extent, 0, 1)
+        crop_content = mx.concatenate((crop_low, mx.maximum(crop_high - crop_low, 0)), axis=-1)
+        crop = self.detail(flatten(surface.cursor_image), crop_content)
+        crop_height, crop_width = crop.shape[1:3]
         yy, xx = mx.meshgrid((mx.arange(crop_height) + 0.5) / crop_height,
                              (mx.arange(crop_width) + 0.5) / crop_width, indexing="ij")
         local = mx.stack((xx, yy), axis=-1).reshape(1, -1, 2)

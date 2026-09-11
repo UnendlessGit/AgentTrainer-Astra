@@ -9,6 +9,7 @@
     "license": "MIT",
     "licenseURL": "https://github.com/facebookresearch/ConvNeXt/blob/main/LICENSE",
     "artifact": "convnext_tiny.safetensors",
+    "artifactSHA256": "b55d15aebe3c2830f8baaf65ed0cf1578e2d1babad488361bec917cab7dc31dd",
     "conversion": "scripts/prepare_weights.py; strict parameter names and shapes; NCHW kernels to NHWC; classification head excluded",
     "normalization": {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]},
     "note": "ImageNet initialization transfers visual features; it does not supply computer-use behavior. No runtime download is required."

@@ -9,7 +9,8 @@ analysis = Analysis(
     datas=collect_data_files("mlx"),
     # Native MLX initialization imports Python helpers (including
     # mlx._reprlib_fix) that static Python import analysis cannot discover.
-    hiddenimports=collect_submodules("mlx", filter=lambda name: name not in {"mlx.extension", "mlx.__main__"}) + ["numpy"],
+    hiddenimports=(collect_submodules("mlx", filter=lambda name: name not in {"mlx.extension", "mlx.__main__"})
+                   + collect_submodules("astra") + ["numpy"]),
     excludes=["torch", "torchvision", "tensorflow", "jax", "pytest"],
     noarchive=False,
 )

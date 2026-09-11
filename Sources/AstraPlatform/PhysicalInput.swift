@@ -1,6 +1,7 @@
 import Foundation
 import ApplicationServices
 import AppKit
+import IOKit.hidsystem
 import AstraCore
 
 public enum AstraSyntheticInput {
@@ -231,7 +232,7 @@ public final class PhysicalInputMonitor: @unchecked Sendable {
         case .keyUp: kind = .keyUp; key = Int(event.getIntegerValueField(.keyboardEventKeycode)); down = false
         case .flagsChanged:
             kind = .flags; key = Int(event.getIntegerValueField(.keyboardEventKeycode))
-            if let key, (0...127).contains(key) { down = CGEventSource.keyState(.hidSystemState, key: CGKeyCode(key)) }
+            if let key { down = Self.modifierState(keyCode: key, flags: event.flags) }
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             kind = .buttonDown; button = Int(event.getIntegerValueField(.mouseEventButtonNumber)); down = true
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
@@ -251,6 +252,30 @@ public final class PhysicalInputMonitor: @unchecked Sendable {
                              modifiers: common.1, isDown: down,
                              detail: kind == .scroll ? "scroll units: points; original phase/precision retained in rawPlatformData" : nil,
                              rawPlatformData: event.data as Data?)
+    }
+
+    static func modifierState(keyCode: Int, flags: CGEventFlags) -> Bool? {
+        // Device-dependent modifier bits belong to this captured event. A HID
+        // query here could observe a later physical edge and relabel history.
+        let pair: (UInt64, UInt64, CGEventFlags)
+        switch keyCode {
+        case 56: pair = (UInt64(NX_DEVICELSHIFTKEYMASK), UInt64(NX_DEVICERSHIFTKEYMASK), .maskShift)
+        case 60: pair = (UInt64(NX_DEVICERSHIFTKEYMASK), UInt64(NX_DEVICELSHIFTKEYMASK), .maskShift)
+        case 59: pair = (UInt64(NX_DEVICELCTLKEYMASK), UInt64(NX_DEVICERCTLKEYMASK), .maskControl)
+        case 62: pair = (UInt64(NX_DEVICERCTLKEYMASK), UInt64(NX_DEVICELCTLKEYMASK), .maskControl)
+        case 55: pair = (UInt64(NX_DEVICELCMDKEYMASK), UInt64(NX_DEVICERCMDKEYMASK), .maskCommand)
+        case 54: pair = (UInt64(NX_DEVICERCMDKEYMASK), UInt64(NX_DEVICELCMDKEYMASK), .maskCommand)
+        case 58: pair = (UInt64(NX_DEVICELALTKEYMASK), UInt64(NX_DEVICERALTKEYMASK), .maskAlternate)
+        case 61: pair = (UInt64(NX_DEVICERALTKEYMASK), UInt64(NX_DEVICELALTKEYMASK), .maskAlternate)
+        case 57: return flags.contains(.maskAlphaShift)
+        case 63: return flags.contains(.maskSecondaryFn)
+        default: return nil
+        }
+        let sideBits = flags.rawValue & (pair.0 | pair.1)
+        // Some remappers supply aggregate flags only. Preserve ambiguity
+        // instead of guessing which physical side changed.
+        if sideBits == 0 && flags.contains(pair.2) { return nil }
+        return flags.rawValue & pair.0 != 0
     }
 }
 

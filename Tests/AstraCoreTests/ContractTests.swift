@@ -68,8 +68,10 @@ private func packet(_ commands: [TimedCommand]) -> ActionPacket {
 @Test func motionEndpointAndGeometryRevisionAreExplicit() throws {
     let actions = ActionCapabilities(absolutePointer: true, relativePointer: true)
     let path = packet([.init(offsetMs: 0, operation: .pointerAbsolute, surfaceID: "primary", x: 0, y: 0),
-                       .init(offsetMs: 100, operation: .pointerAbsolute, surfaceID: "primary", x: 1, y: 1)])
+                       .init(offsetMs: 100, operation: .pointerAbsolute, surfaceID: "primary", x: 0.9, y: 0.9)])
     #expect(try path.validated(capabilities: actions, surfaces: [surface()], capacity: 16) == path)
+    let outside = packet([.init(offsetMs: 100, operation: .pointerAbsolute, surfaceID: "primary", x: 1, y: 1)])
+    #expect(throws: AstraError.self) { try outside.validated(capabilities: actions, surfaces: [surface()], capacity: 16) }
     var changed = surface(); changed.geometryRevision = 1
     #expect(throws: AstraError.self) { try path.validated(capabilities: actions, surfaces: [changed], capacity: 16) }
     let mixed = packet([.init(offsetMs: 0, operation: .pointerAbsolute, surfaceID: "primary", x: 0, y: 0),

@@ -93,7 +93,7 @@ public struct TimedCommand: Codable, Hashable, Sendable {
         case .pointerAbsolute:
             guard capabilities.absolutePointer, keyCode == nil, button == nil, !hasDelta,
                   let surfaceID, surfaces.contains(where: { $0.id == surfaceID }),
-                  let x, let y, (0...1).contains(x), (0...1).contains(y) else { throw invalidCapability() }
+                  let x, let y, (0..<1).contains(x), (0..<1).contains(y) else { throw invalidCapability() }
         case .pointerRelative, .scroll:
             let enabled = operation == .scroll ? capabilities.scroll : capabilities.relativePointer
             guard enabled, keyCode == nil, button == nil, surfaceID == nil, !hasPoint,

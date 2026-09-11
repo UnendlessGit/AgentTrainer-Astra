@@ -9,7 +9,7 @@ MAXIMUM_PARAMETERS = 500_000_000
 
 @dataclass(frozen=True)
 class ModelConfig:
-    schema_version: int = 1
+    schema_version: int = 2
     global_long_edge: int = 768
     detail_long_edge: int = 1536
     cursor_size: int = 384
@@ -33,8 +33,8 @@ class ModelConfig:
     context_width: int = 32
 
     def validate(self) -> ModelConfig:
-        if self.schema_version != 1:
-            raise ValueError("Unsupported model schema")
+        if self.schema_version != 2:
+            raise ValueError("Unsupported model schema; version 2 requires internal visual padding masks")
         if any(type(value) is not tuple for value in
                (self.detail_channels, self.backbone_dims, self.backbone_depths, self.context_sizes)):
             raise ValueError("Model layouts and vocabularies must be immutable tuples")
