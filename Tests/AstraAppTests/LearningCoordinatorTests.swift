@@ -259,7 +259,9 @@ private final class Fixture {
         #expect(try await LearningFiles.read(saved).fields?["verificationMode"] == .bool(true))
         #expect(try fixture.operations() == ["checkpoint.create", "train.behavioral", "shutdown"])
         #expect(FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("shutdown").path))
-        let checkpoint = try #require(snapshot.checkpoints.first { $0.id == run.checkpointID })
+        var checkpoint = try #require(snapshot.checkpoints.first { $0.id == run.checkpointID })
+        checkpoint.name = "Renamed in an already-open view"
+        checkpoint.createdAt += 0.0000001
         try coordinator.evaluate(checkpoint: checkpoint, split: "validation")
         try await waitUntil { !coordinator.isBusy }
         #expect(coordinator.evaluation?.meanNLL == 0.75)

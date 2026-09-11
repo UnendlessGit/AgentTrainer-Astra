@@ -6,7 +6,7 @@ import Testing
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
     let store = try LibraryStore(root: root)
-    let agent = AgentDocument(name: "Existing agent")
+    let agent = AgentDocument(name: "Existing agent", createdAt: Date(timeIntervalSince1970: 1000))
     try await store.save(agent)
     try Data("Invalid run directory".utf8).write(to: root.appendingPathComponent("Runs"))
     try await store.inspectPriorInferenceRuns()

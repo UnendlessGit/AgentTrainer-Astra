@@ -454,7 +454,7 @@ struct BehaviorEvaluation: Sendable {
     private func performEvaluation(checkpoint: CheckpointDocument, agentID: UUID, sourceRunID: UUID, split: String) async {
         let destination = artifact("Jobs", UUID())
         do {
-            guard try await store.snapshot().checkpoints.contains(where: { $0 == checkpoint }) else {
+            guard try await store.snapshot().checkpoints.contains(where: { $0.matchesIdentity(of: checkpoint) }) else {
                 throw AstraError("evaluation.checkpoint", "This checkpoint is no longer available in the workspace catalog.")
             }
             guard try await store.checkpointIDs(for: agentID).contains(checkpoint.id) else {
