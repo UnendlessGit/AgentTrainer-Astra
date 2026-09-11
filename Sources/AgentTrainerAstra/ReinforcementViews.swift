@@ -133,6 +133,7 @@ struct ReinforcementTrainingView: View {
     @Bindable var model: WorkspaceModel
     @State private var options = ReinforcementOptions()
     @State private var failure: String?
+    @State private var showingRewards = false
     private var checkpoints: [CheckpointDocument] {
         model.checkpoints.filter { model.checkpointLinks[agent.id]?.contains($0.id) == true }
     }
@@ -143,7 +144,11 @@ struct ReinforcementTrainingView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Reinforcement learning").font(.title2.weight(.semibold))
+                    HStack {
+                        Text("Reinforcement learning").font(.title2.weight(.semibold))
+                        Spacer()
+                        Button("Rewards & Episodes", systemImage: "slider.horizontal.3") { showingRewards = true }
+                    }
                     Text("Let the agent collect its own experience and improve from rewards. The actor keeps a fixed policy during each episode.")
                         .foregroundStyle(.secondary)
                 }
@@ -232,7 +237,7 @@ struct ReinforcementTrainingView: View {
                 }
                 LearningRunList(runs: model.learningRuns.filter { $0.agentID == agent.id }, model: model, compact: true)
             }.padding(.trailing, 8).padding(.bottom, 20)
-        }
+        }.sheet(isPresented: $showingRewards) { RewardEditor(agent: agent, model: model) }
     }
     private func numberField(_ title: String, value: Binding<Double>) -> some View {
         TextField(title, value: value, format: .number.precision(.fractionLength(1...6))).textFieldStyle(.roundedBorder)

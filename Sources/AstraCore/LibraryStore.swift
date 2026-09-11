@@ -9,6 +9,7 @@ public struct AgentDocument: Codable, Hashable, Identifiable, Sendable {
     public var modifiedAt: Date
     public var environmentID: UUID?
     public var selectedCheckpointID: UUID?
+    public var rewardProgramID: UUID?
     public var pinned: Bool
 
     public init(id: UUID = UUID(), name: String, notes: String = "", createdAt: Date = Date(),
@@ -72,6 +73,7 @@ public struct LibrarySnapshot: Sendable {
     public var learningRuns: [LearningRunDocument]
     public var checkpoints: [CheckpointDocument]
     public var issues: [LibraryIssue]
+    public var rewardPrograms: [RewardProgram] = []
 }
 
 public enum DocumentNames {
@@ -109,6 +111,7 @@ public actor LibraryStore {
             try database.execute("CREATE TABLE IF NOT EXISTS learning_runs (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS agent_checkpoints (agent_id TEXT NOT NULL REFERENCES agents(id), checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id), PRIMARY KEY(agent_id,checkpoint_id))")
+            try database.execute("CREATE TABLE IF NOT EXISTS reward_programs (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
         }
         for folder in ["Recordings", "Models", "Datasets", "Jobs", "Caches", "Logs"] {
             try FileManager.default.createDirectory(at: self.root.appendingPathComponent(folder), withIntermediateDirectories: true)
@@ -137,7 +140,33 @@ public actor LibraryStore {
             do { return try value.validated() }
             catch { issues.append(.init(id: value.id.uuidString, collection: "checkpoints", message: error.localizedDescription)); return nil }
         }
-        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues)
+        let rewards: [RewardProgram] = try documents(table: "reward_programs", issues: &issues).compactMap { (value: RewardProgram) -> RewardProgram? in
+            do { return try value.validated() }
+            catch { issues.append(.init(id: value.id.uuidString, collection: "reward_programs", message: error.localizedDescription)); return nil }
+        }
+        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues, rewardPrograms: rewards)
+    }
+
+    public func saveRewardProgram(_ document: RewardProgram, for agentID: UUID) throws {
+        let value = try document.validated()
+        for digest in Set(value.signals.compactMap(\.templateDigest)) { _ = try RewardAssets.read(digest, root: root) }
+        try database.transaction {
+            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+            guard let agentBytes = try database.query("SELECT document FROM agents WHERE id=?", [.text(agentID.uuidString)]).first?["document"]?.data else {
+                throw AstraError("reward.agent", "The agent was removed before its reward definition could be saved.")
+            }
+            var agent = try decoder.decode(AgentDocument.self, from: agentBytes).validated()
+            if let bytes = try database.query("SELECT document FROM reward_programs WHERE id=?", [.text(value.id.uuidString)]).first?["document"]?.data {
+                guard try decoder.decode(RewardProgram.self, from: bytes) == value else {
+                    throw AstraError("reward.immutable", "Saved reward definitions cannot change. Save the edit as a new definition.")
+                }
+            } else {
+                try database.execute("INSERT INTO reward_programs(id,name,document,created) VALUES(?,?,?,?)", [
+                    .text(value.id.uuidString), .text(value.name), .blob(try encode(value)), .real(Date().timeIntervalSince1970)])
+            }
+            agent.rewardProgramID = value.id; agent.modifiedAt = Date()
+            try save(agent)
+        }
     }
 
     public func saveLearningRun(_ document: LearningRunDocument) throws {

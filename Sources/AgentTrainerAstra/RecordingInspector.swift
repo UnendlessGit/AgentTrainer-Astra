@@ -7,7 +7,7 @@ private struct PreviewEvent: Identifiable {
     var id: UInt64 { event.sequence }
 }
 
-@MainActor @Observable private final class RecordingInspectorModel {
+@MainActor @Observable final class RecordingPreviewModel {
     var inspection: RecordingInspection?
     var preview: RecordingPreview?
     var image: NSImage?
@@ -23,6 +23,7 @@ private struct PreviewEvent: Identifiable {
         return Double(end - first) / 1e9
     }
     func open(_ directory: URL) async {
+        close(); inspection = nil; preview = nil; image = nil; issue = nil; seconds = 0
         loading = true
         let token = UUID(); generation = token
         do {
@@ -85,7 +86,7 @@ struct RecordingInspector: View {
     let recording: RecordingManifest
     let directory: URL
     @Environment(\.dismiss) private var dismiss
-    @State private var model = RecordingInspectorModel()
+    @State private var model = RecordingPreviewModel()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {

@@ -16,6 +16,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private(set) var recordings: [RecordingManifest] = []
     private(set) var learningRuns: [LearningRunDocument] = []
     private(set) var checkpoints: [CheckpointDocument] = []
+    private(set) var rewardPrograms: [RewardProgram] = []
     private(set) var learning: LearningCoordinator?
     private(set) var inference: InferenceCoordinator?
     private(set) var refreshingSources = false
@@ -110,6 +111,12 @@ enum AgentSection: String, CaseIterable, Identifiable {
             try await store.save(value)
             try await refresh()
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    func saveRewardProgram(_ document: RewardProgram, for agentID: UUID) async throws {
+        guard let store, !isClosing else { throw AstraError("reward.workspace", "The workspace is not ready to save this definition.") }
+        try await store.saveRewardProgram(document, for: agentID)
+        try await refresh()
     }
 
     func refreshPermissionsAndSources() async {
@@ -324,6 +331,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
         let snapshot = try await store.snapshot()
         agents = snapshot.agents; environments = snapshot.environments; recordings = snapshot.recordings; issues = snapshot.issues
         learningRuns = snapshot.learningRuns; checkpoints = snapshot.checkpoints
+        rewardPrograms = snapshot.rewardPrograms
         var links: [UUID: Set<UUID>] = [:]
         for agent in agents { links[agent.id] = try await store.recordingIDs(for: agent.id) }
         recordingLinks = links

@@ -44,6 +44,12 @@ import AstraCore
     try await store.saveLearningRun(run)
     let recording = try makeRenderRecording(root: root, environment: environment)
     try await store.saveRecording(recording)
+    let score = RewardSignal(name: "Visible score", kind: .ocrNumber, surfaceID: "generated-render-fixture", region: .init(x: 0.1, y: 0.1, width: 0.3, height: 0.2))
+    var rewards = RewardProgram(name: "Desktop feedback · recorded visual signals", signals: [score], rules: [
+        .init(name: "Score change", kind: .scoreDelta, amount: 0.1, signalID: score.id),
+        .init(name: "Positive feedback", kind: .manualMarker, amount: 1)])
+    rewards.success = .init(conditions: [.init(signalID: score.id, comparison: .atLeast, number: 100)])
+    try await store.saveRewardProgram(rewards, for: agent.id); agent.rewardProgramID = rewards.id
     let interruptedRoot = root.appendingPathComponent("InspectorOnly")
     let interrupted = try makeRenderRecording(root: interruptedRoot, environment: environment,
         issue: "The selected environment changed size while this demonstration was recording. Captured frames and input events were preserved. Review the final interval before including this recording in a training dataset.")
@@ -83,6 +89,10 @@ import AstraCore
                     rolloutTarget: 512, rolloutDecisions: 576, updates: 192, elapsedSeconds: 438, peakMemoryBytes: 4_182_662_144).padding(28))),
                 ("recording-inspector", AnyView(RecordingInspector(recording: recording, directory: root.appendingPathComponent("Recordings/" + recording.id.uuidString + ".astrarecord")))),
                 ("recording-interrupted", AnyView(RecordingInspector(recording: interrupted, directory: interruptedRoot.appendingPathComponent("Recordings/" + interrupted.id.uuidString + ".astrarecord")))),
+                ("reward-signals", AnyView(RewardEditor(agent: agent, model: model, referenceRecordingID: recording.id))),
+                ("reward-rules", AnyView(RewardEditor(agent: agent, model: model, initialPage: "Rewards"))),
+                ("reward-episode", AnyView(RewardEditor(agent: agent, model: model, initialPage: "Episode"))),
+                ("reward-rehearse", AnyView(RewardEditor(agent: agent, model: model, initialPage: "Rehearse", referenceRecordingID: recording.id))),
             ]
             for (name, view) in variants {
                 evidence.append(try await renderOwnedView(view, name: name, size: size, scheme: scheme, output: output))

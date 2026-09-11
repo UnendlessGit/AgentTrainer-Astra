@@ -1,0 +1,15 @@
+# Rewards and external environment boundaries
+
+Status: implementation in progress. This extends the general environment contract in ADR 0001; it does not make the practice simulator the template for desktop interaction.
+
+The native environment coordinator owns visual detectors, human feedback, readiness and reset actions. The learner receives immutable identities, observations, action receipts, reward intervals and explicit outcomes. Detector outputs and reset internals never enter policy features. The same reward evaluator runs over recorded frames for rehearsal and over live observations for training.
+
+Reward definitions select timestamped signals and bounded all/any conditions. Signals may be local OCR text/numbers, image similarity, elapsed time or manual values. Rules combine numeric score changes, observed rising edges, conditional rates and explicit manual markers. Regions use normalized top-left coordinates inside a named surface's content bounds. OCR language/decimal conventions and image template identity are explicit. Definitions are frozen per run.
+
+Unknown is a first-class value. Missing, stale, future, low-confidence and ambiguous OCR values do not become zero. A rule whose reward cannot be established makes the interval's reward unknown. Numeric baselines and edge history are broken across an unknown interval; reacquisition establishes a new baseline without awarding an invented change. Readiness establishes baselines, so a condition already true at episode start is not a new event. Conflicting terminal conditions fail visibly. All timing uses the episode's monotonic clock; each reward belongs to a decision interval, independent of delayed action execution.
+
+Manual feedback uses contiguous sequenced markers with episode identity, event time and availability time. Each marker is consumed once in its half-open decision interval. A producer coverage watermark proves that the entire interval was delivered; an empty list by itself cannot establish zero reward. Unobserved or late feedback cannot rewrite a sealed interval. The coordinator awaits detector and input-producer barriers before once-only evaluation; unresolved windows cannot enter a PPO rollout. Reset clears all signal and rule history only after explicit readiness; reset actions remain outside policy episodes.
+
+The external adapter allows observation, reward and action receipts to arrive independently, with bounded queues and identity validation. It cannot wait for a delayed packet's final execution receipt before releasing the next observation. Every outstanding receipt must be resolved before an episode is admitted to learning; rejected/late/failed actions abort affected experience. Missing reward, disconnect and reset timeout are not fabricated termination or readiness. A separate integration must preserve actor continuity while a learner updates a sealed rollout.
+
+Implementation and verification evidence will be recorded separately. These contracts do not by themselves establish a complete desktop RL workflow.
