@@ -200,6 +200,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--max-updates', type=int, help='Stop at an exact completed optimizer update for matched comparisons')
     parser.add_argument('--model-seed', type=int, default=834)
+    parser.add_argument('--resume-checkpoint', type=Path, help='Continue exact saved optimizer, sampler, RNG and recurrent state')
     parser.add_argument('--reference-initial', type=Path, help='Verify all non-update-bias tensors match this baseline initial checkpoint')
     parser.add_argument('--probe-before-training', action='store_true')
     parser.add_argument('--retention-init', choices=('native', 'zero-update', 'geometric'), default='native')
@@ -211,6 +212,7 @@ def main():
     parser.add_argument('--small', action='store_true', help='Numerical exploration only; not a default-model learning result')
     parser.add_argument('--skip-baseline-policy', action='store_true', help='Still evaluate an answer-independent always-left chance baseline')
     args = parser.parse_args()
+    if args.resume_checkpoint and (args.reference_initial or args.probe_before_training): parser.error('Resume preserves its checkpoint; initial parity/warmup options apply only to fresh policies')
     if args.max_updates is not None and args.max_updates < 1: parser.error('Update limit must be positive')
     if not 0 <= args.model_seed < 2**63: parser.error('Model seed must be a bounded nonnegative integer')
     if not 1 <= args.train_seeds <= 1000 or not 1 <= args.heldout_seeds <= 1000:
@@ -246,7 +248,8 @@ def main():
     train_seeds = list(range(args.train_seeds)); heldout = list(range(1000, 1000 + args.heldout_seeds))
     config = ModelConfig.test_small() if args.small else ModelConfig()
     environment = PracticeConfig(task='delayed_memory', delay_ms=args.delay_ms, time_limit_ms=500 + args.delay_ms + 2000,
-                                 pixel_width=64 if args.small else 1280, pixel_height=64 if args.small else 720)
+                                 pixel_width=64 if args.small else 1280, pixel_height=64 if args.small else 720,
+                                 logical_bounds=(0,0,64,64) if args.small else (0,0,1280,720))
     training = BehaviorConfig(epochs=args.epochs, lanes=2, sequence_length=args.sequence_length, seed=834).validate()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = dict(schemaVersion=1, status='preparing', configuration='numerical-test-small' if args.small else 'production-default',
@@ -279,12 +282,24 @@ def main():
         'answerChunkStart': ((environment.cue_ms + delay) // config.period_ms) // training.sequence_length * training.sequence_length,
         'cueAndAnswerInSameChunk': (environment.cue_ms + delay) // config.period_ms < training.sequence_length,
     } for delay in (2000, 8000, 30000)]
-    mx.random.seed(args.model_seed)
-    policy = AgentPolicy(config, source.vocabulary)
-    report['initialization'] = initialize_experimental_retention(policy, args.retention_init)
+    restored_state = None
+    if args.resume_checkpoint:
+        restored = load_checkpoint(args.resume_checkpoint, include_training=True)
+        if restored.training_state is None: raise ValueError('Resume requires saved behavioral training state')
+        policy, restored_state = restored.policy, restored.training_state
+        if policy.config != config or policy.actions.vocabulary != source.vocabulary:
+            raise ValueError('Resume model/action configuration differs from this experiment')
+        report['resumedFrom'] = str(args.resume_checkpoint)
+        report['resumeStartingUpdates'] = restored_state['updates']
+        report['resumeStartingDecisions'] = restored_state['decisions']
+        report['initialization'] = dict(variant=args.retention_init, restoredWithoutReinitialization=True)
+    else:
+        mx.random.seed(args.model_seed)
+        policy = AgentPolicy(config, source.vocabulary)
+        report['initialization'] = initialize_experimental_retention(policy, args.retention_init)
+        if not args.small: policy.vision.backbone.load_pretrained(ROOT / 'vendor/weights/convnext_tiny.safetensors')
     report['modelSeed'] = args.model_seed
     report['maximumUpdates'] = args.max_updates
-    if not args.small: policy.vision.backbone.load_pretrained(ROOT / 'vendor/weights/convnext_tiny.safetensors')
     if args.reference_initial:
         from mlx.utils import tree_flatten
         reference = load_checkpoint(args.reference_initial).policy
@@ -304,9 +319,13 @@ def main():
         report['initialParity'] = dict(reference=str(args.reference_initial), checkedParameterLeaves=checked,
                                       allExceptPersistentUpdateBiasBitwiseEqual=True)
         del reference, current_parameters, reference_parameters; gc.collect(); mx.clear_cache()
-    initial_path = args.output.parent / str(uuid.uuid4())
-    save_checkpoint(initial_path, policy, kind='initial', step=0)
-    report['initialCheckpoint'] = str(initial_path)
+    if args.resume_checkpoint:
+        initial_path = args.resume_checkpoint
+        report['inputCheckpoint'] = str(initial_path)
+    else:
+        initial_path = args.output.parent / str(uuid.uuid4())
+        save_checkpoint(initial_path, policy, kind='initial', step=0, metrics=dict(experimentalRetention=report['initialization']))
+        report['initialCheckpoint'] = str(initial_path)
     if args.probe_before_training:
         initial_probe = args.output.with_name(args.output.stem + '-initial-probe.json')
         counterfactual_probe(initial_path, seeds=heldout, output=initial_probe, budget_seconds=min(110, deadline-time.perf_counter()-120))
@@ -364,7 +383,7 @@ def main():
     try:
         if not args.skip_baseline_policy:
             report['closedLoop']['initialGreedy'] = trials(initial_path, heldout, label='initialGreedy')
-        trainer = BehaviorTrainer(policy, training, dataset_id='practice-memory-' + environment.signature)
+        trainer = BehaviorTrainer(policy, training, dataset_id='practice-memory-' + environment.signature, restored_state=restored_state)
         training_deadline = min(deadline - 120, time.perf_counter() + args.training_budget_seconds)
         last_progress = 0.
         def progress(metrics):
@@ -374,7 +393,7 @@ def main():
             else:
                 report['latestMetrics'] = asdict(metrics)
         interrupted = False
-        for _ in range(args.epochs):
+        for _ in range(trainer.epoch, args.epochs):
             try:
                 metrics = trainer.train_epoch(source, cancelled=lambda: time.perf_counter() >= training_deadline or (args.max_updates is not None and trainer.updates >= args.max_updates), on_metrics=progress)
                 report['epochs'].append(asdict(metrics)); publish('epochCompleted', completedEpochs=trainer.epoch)
@@ -382,7 +401,9 @@ def main():
                 interrupted = True; break
         checkpoint_path = args.output.parent / str(uuid.uuid4())
         save_checkpoint(checkpoint_path, policy, kind='behavioral', step=trainer.updates, training_state=trainer.state,
-                        metrics=dict(epoch=trainer.epoch, updates=trainer.updates, decisions=trainer.decisions), training_config=asdict(training))
+                        parent_id=initial_path.name,
+                        metrics=dict(epoch=trainer.epoch, updates=trainer.updates, decisions=trainer.decisions,
+                                     experimentalRetention=report['initialization']), training_config=asdict(training))
         publish('checkpointSaved', checkpoint=str(checkpoint_path), trainingInterrupted=interrupted,
                 updates=trainer.updates, trainingDecisions=trainer.decisions, completedEpochs=trainer.epoch,
                 updateTargetReached=args.max_updates is not None and trainer.updates == args.max_updates)
