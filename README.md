@@ -16,7 +16,7 @@ Requires Apple Silicon, Xcode with the macOS SDK, and `uv`. Build-time dependenc
 
 ```sh
 uv sync --locked --group dev
-swift test
+./script/swift.sh test
 .venv/bin/python -m pytest
 .venv/bin/python scripts/build_app.py
 # Or build, verify, and open the native bundle:

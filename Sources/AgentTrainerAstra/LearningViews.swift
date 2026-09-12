@@ -35,6 +35,10 @@ struct LearningBanner: View {
 }
 
 struct BehaviorTrainingView: View {
+    private struct ControlSelectionKey: Hashable {
+        let recordings: Set<UUID>
+        let selections: [UUID: RecordingTrainingSelection]
+    }
     let agent: AgentDocument
     @Bindable var model: WorkspaceModel
     @State private var options = BehaviorOptions()
@@ -51,6 +55,7 @@ struct BehaviorTrainingView: View {
         model.recordings.filter { model.recordingLinks[agent.id]?.contains($0.id) == true && $0.status != .recording && $0.frameCount > 0 }
     }
     private var checkpoints: [CheckpointDocument] { model.checkpoints.filter { model.checkpointLinks[agent.id]?.contains($0.id) == true } }
+    private var controlSelectionKey: ControlSelectionKey { .init(recordings: options.recordingIDs, selections: model.recordingSelections[agent.id] ?? [:]) }
     private var ownsActiveRun: Bool { model.learning?.activeRun?.agentID == agent.id && model.learning?.activeRun?.kind == .behavioral }
     private var startingCheckpoint: CheckpointDocument? { checkpoints.first { $0.id == options.initialCheckpointID } }
     private var completedStartingRun: Bool {
@@ -94,11 +99,11 @@ struct BehaviorTrainingView: View {
                                                 HStack {
                                                     Text(recording.name)
                                                     Spacer()
-                                                    Text("\(recording.durationSeconds, specifier: "%.1f") s").foregroundStyle(.secondary).monospacedDigit()
+                                                    Text(model.trainingSelectionSummary(recording: recording, agentID: agent.id)).foregroundStyle(.secondary).monospacedDigit()
                                                 }
                                             }.toggleStyle(.checkbox)
                                         }
-                                        Text("Whole recording sessions are kept separate across training, validation, and test sets.")
+                                        Text("Each recording stays in one training, validation, or test set. Separate intervals reset the model’s memory. Edit intervals in Demonstrations → Review Recording.")
                                             .font(.caption).foregroundStyle(.secondary)
                                     }
                                 }
@@ -202,7 +207,7 @@ struct BehaviorTrainingView: View {
                                 }
                             }
                             Toggle("Scrolling", isOn: $options.scrollEnabled).toggleStyle(.checkbox)
-                            Text("Controls are detected from the selected recordings. Every demonstration must fit the enabled controls; incompatible input is reported before training.")
+                            Text("Controls are detected inside the selected training intervals. Every demonstration must fit the enabled controls; incompatible input is reported before training.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }.padding(8)
                     } label: { Text("Controls the agent can learn").font(.headline) }
@@ -223,20 +228,21 @@ struct BehaviorTrainingView: View {
             guard !initialized else { return }
             initialized = true; options.recordingIDs = Set(recordings.map(\.id))
         }
-        .task(id: options.recordingIDs) { await readControls() }
+        .task(id: controlSelectionKey) { await readControls() }
     }
 
     private func readControls() async {
         let selected = options.recordingIDs
+        let key = controlSelectionKey
         readingControls = true
-        defer { if selected == options.recordingIDs { readingControls = false } }
+        defer { if key == controlSelectionKey { readingControls = false } }
         do {
-            let result = try await LearningFiles.recordedCapabilities(recordings.filter { selected.contains($0.id) }, root: model.supportRoot)
-            guard !Task.isCancelled, selected == options.recordingIDs else { return }
+            let result = try await LearningFiles.recordedCapabilities(recordings.filter { selected.contains($0.id) }, root: model.supportRoot, selections: key.selections)
+            guard !Task.isCancelled, key == controlSelectionKey else { return }
             detected = result; options.keys = result.keyCodes; options.buttons = result.mouseButtons
             options.pointerEnabled = result.absolutePointer; options.scrollEnabled = result.scroll; controlsError = nil
         } catch is CancellationError { }
-        catch { if selected == options.recordingIDs { controlsError = error.localizedDescription } }
+        catch { if key == controlSelectionKey { controlsError = error.localizedDescription } }
     }
 }
 

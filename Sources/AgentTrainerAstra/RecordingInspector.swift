@@ -85,10 +85,17 @@ private struct PreviewEvent: Identifiable {
 struct RecordingInspector: View {
     let recording: RecordingManifest
     let directory: URL
+    var workspace: WorkspaceModel? = nil
+    var agentID: UUID? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var model = RecordingPreviewModel()
+    @State private var selectionDirty = false
+    @State private var selectionSaving = false
+    @State private var confirmingDiscard = false
 
     var body: some View {
+        GeometryReader { geometry in
+        ScrollView {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
@@ -96,7 +103,8 @@ struct RecordingInspector: View {
                     Text(recording.environment.name).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Done") { if selectionDirty { confirmingDiscard = true } else { dismiss() } }.keyboardShortcut(.cancelAction)
+                    .disabled(selectionSaving)
             }
             if let issue = recording.issue {
                 AttentionLabel(message: issue).font(.callout).textSelection(.enabled)
@@ -112,7 +120,9 @@ struct RecordingInspector: View {
                     ContentUnavailableView("No complete frames", systemImage: "photo", description: Text("The captured source has been preserved for inspection."))
                 }
                 if model.loading { ProgressView().controlSize(.large) }
-            }.frame(minHeight: 180, idealHeight: 300, maxHeight: 440).clipShape(RoundedRectangle(cornerRadius: 10))
+            }.frame(height: agentID == nil ? min(300, max(180, geometry.size.height * 0.4))
+                    : min(300, max(160, geometry.size.height * 0.3)))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
             HStack(spacing: 12) {
                 Button { model.seek(model.seconds - 1.0 / Double(recording.environment.captureFPS)) } label: { Image(systemName: "backward.frame") }
                     .help("Previous capture interval").accessibilityLabel("Previous capture interval")
@@ -122,6 +132,14 @@ struct RecordingInspector: View {
                     .help("Next capture interval").accessibilityLabel("Next capture interval")
                 Text("\(model.seconds, specifier: "%.2f") / \(model.maximumSeconds, specifier: "%.2f") s")
                     .font(.callout.monospacedDigit()).frame(minWidth: 110, alignment: .trailing)
+            }
+            if let workspace, let agentID, let agent = workspace.agents.first(where: { $0.id == agentID }) {
+                RecordingSelectionEditor(recording: recording, agentName: agent.name,
+                    selection: workspace.recordingSelections[agentID]?[recording.id], playheadSeconds: model.seconds,
+                    onSave: { selection in
+                        await workspace.saveRecordingSelection(selection, recordingID: recording.id, agentID: agentID) ? nil
+                            : (workspace.errorMessage ?? "The selection could not be saved.")
+                    }, onDirty: { selectionDirty = $0 }, onSaving: { selectionSaving = $0 })
             }
             if let preview = model.preview {
                 HStack {
@@ -140,7 +158,14 @@ struct RecordingInspector: View {
                 if preview.moreEvents { Text("Showing the first 256 events in this interval.").font(.caption).foregroundStyle(.secondary) }
             }
             if let issue = model.issue, model.image != nil { AttentionLabel(message: issue) }
-        }.padding(24).frame(minWidth: 730, idealWidth: 880, maxWidth: 1100, minHeight: 560)
+        }.padding(24)
+        }
+        }.frame(minWidth: 730, idealWidth: 880, maxWidth: 1100, minHeight: 560)
+            .interactiveDismissDisabled(selectionDirty || selectionSaving)
+            .confirmationDialog("Discard unsaved training intervals?", isPresented: $confirmingDiscard) {
+                Button("Discard Changes", role: .destructive) { dismiss() }
+                Button("Keep Editing", role: .cancel) {}
+            }
             .task { await model.open(directory) }.onDisappear { model.close() }
     }
 

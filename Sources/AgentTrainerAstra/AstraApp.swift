@@ -137,9 +137,10 @@ struct WorkspaceView: View {
         }
         .sheet(isPresented: $model.showingNewAgent) { NewAgentSheet(model: model) }
         .sheet(isPresented: $model.showingRecorder) { RecorderSheet(model: model) }
+        .sheet(item: $model.recordingLinkRequest) { RecordingLinkSheet(model: model, request: $0) }
         .sheet(item: $model.recordingToInspect) { recording in
             RecordingInspector(recording: recording, directory: model.supportRoot.appendingPathComponent("Recordings")
-                .appendingPathComponent(recording.id.uuidString + ".astrarecord"))
+                .appendingPathComponent(recording.id.uuidString + ".astrarecord"), workspace: model, agentID: model.recordingInspectionAgentID)
         }
         .alert("Workspace needs attention", isPresented: Binding(
             get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } }
@@ -203,11 +204,16 @@ private struct AgentWorkspace: View {
                         HStack {
                             Text("Teach by demonstration").font(.headline)
                             Spacer()
+                            Button("Add from Library…", systemImage: "link") { model.recordingLinkRequest = .init(agentID: agent.id) }
+                                .disabled(model.saving)
                             Button("Record…", systemImage: "record.circle") { model.showingRecorder = true }
                                 .buttonStyle(.borderedProminent)
                                 .disabled(model.isRecording || model.recordingStarting || model.recordingStopping)
                         }
-                        RecordingList(recordings: model.recordings.filter { model.recordingLinks[agent.id]?.contains($0.id) == true }, onOpen: { model.recordingToInspect = $0 })
+                        RecordingList(recordings: model.recordings.filter { model.recordingLinks[agent.id]?.contains($0.id) == true },
+                            onOpen: { model.inspectRecording($0, for: agent.id) },
+                            onRemove: { recording in Task { await model.unlinkRecording(recording.id, from: agent.id) } },
+                            trainingSummaries: Dictionary(uniqueKeysWithValues: model.recordings.map { ($0.id, model.trainingSelectionSummary(recording: $0, agentID: agent.id)) }))
                     }
                 case .training:
                     LearningTrainingView(agent: agent, model: model).id(agent.id)
@@ -251,7 +257,8 @@ private struct LibraryOverview: View {
                     Button("Record…", systemImage: "record.circle") { model.showingRecorder = true }
                         .disabled(model.isRecording || model.recordingStarting)
                 }
-                RecordingList(recordings: model.recordings, onOpen: { model.recordingToInspect = $0 })
+                RecordingList(recordings: model.recordings, onOpen: { model.inspectRecording($0) },
+                              onLink: { model.recordingLinkRequest = .init(recordingID: $0.id) })
             }
         }.padding(28).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }

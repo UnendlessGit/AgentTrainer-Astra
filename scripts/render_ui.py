@@ -6,10 +6,10 @@ Images contain generated fixture metadata and are never release screenshots.
 """
 import argparse
 import json
-import os
 from pathlib import Path
 import subprocess
 import tempfile
+from apple_toolchain import build_environment
 
 
 def main() -> None:
@@ -20,7 +20,7 @@ def main() -> None:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="astra-render-", dir=output) as workspace:
-        environment = {**os.environ, "ASTRA_UI_RENDER_DIR": str(output), "ASTRA_WORKSPACE_ROOT": workspace}
+        environment = {**build_environment(), "ASTRA_UI_RENDER_DIR": str(output), "ASTRA_WORKSPACE_ROOT": workspace}
         result = subprocess.run(["swift", "test", "--filter", "renderActualApplicationViews"], cwd=root,
                                 env=environment, capture_output=True, text=True, timeout=180)
         (output / "render.log").write_text(result.stdout + result.stderr)

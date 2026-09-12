@@ -12,7 +12,7 @@ import pytest
 import astra.data.datasets as datasets
 from astra.data.actions import ActionEncodingError
 from astra.data.batching import training_batch
-from astra.data.datasets import DatasetReader, RecordingSelection, build_dataset, session_splits
+from astra.data.datasets import DatasetReader, RecordingSelection, RecordingRange, build_dataset, session_splits
 from astra.model.actions import ActionVocabulary
 from astra.model.config import ModelConfig
 from astra.recordings import RecordingError
@@ -52,6 +52,110 @@ def _rehash_index(directory):
     manifest = json.loads(path.read_bytes())
     manifest["indexSHA256"] = hashlib.sha256((directory / "index.sqlite").read_bytes()).hexdigest()
     path.write_text(json.dumps(manifest))
+
+
+def _write_legacy_dataset_format(directory):
+    """Explicit archived schema-1 layout, retaining the same immutable episode IDs."""
+    path = directory / "manifest.json"
+    manifest = json.loads(path.read_bytes())
+    manifest["schemaVersion"] = 1
+    for source in manifest["sources"]:
+        ranges = source["selection"].pop("ranges")
+        assert len(ranges) == 1
+        source["selection"].update(ranges[0])
+        source["labelPartition"] = source.pop("labelPartitions")[0]
+    with sqlite3.connect(directory / "index.sqlite") as database:
+        database.execute("ALTER TABLE episodes DROP COLUMN selection_index")
+    manifest["indexSHA256"] = hashlib.sha256((directory / "index.sqlite").read_bytes()).hexdigest()
+    path.write_text(json.dumps(manifest))
+
+
+def test_multiple_ranges_share_one_session_split_and_preserve_causal_state_across_gaps(tmp_path, native_recording):
+    source, source_manifest = _clone_source(native_recording, tmp_path / "sources")
+    _append_events_to_fixture(source, source_manifest, [
+        {"sequence": 6, "eventNanos": 1_060_000_000, "observedNanos": 1_065_000_000, "kind": "keyDown", "keyCode": 13, "origin": "physical"},
+        {"sequence": 7, "eventNanos": 1_090_000_000, "observedNanos": 1_095_000_000, "kind": "keyUp", "keyCode": 13, "origin": "physical"},
+    ])
+    other, _ = _clone_source({"directory": str(source)}, source.parent)
+    original = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in source.iterdir() if path.is_file()}
+    ranges = (RecordingRange(1_002_000_000, 1_022_000_000), RecordingRange(1_075_000_000, 1_100_000_000))
+    destination = tmp_path / str(uuid.uuid4())
+    manifest = build_dataset(destination, recording_root=source.parent,
+        selections=[RecordingSelection(item.stem, ranges=ranges) for item in (source, other)],
+        config=_configuration(), vocabulary=_vocabulary(), pointer_mode="absolute")
+    assert manifest["schemaVersion"] == 2 and len(manifest["sources"]) == 2
+    assert {item["split"] for item in manifest["sources"]} == {"train", "validation"}
+    with DatasetReader(destination, recording_root=source.parent) as reader:
+        for split in ("train", "validation"):
+            episodes = sorted(reader.episodes(split), key=lambda item: item["selection_index"])
+            assert len(episodes) == 2 and len({item["recording_id"] for item in episodes}) == 1
+            first, second = [list(reader.samples(item["id"])) for item in episodes]
+            assert first[0].observation.reset.item() and second[0].observation.reset.item()
+            assert second[0].observation.controls[0, 0, 13].item() == 1  # Gap press is prior state, not a label.
+            np.testing.assert_array_equal(np.asarray(second[0].observation.controls)[0, 0, 170:174], np.zeros(4))
+            assert not any(command["operation"] == "keyDown" for row in second for command in row.commands)
+            assert second[0].commands == ({"operation": "keyUp", "keyCode": 13, "offsetMs": 15},)
+    assert {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in source.iterdir() if path.is_file()} == original
+
+
+def test_adjacent_ranges_remain_separate_recurrent_episodes(tmp_path, native_recording):
+    source = Path(native_recording["directory"])
+    ranges = (RecordingRange(1_002_000_000, 1_022_000_000), RecordingRange(1_022_000_000, 1_042_000_000))
+    destination, _ = _build(tmp_path, native_recording, selection=RecordingSelection(source.stem, ranges=ranges))
+    with DatasetReader(destination, recording_root=source.parent) as reader:
+        episodes = reader.episodes()
+        assert {item["selection_index"] for item in episodes} == {0, 1}
+        assert all(next(reader.samples(item["id"])).observation.reset.item() for item in episodes)
+
+
+@pytest.mark.parametrize("ranges", [(), (RecordingRange(0, 1),),
+    (RecordingRange(1_002_000_000, 1_042_000_000), RecordingRange(1_022_000_000, 1_062_000_000)),
+    (RecordingRange(1_075_000_000, 1_100_000_000), RecordingRange(1_002_000_000, 1_022_000_000))])
+def test_invalid_multi_ranges_never_publish_a_partial_dataset(tmp_path, native_recording, ranges):
+    source = Path(native_recording["directory"])
+    with pytest.raises(RecordingError, match="range|interval|coverage"):
+        _build(tmp_path, native_recording, selection=RecordingSelection(source.stem, ranges=ranges))
+    assert not list(tmp_path.iterdir())
+
+
+def test_range_index_cannot_move_an_episode_to_another_selected_interval(tmp_path, native_recording):
+    source = Path(native_recording["directory"])
+    ranges = (RecordingRange(1_002_000_000, 1_022_000_000), RecordingRange(1_075_000_000, 1_100_000_000))
+    destination, _ = _build(tmp_path, native_recording, selection=RecordingSelection(source.stem, ranges=ranges))
+    with sqlite3.connect(destination / "index.sqlite") as database:
+        database.execute("UPDATE episodes SET selection_index=0 WHERE selection_index=1")
+    _rehash_index(destination)
+    with pytest.raises(RecordingError, match="range"):
+        DatasetReader(destination, recording_root=source.parent)
+
+
+def test_schema_one_dataset_checkpoint_resumes_the_exact_optimizer_and_sampler(tmp_path, native_recording):
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from astra.checkpoints import save_checkpoint, load_checkpoint
+    from astra.learning.behavioral import BehaviorConfig, BehaviorTrainer
+    from astra.model.policy import AgentPolicy
+    destination, _ = _build(tmp_path, native_recording)
+    _write_legacy_dataset_format(destination)
+    before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in destination.iterdir()}
+    with DatasetReader(destination, recording_root=Path(native_recording["directory"]).parent) as reader:
+        assert reader.manifest["schemaVersion"] == 1
+        mx.random.seed(731)
+        policy = AgentPolicy(reader.config, reader.vocabulary)
+        training = BehaviorConfig(epochs=1, lanes=1, sequence_length=1, accumulation_chunks=2)
+        trainer = BehaviorTrainer(policy, training, dataset_id=destination.name)
+        with pytest.raises(InterruptedError):
+            trainer.train_epoch(reader, cancelled=lambda: trainer.pending_chunks == 1)
+        checkpoint_path = tmp_path / str(uuid.uuid4())
+        save_checkpoint(checkpoint_path, policy, kind="behavioral", step=trainer.updates, training_state=trainer.state)
+        loaded = load_checkpoint(checkpoint_path, include_training=True)
+        resumed = BehaviorTrainer(loaded.policy, training, dataset_id=destination.name, restored_state=loaded.training_state)
+        trainer.train_epoch(reader); resumed.train_epoch(reader)
+        assert trainer.decisions == resumed.decisions and trainer.updates == resumed.updates
+        expected = dict(tree_flatten(policy.parameters()))
+        for name, value in tree_flatten(resumed.policy.parameters()):
+            np.testing.assert_allclose(np.asarray(value), np.asarray(expected[name]), atol=2e-6, rtol=2e-5, err_msg=name)
+    assert {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in destination.iterdir()} == before
 
 
 def test_native_recording_dataset_reader_and_batch_preserve_causality_and_geometry(tmp_path, native_recording):
@@ -280,7 +384,7 @@ def test_native_dataset_stream_carries_fractional_boundary_events_without_future
         assert later.observation.controls[0, 0, 13].item() == 0
         assert sum(item["operation"] == "keyDown" for row in rows for item in row.commands) == 1
         assert sum(item["operation"] == "keyRepeat" for row in rows for item in row.commands) == 0
-    partition = manifest["sources"][0]["labelPartition"]
+    partition = manifest["sources"][0]["labelPartitions"][0]
     assert partition["gridOriginNanos"] == 1_022_000_000
     assert partition["executionEndNanos"] == 1_082_000_000
     assert partition["assignedPhysicalEvents"] == partition["assignedDiscreteEvents"] == 4
@@ -306,7 +410,7 @@ def test_selection_does_not_pull_a_rounded_event_from_outside_raw_selection(tmp_
         row = next(reader.samples(reader.episodes()[0]["id"]))
         assert row.commands == ({"operation": "keyUp", "offsetMs": 0, "keyCode": 13},)
         assert row.observation.controls[0, 0, 13].item() == 1  # Real prior state, not an expert press label.
-    partition = manifest["sources"][0]["labelPartition"]
+    partition = manifest["sources"][0]["labelPartitions"][0]
     assert partition["assignedDiscreteEvents"] == 1
     assert partition["excludedPhysicalEvents"] == {"before": 0, "after": 1}
     assert partition["exclusionExamples"] == [{"sequence": 8, "eventNanos": 1_081_800_000,
@@ -316,7 +420,7 @@ def test_selection_does_not_pull_a_rounded_event_from_outside_raw_selection(tmp_
 @pytest.mark.parametrize("corruption", ["version", "origin", "counts", "selection"])
 def test_dataset_partition_report_is_versioned_and_validated(tmp_path, native_recording, corruption):
     destination, manifest = _build(tmp_path, native_recording)
-    partition = manifest["sources"][0]["labelPartition"]
+    partition = manifest["sources"][0]["labelPartitions"][0]
     if corruption == "version":
         manifest["canonicalizerVersion"] = 1
     elif corruption == "origin":
@@ -328,7 +432,7 @@ def test_dataset_partition_report_is_versioned_and_validated(tmp_path, native_re
         for name in ("gridOriginNanos", "executionEndNanos", "sourceStartNanos", "sourceEndNanos"):
             partition[name] += 1
     (destination / "manifest.json").write_text(json.dumps(manifest))
-    with pytest.raises(RecordingError, match="version|partition|count"):
+    with pytest.raises(RecordingError, match="version|partition|count|range"):
         DatasetReader(destination, recording_root=Path(native_recording["directory"]).parent)
 
 

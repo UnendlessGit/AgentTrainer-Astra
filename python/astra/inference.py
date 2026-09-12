@@ -222,7 +222,7 @@ def _policy_arrays(policy, tensors, state, key, *, greedy):
     finite = mx.all(mx.stack([mx.all(mx.isfinite(value)) for value in
                              (*state, sampled.log_probability, sampled.conditional_entropy, encoding.temporal.value)]))
     visual = flatten_visual(encoding.visual)
-    return dict(state=state, key=next_key, finite=finite, value=encoding.temporal.value,
+    return dict(state=state, key=next_key, sample_key=action_key, finite=finite, value=encoding.temporal.value,
                 log_probability=sampled.log_probability, conditional_entropy=sampled.conditional_entropy,
                 packet={name: getattr(sampled.packets, name) for name in PacketBatch.__dataclass_fields__},
                 visual={name: getattr(visual, name) for name in VisualFeatures.__dataclass_fields__})
@@ -285,6 +285,9 @@ class InferenceSession:
         self._observations = deque(maxlen=1024)
         self._contexts = ()
         self._needs_reset = True
+        self._collection = self._warming = False
+        self._rng_stream_id = None
+        self._draw_index = self._episode_step = self._environment_resets = 0
 
     def _assert_owner(self):
         if threading.get_ident() != self._owner:
@@ -299,14 +302,17 @@ class InferenceSession:
         self._assert_owner()
         if self._reader is not None:
             raise InferenceError("inference.active", "Close this actor run before preparing another stream")
-        _fields(payload, ("checkpointPath", "ring"), ("seed", "deterministic"))
+        _fields(payload, ("checkpointPath", "ring"), ("seed", "deterministic", "collection"))
         _fields(payload["ring"], ("path", "ringID"))
         run_id = _uuid(run_id)
         ring_id = _uuid(payload["ring"]["ringID"])
         seed = _uint(payload.get("seed", 0))
         deterministic = payload.get("deterministic", True)
-        if type(deterministic) is not bool:
+        collection = payload.get("collection", False)
+        if type(deterministic) is not bool or type(collection) is not bool:
             raise InferenceError("inference.configuration", "Inference mode must be Boolean")
+        if collection and deterministic:
+            raise InferenceError("inference.collectionMode", "On-policy collection requires categorical sampling, not greedy actions")
         checkpoint = load_checkpoint(_path(payload["checkpointPath"]))
         if checkpoint.policy.config.control_width != 178:
             raise InferenceError("inference.configuration", "This actor requires the version-one observed-control feature layout")
@@ -319,9 +325,12 @@ class InferenceSession:
             raise
         self._reader, self._checkpoint, self._run_id, self._key = reader, checkpoint, run_id, key
         self._deterministic = deterministic
+        self._collection = collection
+        self._rng_stream_id = str(uuid.uuid4())
         self._execution = _PolicyExecution(checkpoint.policy, greedy=deterministic)
         return {**self._identity(), "model": checkpoint.manifest["model"], "actions": checkpoint.manifest["actions"],
-                "ringID": ring_id, "deterministic": deterministic}
+                "ringID": ring_id, "deterministic": deterministic, "collection": collection,
+                "collectionVersion": 1 if collection else None, "rngStreamID": self._rng_stream_id if collection else None}
 
     def _run(self, run_id):
         self._assert_owner()
@@ -340,6 +349,8 @@ class InferenceSession:
         # configuration/loading fails, old recurrent state must stay unusable
         # until a valid reset is committed, even though old weights are retained.
         self._needs_reset = True
+        if self._collection and "seed" in payload:
+            raise InferenceError("inference.collectionReseed", "A collecting actor retains its random stream across episode resets")
         contexts = payload["contextIDs"]
         config = self._checkpoint.policy.config
         if type(contexts) is not list or len(contexts) != len(config.context_sizes):
@@ -359,6 +370,8 @@ class InferenceSession:
         self._checkpoint, self._episode_id, self._contexts, self._key = checkpoint, episode_id, tuple(contexts), key
         self._state, self._state_id, self._needs_reset = None, str(uuid.uuid4()), False
         self._last_input_nanos = None
+        self._episode_step = 0
+        self._environment_resets += 1
         return self._identity()
 
     def warmup(self, payload, *, run_id):
@@ -369,13 +382,16 @@ class InferenceSession:
         first real decision, while the native coordinator has no armed controls.
         """
         self._run(run_id)
-        if self._sequence != 0 or self._last_cutoff is not None:
+        already_started = (self._episode_step != 0 or self._state is not None) if self._collection else (self._sequence != 0 or self._last_cutoff is not None)
+        if already_started:
             raise InferenceError("inference.warmupActive", "Warmup must finish before the first real actor decision")
         fields = ("_state", "_state_id", "_episode_id", "_key", "_last_cutoff", "_last_event_sequence",
-                  "_geometry_revision", "_last_input_nanos", "_surfaces", "_sequence", "_contexts", "_needs_reset")
+                  "_geometry_revision", "_last_input_nanos", "_surfaces", "_sequence", "_contexts", "_needs_reset",
+                  "_draw_index", "_episode_step", "_environment_resets", "_warming")
         snapshot = {field: getattr(self, field) for field in fields}
         observations = deque(self._observations, maxlen=self._observations.maxlen)
         try:
+            self._warming = True
             result = self.step(payload, run_id=run_id)
             result["warmup"] = True
             return result
@@ -400,6 +416,7 @@ class InferenceSession:
         if self._last_cutoff is not None and cutoff < self._last_cutoff + config.period_ms * 1_000_000:
             raise InferenceError("inference.timing", "Decision intervals cannot overlap the immutable policy cadence")
         _uint(self._sequence)
+        _uint(self._draw_index); _uint(self._episode_step); _uint(self._environment_resets)
         if cutoff + (config.lead_ms + config.period_ms) * 1_000_000 > 2**64 - 1:
             raise InferenceError("inference.timing", "The action interval exceeds the monotonic clock range")
         if self._geometry_revision is not None and geometry < self._geometry_revision:
@@ -440,8 +457,9 @@ class InferenceSession:
             if self._surfaces is not None and surfaces != self._surfaces and geometry == self._geometry_revision:
                 raise InferenceError("inference.geometry", "Changed surface geometry requires a new aggregate revision")
             first = self._state is None
+            elapsed = config.period_ms / 1000 if first else (cutoff - self._last_cutoff) / 1e9
             observation = make_observation(owned, payload["controlState"], cutoff_nanos=cutoff,
-                                          elapsed_seconds=config.period_ms / 1000 if first else (cutoff - self._last_cutoff) / 1e9,
+                                          elapsed_seconds=elapsed,
                                           reset=first, config=config, context_ids=self._contexts, executed_events=events,
                                           interval_covered=True, surface_preparer=prepare_metal_surface,
                                           maximum_timestamp=2**64 - 1, last_input_nanos=self._last_input_nanos)
@@ -460,12 +478,38 @@ class InferenceSession:
             result = {"packet": packet, "releasedFrames": acknowledgements, "surfaces": surfaces,
                       "logProbability": float(output["log_probability"].item()), "value": float(output["value"].item()),
                       "conditionalEntropy": float(output["conditional_entropy"].item())}
-            self._state, self._key, self._state_id = output["state"], output["key"], str(uuid.uuid4())
+            next_state_id = str(uuid.uuid4())
+            if self._collection and not self._warming:
+                before = policy.temporal.initial_state(1) if first else self._state
+                state_before = []
+                for value in before:
+                    array = np.asarray(value)
+                    if array.ndim != 2 or array.shape[0] != 1 or array.dtype != np.float32 or not np.isfinite(array).all():
+                        raise InferenceError("inference.collectionState", "Collection requires finite single-actor FP32 recurrent anchors")
+                    state_before.append(array[0].tolist())
+                result["collectionRecord"] = {
+                    "schemaVersion": 1, "checkpointID": self._checkpoint.manifest["id"],
+                    "policySignature": self._checkpoint.manifest["policySignature"], "modelSignature": config.signature,
+                    "episodeID": self._episode_id, "episodeStep": self._episode_step,
+                    "observationID": observation_id, "cutoffNanos": cutoff, "geometryRevision": geometry,
+                    "frameIDs": [_uuid(metadata["id"]) for _, metadata in owned], "contextIDs": list(self._contexts),
+                    "previousStateID": self._state_id, "nextStateID": next_state_id,
+                    "recurrentReset": first, "elapsedSeconds": elapsed, "stateBefore": state_before,
+                    "packetFields": {name: np.asarray(value)[0].tolist() for name, value in output["packet"].items()},
+                    "logProbability": result["logProbability"], "value": result["value"],
+                    "sampler": {"kind": "categorical", "temperature": 1, "mixture": "none", "version": 1,
+                        "rngStreamID": self._rng_stream_id, "drawIndex": self._draw_index,
+                        "stateBefore": np.asarray(self._key).tolist(), "sampleKey": np.asarray(output["sample_key"]).tolist(),
+                        "stateAfter": np.asarray(output["key"]).tolist()},
+                    "environmentResets": self._environment_resets,
+                }
+            self._state, self._key, self._state_id = output["state"], output["key"], next_state_id
             self._last_cutoff, self._last_event_sequence, self._geometry_revision = cutoff, last_event, geometry
             self._last_input_nanos = last_input_nanos
             self._surfaces = deepcopy(surfaces)
             self._observations.append(observation_id)
             self._sequence += 1
+            self._draw_index += 1; self._episode_step += 1
             return {**result, **self._identity()}
         except Exception as error:
             # A copied lease is safe to release even if preprocessing/policy
@@ -489,6 +533,9 @@ class InferenceSession:
         self._contexts = ()
         self._observations.clear()
         self._needs_reset = True
+        self._collection = self._warming = False
+        self._rng_stream_id = None
+        self._draw_index = self._episode_step = self._environment_resets = 0
 
 
 class InferenceManager:

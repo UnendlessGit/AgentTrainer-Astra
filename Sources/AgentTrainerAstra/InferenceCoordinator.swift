@@ -34,6 +34,9 @@ struct InferenceDependencies: Sendable {
     let capture: @Sendable (CaptureSource) -> InferenceCapture
     let activate: @MainActor @Sendable (CaptureSource) throws -> Void
     var countdownSeconds = 3
+    /// Live control always uses the paired recovery protocol. Injected virtual
+    /// runtimes have no physical input ownership and are tested independently.
+    var protectsPhysicalInputs = false
 
     static func live(bundle: Bundle) -> Self {
         let helpers = bundle.bundleURL.appendingPathComponent("Contents/Helpers")
@@ -62,7 +65,7 @@ struct InferenceDependencies: Sendable {
                 }
                 application.activate()
             }
-        })
+        }, protectsPhysicalInputs: true)
     }
 }
 
@@ -145,6 +148,7 @@ struct InferencePolicyDetails: Sendable {
     private(set) var policy: InferencePolicyDetails?
     private(set) var resultsURL: URL?
     private(set) var cleanupConfirmed = false
+    private(set) var cleanupRecoveredByGuardian = false
     private let store: LibraryStore
     private let root: URL
     private let dependencies: InferenceDependencies
@@ -158,14 +162,19 @@ struct InferencePolicyDetails: Sendable {
     private var inbox: InferenceFrameInbox?
     private var stopRequested = false
     private var controlAdmissionAttempted = false
+    private var controlRecovery: ControlRecoveryLedger?
     private var pending: [UUID: ActionPacket] = [:]
+    private var collectionSink: InferenceCollectionSink?
+    private var collectionFault: InferenceCollectionFault?
 
     init(store: LibraryStore, root: URL, bundle: Bundle = .main, dependencies: InferenceDependencies? = nil) {
         self.store = store; self.root = root; self.dependencies = dependencies ?? .live(bundle: bundle)
     }
 
-    func start(agent: AgentDocument, checkpoint: CheckpointDocument, source: CaptureSource, options: InferenceOptions) throws {
+    func start(agent: AgentDocument, checkpoint: CheckpointDocument, source: CaptureSource, options: InferenceOptions,
+               collection: InferenceCollectionSink? = nil) throws {
         guard !isBusy else { throw AstraError("inference.busy", "Stop the current agent before starting another run.") }
+        guard collection == nil || !options.deterministic else { throw AstraError("inference.collectionMode", "Reinforcement collection requires categorical policy sampling.") }
         guard options.seed >= 0, options.seed <= 1_000_000_000, options.contextIDs.count <= 32,
               options.contextIDs.allSatisfy({ $0 >= 0 && $0 < 65_536 }), [.window, .display].contains(source.kind) else {
             throw AstraError("inference.options", "Choose a supported environment and valid inference settings.")
@@ -175,6 +184,10 @@ struct InferencePolicyDetails: Sendable {
         failure = nil; stopReason = nil; phase = "Opening the local policy…"; decisions = 0; executedPackets = 0
         lastLatencyMS = nil; maximumLatencyMS = nil; warmupLatencyMS = []; policy = nil; resultsURL = nil; pending = [:]
         controlAdmissionAttempted = false; cleanupConfirmed = false
+        cleanupRecoveredByGuardian = false
+        controlRecovery = nil
+        collectionSink = collection
+        collectionFault = collection == nil ? nil : InferenceCollectionFault()
         work = Task { [weak self] in await self?.perform(agent: agent, checkpoint: checkpoint, source: source, options: options, run: run) }
     }
 
@@ -209,7 +222,23 @@ struct InferencePolicyDetails: Sendable {
     }
 
     private func makeRuntime(_ role: String, run: UUID) -> InferenceRuntime {
-        dependencies.runtime(role, { [weak self] message in
+        let sink = collectionSink, fault = collectionFault
+        return dependencies.runtime(role, { [weak self] message in
+            // Offer on the process I/O callback before dispatching UI updates.
+            // Shutdown joins that callback, so final receipts cannot overtake
+            // collector finalization or disappear behind stopRequested.
+            if role == "control", let sink {
+                do {
+                    guard message.runID == run else { throw AstraError("inference.collectionRun", "Control collection received a foreign run.") }
+                    try sink.offer(.control(message))
+                } catch {
+                    fault?.record(error)
+                    Task { @MainActor [weak self] in
+                        guard let self, runID == run, isBusy else { return }
+                        requestStop(reason: error.localizedDescription)
+                    }
+                }
+            }
             Task { @MainActor [weak self] in
                 guard let self, runID == run, isBusy, !stopRequested else { return }
                 receive(message)
@@ -228,8 +257,7 @@ struct InferencePolicyDetails: Sendable {
         do {
             guard try await store.checkpointIDs(for: agent.id).contains(checkpoint.id),
                   let saved = try await store.snapshot().checkpoints.first(where: { $0.id == checkpoint.id }),
-                  saved.policySignature == checkpoint.policySignature, saved.kind == checkpoint.kind,
-                  saved.trainingStep == checkpoint.trainingStep, saved.parameterCount == checkpoint.parameterCount else {
+                  saved.matchesIdentity(of: checkpoint) else {
                 throw AstraError("inference.checkpoint", "This checkpoint is no longer linked to the selected agent.")
             }
             try await LearningFiles.write(.object(["runID": .string(run.uuidString.lowercased()), "agentID": .string(agent.id.uuidString.lowercased()),
@@ -254,10 +282,11 @@ struct InferencePolicyDetails: Sendable {
             self.actor = actor; self.control = control
             try validateHello(try await actor.start(), role: "actor"); try checkRunning()
             let checkpointPath = root.appendingPathComponent("Models").appendingPathComponent(checkpoint.id.uuidString.lowercased()).path
-            let prepare: JSONValue = .object(["checkpointPath": .string(checkpointPath),
+            var preparation: [String: JSONValue] = ["checkpointPath": .string(checkpointPath),
                 "ring": .object(["path": .string(ring.url.path), "ringID": .string(ring.ringID.uuidString.lowercased())]),
-                "seed": .integer(Int64(options.seed)), "deterministic": .bool(options.deterministic)])
-            let ready = try await actor.request("inference.prepare", prepare, run, .seconds(120), false)
+                "seed": .integer(Int64(options.seed)), "deterministic": .bool(options.deterministic)]
+            if collectionSink != nil { preparation["collection"] = .bool(true) }
+            let ready = try await actor.request("inference.prepare", .object(preparation), run, .seconds(120), false)
             guard ready.kind == "ack", ready.runID == run else { throw AstraError("inference.run", "The actor prepared a different run.") }
             let details = try InferencePolicyDetails(ready.payload, checkpoint: checkpoint, runID: run, ringID: ring.ringID)
             guard options.contextIDs.count == details.contextSizes.count,
@@ -265,6 +294,13 @@ struct InferencePolicyDetails: Sendable {
                 throw AstraError("inference.contexts", "Choose one valid value for every context in this checkpoint.")
             }
             policy = details; try checkRunning()
+            if let collectionSink {
+                guard ready.payload.fields?["collection"] == .bool(true), ready.payload.fields?["collectionVersion"] == .integer(1),
+                      ready.payload.fields?["rngStreamID"]?.uuid != nil, ready.payload.fields?["deterministic"] == .bool(false) else {
+                    throw AstraError("inference.collectionVersion", "The actor cannot provide the required on-policy collection evidence.")
+                }
+                try collectionSink.offer(.prepared(runID: run, actor: ready.payload))
+            }
             phase = "Warming the local policy…"
             // Warmup runs the actual mapped image/preprocessing/policy/decoder
             // path, but the actor restores recurrent, sequence and RNG state.
@@ -303,7 +339,13 @@ struct InferencePolicyDetails: Sendable {
             // Warmup is not an environment episode and does not consume the
             // run's action sequence. Confirm the real initial state only now.
             let episode = UUID()
-            var previousState = try await reset(actor, run: run, episode: episode, contexts: options.contextIDs, seed: options.seed)
+            var previousState = try await reset(actor, run: run, episode: episode, contexts: options.contextIDs,
+                                                seed: collectionSink == nil ? options.seed : nil)
+            if dependencies.protectsPhysicalInputs {
+                controlRecovery = try await Task.detached {
+                    try ControlRecoveryLedger(createAt: directory.appendingPathComponent("control-recovery.astracontrol"), runID: run, capabilities: details.capabilities)
+                }.value
+            }
             try validateHello(try await control.start(), role: "control"); try checkRunning()
             if dependencies.countdownSeconds > 0 {
                 for remaining in (1...dependencies.countdownSeconds).reversed() {
@@ -321,8 +363,16 @@ struct InferencePolicyDetails: Sendable {
             try checkRunning()
             controlAdmissionAttempted = true
             let armed = try await control.request("arm", .encode(ArmRequest(runID: run, scope: scope, capabilities: details.capabilities,
-                                                                           packetCapacity: details.capacity)), run, .seconds(20), false)
+                                                                           packetCapacity: details.capacity, recovery: controlRecovery?.descriptor)), run, .seconds(20), false)
             guard armed.kind == "ack", armed.runID == run, armed.payload.fields?["armed"] == .bool(true) else { throw AstraError("inference.arm", "The control helper did not arm the selected environment.") }
+            if let recovery = controlRecovery {
+                let snapshot = try recovery.snapshot()
+                guard armed.payload.fields?["recoveryLedgerID"]?.uuid == recovery.descriptor.ledgerID,
+                      armed.payload.fields?["guardianPID"]?.int == Int(snapshot.guardianPID), snapshot.guardianReady,
+                      snapshot.everArmed, snapshot.executorPID > 0 else {
+                    throw AstraError("inference.recoveryHandshake", "The control helper did not establish the requested independent cleanup protection.")
+                }
+            }
             // Stop may arrive while arm is in flight. Disarm again after its
             // response so an earlier stop request cannot leave a late arm live.
             if stopRequested { _ = try? await control.request("disarm", .object([:]), run, .seconds(2), false); throw CancellationError() }
@@ -382,6 +432,28 @@ struct InferencePolicyDetails: Sendable {
                 }
                 guard pending.count < 32 else { throw AstraError("inference.receipts", "Too many action packets are awaiting execution receipts.") }
                 pending[packet.id] = packet
+                if let collectionSink {
+                    let record = try result.payload.required("collectionRecord")
+                    guard record.fields?["schemaVersion"] == .integer(1), record.fields?["checkpointID"]?.uuid == checkpoint.id,
+                          record.fields?["policySignature"] == .string(checkpoint.policySignature), record.fields?["episodeID"]?.uuid == episode,
+                          record.fields?["observationID"]?.uuid == observationID, record.fields?["previousStateID"]?.uuid == previousState,
+                          record.fields?["nextStateID"]?.uuid == result.payload.fields?["stateID"]?.uuid,
+                          try record.required("cutoffNanos").decode(UInt64.self) == observed.cutoffNanos,
+                          try record.required("frameIDs").decode([UUID].self) == [image.metadata.id],
+                          try record.required("contextIDs").decode([Int].self) == options.contextIDs,
+                          try record.required("episodeStep").decode(UInt64.self) == UInt64(decisions),
+                          record.fields?["recurrentReset"] == .bool(decisions == 0),
+                          record.fields?["logProbability"]?.double == result.payload.fields?["logProbability"]?.double,
+                          record.fields?["value"]?.double == result.payload.fields?["value"]?.double,
+                          record.fields?["sampler"]?.fields?["rngStreamID"]?.uuid == ready.payload.fields?["rngStreamID"]?.uuid,
+                          try record.required("sampler").required("drawIndex").decode(UInt64.self) == UInt64(decisions),
+                          record.fields?["sampler"]?.fields?["kind"] == .string("categorical"),
+                          record.fields?["sampler"]?.fields?["temperature"]?.double == 1,
+                          record.fields?["sampler"]?.fields?["mixture"] == .string("none") else {
+                        throw AstraError("inference.collectionIdentity", "The actor returned inconsistent collection evidence.")
+                    }
+                    try collectionSink.offer(.decision(result.payload))
+                }
                 let accepted = try await control.request("execute", .encode(packet), run, .seconds(2), false)
                 guard accepted.kind == "ack", accepted.runID == run, accepted.payload.fields?["admitted"] == .bool(true) else { throw AstraError("inference.admission", "The control helper did not admit the action packet.") }
                 decisions += 1; previousState = try result.payload.requiredUUID("stateID")
@@ -393,18 +465,35 @@ struct InferencePolicyDetails: Sendable {
         } catch is CancellationError { /* Stop already records any originating failure. */ }
         catch { if !stopRequested { requestStop(reason: error.localizedDescription) } }
         await finish(run: run)
-        let summary: JSONValue = .object(["runID": .string(run.uuidString.lowercased()), "status": .string(failure == nil ? "stopped" : "failed"),
+        if let message = collectionFault?.message {
+            failure = [failure, "Collection lost control evidence: \(message)"].compactMap { $0 }.joined(separator: "\n")
+        }
+        var summary: JSONValue = .object(["runID": .string(run.uuidString.lowercased()), "status": .string(failure == nil ? "stopped" : "failed"),
             "decisions": .integer(Int64(decisions)), "executedPackets": .integer(Int64(executedPackets)),
             "warmupLatencyMS": .array(warmupLatencyMS.map(JSONValue.number)),
             "elapsedSeconds": .number(Date().timeIntervalSince(startedAt)), "maximumLatencyMS": maximumLatencyMS.map(JSONValue.number) ?? .null,
             "issue": failure.map(JSONValue.string) ?? .null, "stopReason": stopReason.map(JSONValue.string) ?? .null,
-            "cleanupConfirmed": .bool(cleanupConfirmed), "finishedAt": .string(Date().ISO8601Format())])
+            "cleanupConfirmed": .bool(cleanupConfirmed), "cleanupRecoveredByGuardian": .bool(cleanupRecoveredByGuardian),
+            "finishedAt": .string(Date().ISO8601Format())])
+        if let collectionSink {
+            phase = "Saving collected experience…"
+            do { try await collectionSink.finish(summary) }
+            catch {
+                failure = [failure, "Collection could not be finalized: \(error.localizedDescription)"].compactMap { $0 }.joined(separator: "\n")
+                var fields = summary.fields ?? [:]; fields["status"] = .string("failed"); fields["issue"] = failure.map(JSONValue.string)
+                summary = .object(fields)
+            }
+        }
         do {
             let destination = directory.appendingPathComponent("results.json")
             try await LearningFiles.write(summary, to: destination, exclusive: true); resultsURL = destination
         } catch { failure = [failure, "The run summary could not be saved: \(error.localizedDescription)"].compactMap { $0 }.joined(separator: "\n") }
         isBusy = false; isStopping = false; activeAgentID = nil; countdown = nil; work = nil
-        phase = failure == nil && cleanupConfirmed ? "Agent stopped · controls released" : "Agent stopped · needs attention"
+        collectionSink = nil
+        collectionFault = nil
+        phase = failure == nil && cleanupConfirmed
+            ? (cleanupRecoveredByGuardian ? "Agent stopped · guardian recovered controls" : "Agent stopped · controls released")
+            : "Agent stopped · needs attention"
     }
 
     private func waitForFrame(_ inbox: InferenceFrameInbox) async throws -> InferenceImage {
@@ -436,13 +525,21 @@ struct InferencePolicyDetails: Sendable {
                          previousState: UUID, cutoff: UInt64, controls: ControlState, events: [RawInputEvent], contexts: [Int],
                          observationID: UUID = UUID(), warmup: Bool = false) async throws -> WireMessage {
         try checkRunning()
-        let reference = try await Task.detached { try ring.publish(pixels: frame.pixels(), metadata: frame.metadata) }.value
+        let collecting = collectionSink != nil && !warmup
+        let (reference, collectedPixels) = try await Task.detached {
+            let pixels = try frame.pixels()
+            return (try ring.publish(pixels: pixels, metadata: frame.metadata), collecting ? pixels : nil)
+        }.value
         try checkRunning()
         let payload: JSONValue = .object(["observationID": .string(observationID.uuidString.lowercased()), "episodeID": .string(episode.uuidString.lowercased()),
             "previousStateID": .string(previousState.uuidString.lowercased()), "cutoffNanos": .unsigned(cutoff),
             "geometryRevision": .unsigned(frame.metadata.surface.geometryRevision), "frames": .array([try .encode(reference)]),
             "controlState": try .encode(controls), "executedEvents": try .encode(events), "intervalCovered": .bool(true),
             "contextIDs": .array(contexts.map { .integer(Int64($0)) })])
+        if let collectedPixels, let collectionSink, var input = payload.fields {
+            input.removeValue(forKey: "frames")
+            try collectionSink.offer(.observation(.init(runID: run, actorInput: .object(input), frame: frame.metadata, pixels: collectedPixels)))
+        }
         let response = try await actor.request(warmup ? "inference.warmup" : "inference.step", payload, run, .seconds(120), true)
         guard response.runID == run else { throw AstraError("inference.run", "The actor replied for another run.") }
         let released = try response.payload.required("releasedFrames").decode([SharedFrameAcknowledgement].self)
@@ -487,6 +584,9 @@ struct InferencePolicyDetails: Sendable {
               message.payload.fields?["role"]?.text == role,
               message.payload.fields?["protocolVersion"]?.int == AstraVersion.protocolVersion else {
             throw AstraError("inference.runtime", "The local \(role) runtime reported an incompatible identity.")
+        }
+        if role == "control", dependencies.protectsPhysicalInputs, message.payload.fields?["recoveryVersion"] != .integer(1) {
+            throw AstraError("inference.recoveryVersion", "This control helper does not support the required independent cleanup protection. Rebuild or reinstall the complete application.")
         }
     }
 
@@ -561,7 +661,9 @@ struct InferencePolicyDetails: Sendable {
             _ = try? await control.request("disarm", .object([:]), run, .seconds(2), false)
             phase = "Waiting for owned controls to release…"
             let status = await control.shutdown()
-            cleanupConfirmed = !controlAdmissionAttempted || status == 0
+            if let recovery = controlRecovery {
+                cleanupConfirmed = await confirmRecoveryAfterExecutorExit(recovery)
+            } else { cleanupConfirmed = !controlAdmissionAttempted || status == 0 }
         } else {
             cleanupConfirmed = !controlAdmissionAttempted
         }
@@ -575,6 +677,23 @@ struct InferencePolicyDetails: Sendable {
         _ = await actor?.shutdown(); actor = nil
         ring?.closeAfterConsumerExit(); ring = nil
         pending = [:]
+    }
+
+    private func confirmRecoveryAfterExecutorExit(_ ledger: ControlRecoveryLedger) async -> Bool {
+        while true {
+            do {
+                let snapshot = try ledger.snapshot()
+                if snapshot.cleanupConfirmed { cleanupRecoveredByGuardian = snapshot.recoveredByGuardian; return true }
+                // Native posting requires the sticky armed marker before any
+                // reservation. A command process dying before that point never
+                // gained input authority, even when the arm request was in flight.
+                if !snapshot.everArmed, snapshot.possibleKeys.isEmpty, snapshot.possibleButtons.isEmpty, snapshot.inFlight == 0 { return true }
+                guard ledger.matchingGuardianIsAlive(snapshot) else { return false }
+                phase = snapshot.errorCode == 0 ? "Recovering owned controls after the executor stopped…"
+                    : "Waiting for the cleanup guardian to release owned controls…"
+                try? await Task.sleep(for: .milliseconds(25))
+            } catch { return false }
+        }
     }
 }
 

@@ -179,3 +179,44 @@ def test_truncated_mapping_is_rejected_before_touching_missing_pages(native_ring
             stream.truncate(64)
         with pytest.raises(FrameRingError, match="bounded regular file"):
             reader.copy_frame(report["reference"])
+
+
+def test_native_cpu_frame_is_immutable_and_survives_acknowledged_slot_reuse(native_ring):
+    from astra.environments.external import FrameRingResolver
+    process, first = native_ring
+    with _reader(first) as reader:
+        resolver = FrameRingResolver({str(reader.ring_id): reader})
+        resolved = resolver(first['reference'], first['reference']['metadata'])
+        assert resolved.pixels.dtype == np.uint8 and resolved.pixels.shape == (5, 7, 4)
+        assert not resolved.pixels.flags.writeable
+        with pytest.raises(ValueError): resolved.pixels.flags.writeable = True
+        assert hashlib.sha256(resolved.pixels.tobytes()).hexdigest() == first['pixelSHA256']
+        process.stdin.write(json.dumps({'release': resolved.acknowledgement}).encode() + b'\n')
+        process.stdin.flush()
+        second = _message(process)
+        assert second['reference']['slot'] == first['reference']['slot']
+        assert hashlib.sha256(resolved.pixels.tobytes()).hexdigest() == first['pixelSHA256']
+        with pytest.raises(transport.FrameRingError, match='stale'):
+            reader.copy_cpu_frame(first['reference'])
+        latest = reader.copy_cpu_frame(second['reference'])
+        assert _digest(latest) == second['pixelSHA256']
+        _release(process, latest)
+        assert _message(process) == {'closed': True, 'pathExists': False}
+        assert process.wait(timeout=10) == 0
+    assert hashlib.sha256(resolved.pixels.tobytes()).hexdigest() == first['pixelSHA256']
+
+
+def test_cpu_copy_rejects_lease_mutation_before_acknowledgement(native_ring, monkeypatch):
+    _, report = native_ring
+    original = transport.np.frombuffer
+    def replaced_during_copy(*args, **kwargs):
+        result = original(*args, **kwargs)
+        with Path(report['path']).open('r+b') as stream:
+            stream.seek(report['reference']['offset'] - transport.SLOT_HEADER_BYTES + 16)
+            stream.write(uuid.uuid4().bytes)
+        return result
+    with _reader(report) as reader:
+        monkeypatch.setattr(transport.np, 'frombuffer', replaced_during_copy)
+        with pytest.raises(FrameRingError, match='ownership changed'):
+            reader.copy_cpu_frame(report['reference'])
+        assert not reader._seen

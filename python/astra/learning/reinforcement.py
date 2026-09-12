@@ -1,8 +1,9 @@
-"""Recurrent PPO over the real policy and an isolated virtual-time environment.
+"""Recurrent PPO over the shared policy and validated environment adapters.
 
 The actor is a private immutable weight snapshot. Learner weights wait for a
-confirmed environment reset before activation. This synchronous practice
-coordinator is not the asynchronous wall-clock desktop actor coordinator.
+confirmed environment reset before activation. This synchronous collector
+waits for rewards; actor continuity during delayed labelling or learner work
+requires the separate asynchronous rollout coordinator.
 """
 from __future__ import annotations
 
@@ -16,7 +17,6 @@ from typing import Callable
 import uuid
 
 import mlx.core as mx
-import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map
 import numpy as np
@@ -24,8 +24,10 @@ import numpy as np
 from astra.data.actions import decode_commands
 from astra.data.batching import stack_observations
 from astra.data.observations import make_observation
-from astra.environments.practice import PracticeEnvironment, PracticeObservation
-from astra.model.actions import PacketBatch, flatten_visual
+from astra.environments.practice import PracticeEnvironment
+from astra.environments.practice_adapter import PracticeAdapter
+from astra.environments.interface import EnvironmentAdapter, EnvironmentObservation, DecisionContext
+from astra.model.actions import PacketBatch, Operation, flatten_visual
 from astra.model.observation import ObservationBatch
 from astra.model.policy import AgentPolicy
 from .optimizers import GroupedAdamW, finite_gradients
@@ -97,25 +99,9 @@ def _json(value):
 
 
 @dataclass(frozen=True)
-class ObservationRecord:
-    """Raw owned pixels and immutable causal metadata; normalized only on use."""
+class ObservationImage:
     storage: np.ndarray | StoredFrame
     metadata_json: bytes
-    controls_json: bytes
-    events_json: bytes
-    elapsed_seconds: float
-    reset: bool
-    last_input_nanos: int | None = None
-
-    @classmethod
-    def capture(cls, observation: PracticeObservation, *, events=(), elapsed_seconds: float, reset: bool,
-                last_input_nanos: int | None = None, spool: FrameSpool | None = None):
-        record = cls(spool.append(observation.pixels) if spool is not None else _frozen_array(observation.pixels),
-                     _json(observation.metadata), _json(observation.control_state),
-                     _json(events), elapsed_seconds, reset, last_input_nanos)
-        if spool is not None:
-            spool.reserve_metadata(record.metadata_byte_count)
-        return record
 
     @property
     def pixels(self):
@@ -125,20 +111,59 @@ class ObservationRecord:
     def metadata(self):
         return json.loads(self.metadata_json)
 
+
+@dataclass(frozen=True)
+class ObservationRecord:
+    """Owned/spooled source images plus an independent decision cutoff."""
+    images: tuple[ObservationImage, ...]
+    observation_id: str
+    episode_id: str
+    cutoff_nanos: int
+    geometry_revision: int
+    controls_json: bytes
+    events_json: bytes
+    elapsed_seconds: float
+    reset: bool
+    last_input_nanos: int | None = None
+
+    @classmethod
+    def capture(cls, observation: EnvironmentObservation, *, events=(), elapsed_seconds: float, reset: bool,
+                last_input_nanos: int | None = None, spool: FrameSpool | None = None):
+        images = tuple(ObservationImage(spool.append(frame.pixels) if spool is not None else _frozen_array(frame.pixels),
+                                        _json(frame.metadata)) for frame in observation.frames)
+        record = cls(images, observation.id, observation.episode_id, observation.cutoff_nanos, observation.geometry_revision,
+                     _json(observation.control_state), _json(events), elapsed_seconds, reset, last_input_nanos)
+        if spool is not None:
+            spool.reserve_metadata(record.metadata_byte_count)
+        return record
+
+    def with_spool(self, spool):
+        images = tuple(replace(image, storage=spool.append(image.pixels)) for image in self.images)
+        spool.reserve_metadata(self.metadata_byte_count)
+        return replace(self, images=images)
+
+    @property
+    def pixels(self):
+        return self.images[0].pixels
+
+    @property
+    def metadata(self):
+        return self.images[0].metadata
+
     @property
     def byte_count(self):
-        return self.storage.nbytes + self.metadata_byte_count
+        return sum(image.storage.nbytes for image in self.images) + self.metadata_byte_count
 
     @property
     def metadata_byte_count(self):
-        return len(self.metadata_json) + len(self.controls_json) + len(self.events_json) + 512
+        return sum(len(image.metadata_json) + 512 for image in self.images) + len(self.controls_json) + len(self.events_json) + 512
 
     def prepare(self, model, context_ids) -> ObservationBatch:
-        metadata = self.metadata
-        return make_observation([(self.pixels, metadata)], json.loads(self.controls_json),
-                                cutoff_nanos=metadata["observedNanos"], elapsed_seconds=self.elapsed_seconds,
+        return make_observation([(image.pixels, image.metadata) for image in self.images], json.loads(self.controls_json),
+                                cutoff_nanos=self.cutoff_nanos, elapsed_seconds=self.elapsed_seconds,
                                 reset=self.reset, config=model, context_ids=context_ids,
-                                executed_events=json.loads(self.events_json), last_input_nanos=self.last_input_nanos)
+                                executed_events=json.loads(self.events_json), last_input_nanos=self.last_input_nanos,
+                                maximum_timestamp=2**64-1)
 
 
 @dataclass(frozen=True)
@@ -148,6 +173,8 @@ class CollectedDecision:
     packet_fields: tuple[tuple[int, ...], ...]
     state_before: tuple[np.ndarray, ...]
     bootstrap_observation: ObservationRecord | None
+    outcome_detail: str | None = None
+    commands_json: bytes | None = None
 
     def packet(self):
         return PacketBatch(**{name: mx.array(values, dtype=mx.int32)[None]
@@ -166,10 +193,24 @@ class CollectedRollout:
     collection_seconds: float
     audit_tail_decisions: int
     spool: FrameSpool
+    actor_sampling: tuple[str, float, str, int] | None = None
+    actor_progress_json: bytes | None = None
 
     def __post_init__(self):
         if not isinstance(self.decisions, tuple) or tuple(item.transition for item in self.decisions) != self.rollout.transitions:
             raise ValueError("Rollout payloads must match their immutable transition records")
+        for item in self.decisions:
+            scalar, observed = item.transition, item.observation
+            if (observed.observation_id, observed.episode_id, observed.cutoff_nanos, observed.reset) != (
+                scalar.observation_id, scalar.episode_id, scalar.decision_nanos, scalar.recurrent_reset):
+                raise ValueError('Rollout observation payload disagrees with its scalar identity/cutoff')
+            if scalar.bootstrap is not None:
+                final = item.bootstrap_observation
+                if final is None or final.reset or (final.observation_id, final.episode_id, final.cutoff_nanos) != (
+                    scalar.bootstrap.observation_id, scalar.bootstrap.episode_id, scalar.bootstrap.cutoff_nanos):
+                    raise ValueError('Rollout bootstrap payload must be the same-episode pre-reset observation')
+            elif item.bootstrap_observation is not None:
+                raise ValueError('An unbootstrapped transition cannot carry a bootstrap payload')
 
     def close(self):
         self.spool.close()
@@ -243,26 +284,31 @@ def _finite_tree(values):
 
 
 class ReinforcementTrainer:
-    """One practice actor, one learner, and at most one pending weight snapshot.
+    """One immutable actor, one learner, and at most one pending weight snapshot.
 
     The caller's `policy` is the learner/checkpoint policy. It must not be
     mutated concurrently. Actor and pending modules are private copies.
     Checkpoint state resumes learning at a fresh world reset, never restores
     a live world from recurrent state alone.
     """
-    def __init__(self, policy: AgentPolicy, environment: PracticeEnvironment,
+    def __init__(self, policy: AgentPolicy, environment: PracticeEnvironment | EnvironmentAdapter,
                  config: ReinforcementConfig = ReinforcementConfig(), *, policy_id: str | None = None,
                  context_ids: tuple[int, ...] = (), restored_state: dict | None = None,
                  scratch_directory: Path | None = None):
-        if not isinstance(policy, AgentPolicy) or not isinstance(environment, PracticeEnvironment):
-            raise ValueError("This collector requires AgentPolicy and an isolated PracticeEnvironment")
+        adapter = PracticeAdapter(environment) if isinstance(environment, PracticeEnvironment) else environment
+        if not isinstance(policy, AgentPolicy) or not isinstance(adapter, EnvironmentAdapter):
+            raise ValueError("This collector requires AgentPolicy and a validated environment adapter")
+        adapter.spec.validate()
+        if adapter.spec.maximum_surfaces > policy.config.maximum_surfaces:
+            raise ValueError('Environment surface capacity exceeds the policy configuration')
+        self._environment_adapter = adapter
         self.config = config.validate()
         self.policy, self.environment = policy, environment
-        if (policy.config.period_ms, policy.config.lead_ms) != (environment.config.period_ms, environment.config.lead_ms):
+        if (policy.config.period_ms, policy.config.lead_ms) != (adapter.spec.period_ms, adapter.spec.lead_ms):
             raise ValueError("Actor and environment must share immutable period/lead timing")
-        if policy.actions.vocabulary != environment.action_vocabulary:
-            raise ValueError("Policy and practice action vocabularies must agree")
-        if not math.isclose(config.returns.discount_half_life_seconds * 1000, environment.config.discount_half_life_ms):
+        if policy.actions.vocabulary != adapter.spec.action_vocabulary:
+            raise ValueError("Policy and environment action vocabularies must agree")
+        if not math.isclose(config.returns.discount_half_life_seconds * 1000, adapter.spec.discount_half_life_ms):
             raise ValueError("Potential shaping and PPO must use the same discount half-life")
         if type(context_ids) is not tuple or len(context_ids) != len(policy.config.context_sizes) or any(
             type(value) is not int or not 0 <= value < size for value, size in zip(context_ids, policy.config.context_sizes)
@@ -281,7 +327,7 @@ class ReinforcementTrainer:
             raise ValueError("Behavior policy identity must be a bounded nonempty string")
         if restored_state is not None:
             self._restore(restored_state)
-        self._run_id = str(uuid.uuid4())
+        self._run_id = self._environment_adapter.run_id
         self._actor = copy.deepcopy(policy)
         self._actor.eval()
         self._actor.configure_execution(vision_microbatch=config.vision_microbatch, checkpoint_vision=False)
@@ -304,10 +350,10 @@ class ReinforcementTrainer:
                     "iteration", "decisions", "optimizerUpdates", "environmentResets", "rng", "optimizer", "policyID", "requiresEnvironmentReset"}
         if not isinstance(state, dict) or set(state) != expected or state["kind"] != "reinforcement" or state["schemaVersion"] != 2:
             raise ValueError("Unsupported reinforcement checkpoint state")
-        if state["config"] != asdict(self.config) or state["environmentSignature"] != self.environment.config.signature or state["modelSignature"] != self.policy.config.signature or tuple(state["contextIDs"]) != self.context_ids:
+        if state["config"] != asdict(self.config) or state["environmentSignature"] != self._environment_adapter.signature or state["modelSignature"] != self.policy.config.signature or tuple(state["contextIDs"]) != self.context_ids:
             raise ValueError("Reinforcement resume requires the same model, environment and training configuration")
         if state["requiresEnvironmentReset"] is not True:
-            raise ValueError("A checkpoint cannot restore a live practice world implicitly")
+            raise ValueError("A checkpoint cannot restore a live environment implicitly")
         for name in ("iteration", "decisions", "optimizerUpdates", "environmentResets"):
             if type(state[name]) is not int or state[name] < 0:
                 raise ValueError("Invalid saved reinforcement progress")
@@ -340,25 +386,25 @@ class ReinforcementTrainer:
         if self._busy or self._outstanding_rollout_id is not None:
             raise RuntimeError("Checkpoint reinforcement state only after completing or discarding the current rollout")
         return {"kind": "reinforcement", "schemaVersion": 2, "config": asdict(self.config),
-                "environmentSignature": self.environment.config.signature, "modelSignature": self.policy.config.signature,
+                "environmentSignature": self._environment_adapter.signature, "modelSignature": self.policy.config.signature,
                 "contextIDs": self.context_ids, "iteration": self.iteration, "decisions": self.decisions,
                 "optimizerUpdates": self.optimizer_updates,
                 "environmentResets": self.environment_resets, "rng": mx.array(self._rng),
                 "optimizer": copy.deepcopy(self.optimizer.state),
                 "policyID": self.pending_policy_id or self.actor_policy_id, "requiresEnvironmentReset": True}
 
-    def activate_pending_at_reset(self):
+    def activate_pending_at_reset(self, *, cancelled=lambda: False):
         """Confirm/reset the environment before exposing pending actor weights."""
         if self._busy:
             raise RuntimeError("Cannot reset an actor during an active collection/update")
-        self._reset()
+        self._reset(cancelled=cancelled)
 
-    def _reset(self):
+    def _reset(self, *, cancelled=lambda: False):
         if not self._boundary:
             raise RuntimeError("Pending policy activation requires a confirmed episode boundary")
         if self._outstanding_rollout_id is not None:
             raise RuntimeError("Finish or discard the sealed rollout before resetting the actor")
-        observed = self.environment.reset(seed=(self.environment.config.seed + self.environment_resets) % 2**63)
+        observed = self._environment_adapter.reset(seed=(self._environment_adapter.spec.seed + self.environment_resets) % 2**63, cancelled=cancelled)
         if observed.episode_id == self._episode_id or not observed.control_state["valid"] or observed.control_state["keys"] or observed.control_state["buttons"]:
             raise RuntimeError("Environment reset failed readiness/identity confirmation")
         self.environment_resets += 1
@@ -374,7 +420,7 @@ class ReinforcementTrainer:
                                                  reset=True, spool=self._spool)
         self._boundary = False
 
-    def stop(self, reason="Practice learning stopped"):
+    def stop(self, reason="Environment learning stopped"):
         """Administrative cancellation has no fabricated zero-duration PPO row."""
         if self._busy:
             raise RuntimeError("Use the cancellation callback while a collection/update is active")
@@ -382,10 +428,9 @@ class ReinforcementTrainer:
 
     def _stop(self, reason):
         try:
-            if self.environment.outcome == "continuing":
-                self.environment.abort(reason)
+            self._environment_adapter.abort(reason)
         finally:
-            self._boundary = self.environment.outcome != "continuing"
+            self._boundary = self._environment_adapter.outcome != "continuing"
             self._current = None
             self._encoding = None
             self._state = None
@@ -398,7 +443,7 @@ class ReinforcementTrainer:
         try:
             self._stop(reason)
         except BaseException as cleanup_error:
-            failure.add_note(f"Practice cleanup also failed ({type(cleanup_error).__name__}).")
+            failure.add_note(f"Environment cleanup also failed ({type(cleanup_error).__name__}).")
 
     def discard_rollout(self, rollout: CollectedRollout):
         if self._busy or self._outstanding_rollout_id != rollout.id:
@@ -407,11 +452,36 @@ class ReinforcementTrainer:
         self._spool = None
         self._outstanding_rollout_id = None
 
-    def _decision(self) -> CollectedDecision:
+    def admit_external_rollout(self, rollout: CollectedRollout):
+        """Adopt independently sampled experience without stepping the world.
+
+        update() still verifies behavior likelihoods, recurrent anchors and
+        bootstrap values before it can admit a gradient. Native coordination
+        owns actor continuity and must confirm any pending activation at reset.
+        """
+        if self._busy or self._outstanding_rollout_id is not None or self._pending is not None:
+            raise RuntimeError('The learner already owns a rollout or pending policy update')
+        if rollout.actor_sampling != ('categorical', 1.0, 'none', 1):
+            raise ValueError('External PPO requires the bound categorical sampling contract')
+        if (rollout.rollout.run_id != self._run_id or rollout.rollout.policy_id != self.actor_policy_id
+            or rollout.model_signature != self.policy.config.signature
+            or rollout.environment_signature != self._environment_adapter.signature or rollout.context_ids != self.context_ids):
+            raise ValueError('External rollout identity does not match this learner')
+        if any(item.transition.outcome not in (Outcome.TERMINATED, Outcome.TRUNCATED)
+               for index, item in enumerate(rollout.decisions)
+               if index + 1 == len(rollout.decisions) or rollout.decisions[index + 1].observation.reset):
+            raise ValueError('External learning admission requires complete episodes')
+        if rollout.spool.closed:
+            raise ValueError('External rollout source storage is already retired')
+        self._outstanding_rollout_id, self._spool = rollout.id, rollout.spool
+        self._boundary = True
+        self._episode_id = rollout.decisions[-1].transition.episode_id
+        self._current = self._state = self._encoding = None
+
+    def _decision(self, *, cancelled=lambda: False) -> CollectedDecision:
         if self._boundary or self._current is None:
             raise RuntimeError("A decision requires a confirmed running environment")
         current = self._current
-        metadata = current.metadata
         if not json.loads(current.controls_json)["valid"]:
             raise RuntimeError("Actor controls are unavailable; no policy packet may be admitted")
         before = self._state if self._state is not None else self._actor.temporal.initial_state(1)
@@ -427,17 +497,19 @@ class ReinforcementTrainer:
         if not math.isfinite(old_log) or not math.isfinite(value):
             raise FloatingPointError("The actor produced nonfinite behavior likelihood/value")
         commands = decode_commands(sampled.packets, config=self.policy.config, vocabulary=self._actor.actions.vocabulary,
-                                   visual=flatten_visual(encoding.visual), surfaces=(metadata["surface"],))
+                                   visual=flatten_visual(encoding.visual), surfaces=tuple(image.metadata["surface"] for image in current.images))
         packet_fields = tuple(tuple(int(value) for value in np.asarray(getattr(sampled.packets, name)[0]))
                               for name in PacketBatch.__dataclass_fields__)
-        result = self.environment.step(commands, episode_id=self._episode_id, provenance="agent")
+        context = DecisionContext(self._run_id, self._episode_id, self._policy_id, current.observation_id,
+                                  str(uuid.uuid4()), self._step, current.cutoff_nanos, current.geometry_revision)
+        result = self._environment_adapter.step(commands, context=context, cancelled=cancelled)
         self._boundary = result.outcome != "continuing"
         if result.provenance != "agent" or result.duration_ms <= 0 or result.observation.episode_id != self._episode_id:
             raise RuntimeError("Environment returned invalid or non-agent transition provenance")
         if any(item["status"] in ("failed", "late", "rejected") for item in result.command_results):
             raise RuntimeError("Environment execution failed; this rollout cannot enter PPO")
-        end = result.observation.metadata["observedNanos"]
-        if end - metadata["observedNanos"] != result.duration_ms * 1_000_000:
+        end = result.observation.cutoff_nanos
+        if end - current.cutoff_nanos != result.duration_ms * 1_000_000:
             raise RuntimeError("Environment duration disagrees with its decision clock")
         input_times = [event["observedNanos"] for event in result.raw_events if event["origin"] in ("physical", "agent")]
         if input_times:
@@ -453,9 +525,9 @@ class ReinforcementTrainer:
             self._encoding = self._actor(next_observation.prepare(self.policy.config, self.context_ids), self._state)
             mx.eval(self._encoding.temporal.value, self._encoding.temporal.state)
             bootstrap = BootstrapObservation(self._episode_id, self._policy_id,
-                                             result.observation.metadata["id"], end, float(self._encoding.temporal.value[0, 0]))
-        transition = Transition(self._run_id, self._episode_id, self._policy_id, self._step, metadata["id"], str(uuid.uuid4()),
-                                metadata["observedNanos"], end, RewardWindow(metadata["observedNanos"], end, result.reward),
+                                             result.observation.id, end, float(self._encoding.temporal.value[0, 0]))
+        transition = Transition(self._run_id, self._episode_id, self._policy_id, self._step, current.observation_id, context.packet_id,
+                                current.cutoff_nanos, end, RewardWindow(current.cutoff_nanos, end, result.reward),
                                 old_log, value, bootstrap, outcome, current.reset,
                                 valid=outcome != Outcome.ABORTED, invalid_reason=result.reason if outcome == Outcome.ABORTED else None)
         self._current = next_observation
@@ -465,7 +537,7 @@ class ReinforcementTrainer:
             self._encoding = None
             self._state = None
         return CollectedDecision(transition, current, packet_fields, state_record,
-                                 next_observation if bootstrap is not None else None)
+                                 next_observation if bootstrap is not None else None, result.outcome_detail, _json(commands))
 
     def advance_to_reset(self, *, cancelled: Callable[[], bool] = lambda: False,
                          on_decision: Callable[[int], None] = lambda _: None) -> int:
@@ -478,18 +550,18 @@ class ReinforcementTrainer:
         if self._outstanding_rollout_id is not None:
             raise RuntimeError("Finish the sealed rollout before advancing its actor")
         count = 0
-        maximum = math.ceil(self.environment.config.time_limit_ms / self.environment.config.period_ms) + 1
+        maximum = math.ceil(self._environment_adapter.spec.maximum_episode_ms / self._environment_adapter.spec.period_ms) + 1
         try:
             while not self._boundary:
                 if cancelled():
                     raise InterruptedError("Reinforcement learning cancelled while waiting for reset")
-                self._decision()
+                self._decision(cancelled=cancelled)
                 count += 1
                 on_decision(count)
                 if count > maximum:
-                    raise RuntimeError("Practice actor exceeded its configured episode time limit")
+                    raise RuntimeError("Environment actor exceeded its configured episode time limit")
         except BaseException as failure:
-            self._stop_after_failure(failure, "Practice reset wait interrupted")
+            self._stop_after_failure(failure, "Environment reset wait interrupted")
             raise
         return count
 
@@ -505,19 +577,18 @@ class ReinforcementTrainer:
         try:
             if cancelled():
                 raise InterruptedError("Reinforcement rollout collection cancelled")
-            frame_bytes = self.environment.config.pixel_width * self.environment.config.pixel_height * 4
+            frame_bytes = self._environment_adapter.spec.maximum_observation_bytes
             if frame_bytes > self.config.maximum_rollout_bytes:
-                raise MemoryError("One practice frame exceeds the rollout RAM budget")
+                raise MemoryError("One environment observation exceeds the rollout RAM budget")
             self._spool = FrameSpool(memory_bytes=self.config.maximum_rollout_bytes,
                                      disk_bytes=self.config.maximum_rollout_disk_bytes,
                                      directory=self._scratch_directory)
             if self._boundary:
-                self._reset()
+                self._reset(cancelled=cancelled)
             elif self._step == 0 and self._current is not None and self._current.reset:
                 # An explicit activate_pending_at_reset() can prepare episode
                 # zero before collection has acquired its temporary storage.
-                self._spool.reserve_metadata(self._current.metadata_byte_count)
-                self._current = replace(self._current, storage=self._spool.append(self._current.pixels))
+                self._current = self._current.with_spool(self._spool)
             else:
                 raise RuntimeError("Complete-episode collection must start at confirmed episode zero")
             while len(decisions) < self.config.rollout_decisions or not self._boundary:
@@ -526,9 +597,11 @@ class ReinforcementTrainer:
                 if len(decisions) >= self.config.maximum_rollout_decisions:
                     raise MemoryError("Episode did not finish within the configured rollout decision limit")
                 if self._boundary:
-                    self._reset()
-                item = self._decision()
+                    self._reset(cancelled=cancelled)
+                item = self._decision(cancelled=cancelled)
                 decisions.append(item)
+                if self._boundary:
+                    self._environment_adapter.seal_episode(cancelled=cancelled)
                 self._spool.reserve_metadata(sum(value.nbytes for value in item.state_before)
                     + sum(len(field) * 4 for field in item.packet_fields) + 512)
                 if len(decisions) >= self.config.rollout_decisions and not self._boundary:
@@ -540,11 +613,11 @@ class ReinforcementTrainer:
             identifier = str(uuid.uuid4())
             self._outstanding_rollout_id = identifier
             return CollectedRollout(identifier, rollout, tuple(decisions), self.policy.config.signature,
-                                    self.environment.config.signature, self.context_ids,
+                                    self._environment_adapter.signature, self.context_ids,
                                     self._spool.disk_bytes + self._spool.metadata_bytes,
                                     time.perf_counter() - started, 0, self._spool)
         except BaseException as failure:
-            self._stop_after_failure(failure, "Practice collection interrupted")
+            self._stop_after_failure(failure, "Environment collection interrupted")
             raise
         finally:
             self._busy = False
@@ -555,32 +628,84 @@ class ReinforcementTrainer:
             value = item.observation.prepare(self.policy.config, self.context_ids)
             observations.append(replace(value, valid=value.valid & item.transition.valid))
         observation = stack_observations([observations])
-        packets = PacketBatch(**{name: mx.array([item.packet_fields[index] for item in decisions], dtype=mx.int32)
-                                  for index, name in enumerate(PacketBatch.__dataclass_fields__)})
+        arrays = {name: np.array([item.packet_fields[index] for item in decisions], dtype=np.int32)
+                  for index, name in enumerate(PacketBatch.__dataclass_fields__)}
+        # Right/bottom padding changes the row-major cell index, not the
+        # physical cell or its sampled subcell category. Reindex only that
+        # coordinate; re-encoding normalized commands could requantize tokens.
+        for row, original in enumerate(observations):
+            for slot in np.flatnonzero(arrays['operation'][row] == Operation.ABSOLUTE):
+                surface = int(arrays['surface'][row, slot])
+                if not 0 <= surface < len(original.surfaces):
+                    raise ValueError('Sampled packet references an unobserved surface')
+                image = original.surfaces[surface].detail_image
+                old_width, old_height = (image.shape[3] + 7) // 8, (image.shape[2] + 7) // 8
+                cell = int(arrays['cell'][row, slot])
+                if not 0 <= cell < old_width * old_height:
+                    raise ValueError('Sampled packet cell is outside its original layout')
+                new_width = (observation.surfaces[surface].detail_image.shape[3] + 7) // 8
+                arrays['cell'][row, slot] = (cell // old_width) * new_width + cell % old_width
+        packets = PacketBatch(**{name: mx.array(value) for name, value in arrays.items()})
         return observation, packets
+
+    def _replay_segments(self, collected):
+        """Expose every burn-in anchor and preserve reset geometry boundaries."""
+        boundaries = {0, len(collected.decisions)}
+        boundaries.update(index for index, item in enumerate(collected.decisions) if item.observation.reset)
+        for episode_start, start, end in self._chunks(collected):
+            boundaries.update((start, end, max(episode_start, start - self.config.burn_in)))
+        ordered = sorted(boundaries)
+        for first, last in zip(ordered, ordered[1:]):
+            for start in range(first, last, self.config.sequence_length):
+                yield start, min(start + self.config.sequence_length, last)
 
     def verify_behavior(self, collected: CollectedRollout, *, cancelled=lambda: False):
         """Exact old-policy recurrent replay from episode zero, before updates."""
         state = None
         errors, ratios = [], []
         self.policy.eval()
-        for start in range(0, len(collected.decisions), self.config.sequence_length):
+        for start, end in self._replay_segments(collected):
             if cancelled():
                 raise InterruptedError("Behavior-policy replay cancelled")
-            items = collected.decisions[start:start + self.config.sequence_length]
+            items = collected.decisions[start:end]
+            expected = self.policy.temporal.initial_state(1) if items[0].observation.reset or state is None else state
+            saved = items[0].state_before
+            if items[0].transition.valid and (len(saved) != len(expected) or any(
+                old.shape != actual.shape or not np.allclose(old, np.asarray(actual), atol=2e-5, rtol=2e-5)
+                for old, actual in zip(saved, expected))):
+                raise ValueError('Behavior recurrent anchor replay disagrees before the first PPO update')
             observation, packets = self._batch(items)
             encoding = self.policy(observation, state)
             scores = self.policy.score(encoding, packets)
             mx.eval(scores.log_probability, encoding.temporal.value, encoding.temporal.state)
+            visual = flatten_visual(encoding.visual)
+            for row, item in enumerate(items):
+                if item.commands_json is None:
+                    continue
+                decoded = decode_commands(packets, config=self.policy.config, vocabulary=self.policy.actions.vocabulary,
+                    visual=visual, surfaces=tuple(image.metadata['surface'] for image in item.observation.images), batch_index=row)
+                recorded = json.loads(item.commands_json)
+                if len(decoded) != len(recorded) or any(before.keys() != after.keys() or any(
+                    (not math.isclose(before[key], after[key], rel_tol=0, abs_tol=1e-6)) if key in ('x', 'y')
+                    else before[key] != after[key] for key in before) for before, after in zip(decoded, recorded)):
+                    raise ValueError('Actor wire commands disagree with their originally sampled packet tokens')
             old = np.array([item.transition.old_log_probability for item in items], np.float32)
             valid = np.array([item.transition.valid for item in items], bool)
             actual = np.asarray(scores.log_probability)
-            errors.append(verify_behavior_log_probabilities(old, actual, valid))
+            if valid.any(): errors.append(verify_behavior_log_probabilities(old, actual, valid))
             recorded_values = np.array([item.transition.value for item in items], np.float32)
             if not np.allclose(np.asarray(encoding.temporal.value).reshape(-1)[valid], recorded_values[valid], atol=2e-5, rtol=2e-5):
                 raise ValueError("Behavior value replay disagrees before the first PPO update")
             ratios.extend(np.exp(actual[valid].astype(np.float64) - old[valid]).tolist())
             state = _detached_state(encoding.temporal.state)
+            last = items[-1]
+            if last.transition.outcome == Outcome.TRUNCATED and last.transition.valid:
+                final = self.policy(last.bootstrap_observation.prepare(self.policy.config, self.context_ids), state)
+                mx.eval(final.temporal.value)
+                if not math.isclose(float(final.temporal.value[0, 0]), last.transition.bootstrap.value, abs_tol=2e-5, rel_tol=2e-5):
+                    raise ValueError('Behavior truncation bootstrap replay disagrees before the first PPO update')
+        if not errors:
+            raise ValueError('Behavior replay has no valid decisions')
         return max(errors), min(ratios), max(ratios)
 
     def _chunks(self, collected):
@@ -627,10 +752,10 @@ class ReinforcementTrainer:
         count = clipped = 0
         total = 0.0
         low, high = math.inf, -math.inf
-        for start in range(0, len(collected.decisions), self.config.sequence_length):
+        for start, end in self._replay_segments(collected):
             if cancelled():
                 raise InterruptedError("Candidate-policy validation cancelled")
-            items = collected.decisions[start:start + self.config.sequence_length]
+            items = collected.decisions[start:end]
             observation, packets = self._batch(items)
             encoding = self.policy(observation, state)
             scores = self.policy.score(encoding, packets)
@@ -664,7 +789,7 @@ class ReinforcementTrainer:
                on_validation: Callable[[dict], None] = lambda _: None) -> ReinforcementMetrics:
         if self._busy or self._outstanding_rollout_id != collected.id or self._pending is not None:
             raise RuntimeError("PPO needs the one outstanding rollout and no pending policy update")
-        if collected.rollout.policy_id != self.actor_policy_id or collected.rollout.run_id != self._run_id or collected.model_signature != self.policy.config.signature or collected.environment_signature != self.environment.config.signature or collected.context_ids != self.context_ids:
+        if collected.rollout.policy_id != self.actor_policy_id or collected.rollout.run_id != self._run_id or collected.model_signature != self.policy.config.signature or collected.environment_signature != self._environment_adapter.signature or collected.context_ids != self.context_ids:
             raise ValueError("Rollout identity/configuration does not match this actor and learner")
         started = time.perf_counter()
         previous_weights = copy.deepcopy(self.policy.parameters())
@@ -838,5 +963,5 @@ class ReinforcementTrainer:
                                   on_validation=on_validation)
             return IterationResult(metrics, self.state)
         except InterruptedError as failure:
-            self._stop_after_failure(failure, "Practice learning cancelled")
+            self._stop_after_failure(failure, "Environment learning cancelled")
             raise

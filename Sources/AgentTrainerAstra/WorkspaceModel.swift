@@ -4,6 +4,11 @@ import Observation
 import AstraPlatform
 
 enum WorkspaceDestination: Hashable { case agent(UUID), library, activity }
+struct RecordingLinkRequest: Identifiable {
+    let id = UUID()
+    var agentID: UUID?
+    var recordingID: UUID?
+}
 enum AgentSection: String, CaseIterable, Identifiable {
     case demonstrations = "Demonstrations", training = "Training", evaluation = "Evaluation", run = "Run"
     var id: String { rawValue }
@@ -32,6 +37,8 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private(set) var recordingStopping = false
     var showingRecorder = false
     var recordingToInspect: RecordingManifest?
+    var recordingInspectionAgentID: UUID?
+    var recordingLinkRequest: RecordingLinkRequest?
     private(set) var loading = true
     private(set) var saving = false
     var destination: WorkspaceDestination? = .library
@@ -46,6 +53,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private var recordingAgentID: UUID?
     private var activeRecordingID: UUID?
     private(set) var recordingLinks: [UUID: Set<UUID>] = [:]
+    private(set) var recordingSelections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
     private(set) var checkpointLinks: [UUID: Set<UUID>] = [:]
 
     init(inferenceCoordinator: InferenceCoordinator? = nil) {
@@ -260,10 +268,11 @@ enum AgentSection: String, CaseIterable, Identifiable {
 
     func startBehaviorTraining(agent: AgentDocument, options: BehaviorOptions) {
         do {
-            guard !isClosing, !isRunningAgent else { throw AstraError("learning.closing", "Stop live control before starting another learning operation.") }
+            guard !isClosing, !isRunningAgent, !saving else { throw AstraError("learning.closing", "Finish saving library changes and stop live control before starting another learning operation.") }
             guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
             try learning.start(agent: agent, options: options,
-                               recordings: recordings.filter { recordingLinks[agent.id]?.contains($0.id) == true })
+                               recordings: recordings.filter { recordingLinks[agent.id]?.contains($0.id) == true },
+                               selections: recordingSelections[agent.id] ?? [:])
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -305,7 +314,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
         async let learning: Void = stopLearningAndWait()
         async let inferenceStop: Void = inference?.stopAndWait() ?? ()
         _ = await (recording, learning, inferenceStop)
-        while recordingStarting || recordingStopping {
+        while recordingStarting || recordingStopping || saving {
             try? await Task.sleep(for: .milliseconds(50))
         }
         if let inference, let run = inference.runID, !inference.cleanupConfirmed,
@@ -326,12 +335,44 @@ enum AgentSection: String, CaseIterable, Identifiable {
         } catch { errorMessage = error.localizedDescription }
     }
 
+    func inspectRecording(_ recording: RecordingManifest, for agentID: UUID? = nil) {
+        recordingInspectionAgentID = agentID; recordingToInspect = recording
+    }
+
+    func linkRecordings(_ identifiers: Set<UUID>, to agentID: UUID) async -> Bool {
+        guard let store, !isClosing, !saving else { return false }
+        saving = true; defer { saving = false }
+        do { try await store.linkRecordings(identifiers, to: agentID); try await refresh(); return true }
+        catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    func unlinkRecording(_ recordingID: UUID, from agentID: UUID) async {
+        guard let store, !isClosing, !saving else { return }
+        saving = true; defer { saving = false }
+        do { try await store.unlinkRecording(recordingID, from: agentID); try await refresh() }
+        catch { errorMessage = error.localizedDescription }
+    }
+
+    func saveRecordingSelection(_ selection: RecordingTrainingSelection, recordingID: UUID, agentID: UUID) async -> Bool {
+        guard let store, !isClosing, !saving else { return false }
+        saving = true; defer { saving = false }
+        do { try await store.saveRecordingSelection(selection, recordingID: recordingID, agentID: agentID); try await refresh(); return true }
+        catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    func trainingSelectionSummary(recording: RecordingManifest, agentID: UUID) -> String {
+        guard let selection = recordingSelections[agentID]?[recording.id], let ranges = try? selection.resolved(for: recording) else { return "Review selection" }
+        let seconds = ranges.reduce(0) { $0 + $1.durationSeconds }.formatted(.number.precision(.fractionLength(1)))
+        return selection.ranges == nil ? "All usable · \(seconds) s" : "\(ranges.count) \(ranges.count == 1 ? "interval" : "intervals") · \(seconds) s"
+    }
+
     private func refresh() async throws {
         guard let store else { return }
         let snapshot = try await store.snapshot()
         agents = snapshot.agents; environments = snapshot.environments; recordings = snapshot.recordings; issues = snapshot.issues
         learningRuns = snapshot.learningRuns; checkpoints = snapshot.checkpoints
         rewardPrograms = snapshot.rewardPrograms
+        recordingSelections = snapshot.recordingSelections
         var links: [UUID: Set<UUID>] = [:]
         for agent in agents { links[agent.id] = try await store.recordingIDs(for: agent.id) }
         recordingLinks = links

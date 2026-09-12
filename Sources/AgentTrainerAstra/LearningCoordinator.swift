@@ -126,7 +126,8 @@ struct BehaviorEvaluation: Sendable {
         self.weights = (bundle.resourceURL ?? bundle.bundleURL).appendingPathComponent("Weights/convnext_tiny.safetensors")
     }
 
-    func start(agent: AgentDocument, options rawOptions: BehaviorOptions, recordings: [RecordingManifest]) throws {
+    func start(agent: AgentDocument, options rawOptions: BehaviorOptions, recordings: [RecordingManifest],
+               selections: [UUID: RecordingTrainingSelection]? = nil) throws {
         guard !isBusy else { throw AstraError("learning.busy", "Finish or stop the current learning job first.") }
         let options = try rawOptions.validated()
         let selected = options.source == .recordings && !options.resume ? recordings.filter { options.recordingIDs.contains($0.id) } : []
@@ -134,11 +135,25 @@ struct BehaviorEvaluation: Sendable {
               selected.allSatisfy({ $0.status != .recording && $0.frameCount > 0 }) else {
             throw AstraError("learning.sources", "A selected recording is unavailable or has not finished saving.")
         }
+        let chosen = try selected.sorted { $0.id.uuidString < $1.id.uuidString }.map { recording -> JSONValue in
+            guard let selection = selections == nil ? .whole : selections?[recording.id] else {
+                throw AstraError("learning.selection", "Review the saved training intervals for \(recording.name) before training.")
+            }
+            _ = try selection.resolved(for: recording)
+            return try selection.payload(recordingID: recording.id)
+        }
+        guard chosen.count <= 4096, chosen.reduce(0, { total, value in
+            if case .array(let ranges) = value.fields?["ranges"] { return total + ranges.count }
+            return total + 1
+        }) <= 100_000 else { throw AstraError("learning.selectionLimit", "The selection exceeds the supported recording or interval count.") }
+        // Check the selection envelope before starting a job. The final request
+        // and saved configuration retain their full transport/artifact limits.
+        _ = try WireMessage(kind: "dataset.prepare", sequence: 0, payload: .object(["selections": .array(chosen)])).framed()
         begin(agentID: agent.id)
         let run = LearningRunDocument(agentID: agent.id, kind: .behavioral,
                                       name: "\(String(agent.name.prefix(125))) · Imitation", sourceKind: options.source == .practice ? "practice_oracle" : "recordings")
         activeRun = run
-        work = Task { await performTraining(agent: agent, options: options, recordings: selected, runID: run.id) }
+        work = Task { await performTraining(agent: agent, options: options, recordings: selected, selections: chosen, runID: run.id) }
     }
 
     func startReinforcement(agent: AgentDocument, options rawOptions: ReinforcementOptions) throws {
@@ -321,12 +336,13 @@ struct BehaviorEvaluation: Sendable {
         _ = try await child.start()
     }
 
-    private func performTraining(agent: AgentDocument, options: BehaviorOptions, recordings: [RecordingManifest], runID: UUID) async {
+    private func performTraining(agent: AgentDocument, options: BehaviorOptions, recordings: [RecordingManifest], selections: [JSONValue], runID: UUID) async {
         let directory = artifact("Jobs", runID)
         let datasetID = UUID(), initialID = options.initialCheckpointID ?? UUID(), finalID = UUID()
         var model = options.model, actions = options.actions, training = options.training
         var verificationMode = options.source == .practice
         var recordingIDs = recordings.map(\.id).sorted { $0.uuidString < $1.uuidString }
+        var selectionProvenance: JSONValue? = options.source == .recordings && !options.resume ? .array(selections) : nil
         var dataset: JSONValue = .object([:])
         if !options.resume && options.source == .practice {
             let heldout = max(1, options.practiceEpisodes / 4)
@@ -377,6 +393,7 @@ struct BehaviorEvaluation: Sendable {
                     }
                     verificationMode = verified
                     recordingIDs = try original.required("sourceRecordingIDs").decode([UUID].self)
+                    selectionProvenance = original.fields?["sourceSelections"]
                     activeRun?.sourceRecordingIDs = recordingIDs
                     activeRun?.sourceKind = verified ? "practice_oracle" : "recordings"
                     if let saved = manifest.fields?["datasetID"]?.text.flatMap(UUID.init(uuidString:)) { activeRun?.datasetID = saved }
@@ -387,17 +404,19 @@ struct BehaviorEvaluation: Sendable {
                     fields["environment"] = .object(environment); dataset = .object(fields)
                 }
             }
-            let configuration: JSONValue = .object(["schemaVersion": .integer(1), "runID": .string(runID.uuidString.lowercased()),
+            var configurationFields: [String: JSONValue] = ["schemaVersion": .integer(1), "runID": .string(runID.uuidString.lowercased()),
                 "agentID": .string(agent.id.uuidString.lowercased()), "operation": .string("train.behavioral"),
                 "dataset": dataset, "training": training, "model": model, "actions": actions, "resume": .bool(options.resume),
                 "verificationMode": .bool(verificationMode), "sourceRecordingIDs": .array(recordingIDs.map { .string($0.uuidString.lowercased()) }),
-                "initialCheckpointID": .string(initialID.uuidString.lowercased()), "destinationCheckpointID": .string(finalID.uuidString.lowercased())])
+                "initialCheckpointID": .string(initialID.uuidString.lowercased()), "destinationCheckpointID": .string(finalID.uuidString.lowercased())]
+            if let selectionProvenance { configurationFields["sourceSelections"] = selectionProvenance }
+            let configuration: JSONValue = .object(configurationFields)
             try await LearningFiles.write(configuration, to: directory.appendingPathComponent("configuration.json"), exclusive: true)
             if options.source == .recordings && !options.resume {
                 phase = "Preparing demonstrations…"
                 let prepared = try await job("dataset.prepare", .object([
                     "destination": .string(artifact("Datasets", datasetID).path), "recordingRoot": .string(root.appendingPathComponent("Recordings").path),
-                    "selections": .array(recordings.map { .object(["recording_id": .string($0.id.uuidString.lowercased()), "context_ids": .array([])]) }),
+                    "selections": .array(selections),
                     "model": model, "actions": actions,
                     "pointerMode": .string(actions.fields?["relativePointer"] == .bool(true) && actions.fields?["absolutePointer"] != .bool(true) ? "relative" : options.pointerMode),
                     "splitSeed": .integer(Int64(options.seed))]))
@@ -681,13 +700,19 @@ enum LearningFiles {
             return try JSONDecoder().decode(JSONValue.self, from: data)
         }.value
     }
-    static func recordedCapabilities(_ recordings: [RecordingManifest], root: URL) async throws -> ActionCapabilities {
+    static func recordedCapabilities(_ recordings: [RecordingManifest], root: URL,
+                                     selections: [UUID: RecordingTrainingSelection]? = nil) async throws -> ActionCapabilities {
         let operation = Task.detached {
             var result = ActionCapabilities()
             let decoder = JSONDecoder()
             for recording in recordings {
                 try Task.checkCancellation()
                 guard recording.status != .recording else { throw AstraError("learning.recordingActive", "Finish recording before choosing its controls.") }
+                let ranges: [RecordingTimeRange]?
+                if let selections {
+                    guard let selection = selections[recording.id] else { throw AstraError("learning.selection", "Review the saved intervals for \(recording.name) before choosing its controls.") }
+                    ranges = try selection.resolved(for: recording)
+                } else { ranges = nil }
                 let directory = root.appendingPathComponent("Recordings").appendingPathComponent(recording.id.uuidString + ".astrarecord")
                 let descriptor = open(directory.appendingPathComponent(".writer.lock").path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
                 guard descriptor >= 0 else { throw AstraError("learning.recordingLock", "The recording's lock is unavailable.") }
@@ -712,9 +737,22 @@ enum LearningFiles {
                             throw AstraError("learning.inputIdentity", "Recorded input does not agree with its saved index.")
                         }
                         guard event.origin == .physical || event.origin == .reconciliation else { continue }
+                        if let ranges {
+                            guard event.origin == .physical else { continue }
+                            // Source times may arrive late relative to sequence;
+                            // binary search preserves that order without R scans.
+                            var lower = 0, upper = ranges.count
+                            while lower < upper {
+                                let middle = lower + (upper - lower) / 2
+                                if ranges[middle].endNanos <= event.eventNanos { lower = middle + 1 } else { upper = middle }
+                            }
+                            guard lower < ranges.count, ranges[lower].startNanos <= event.eventNanos else { continue }
+                        }
                         if let key = event.keyCode { result.keyCodes.insert(key) }
                         if let button = event.button { result.mouseButtons.insert(button) }
-                        if event.kind == .pointer { result.absolutePointer = true; result.relativePointer = true }
+                        if event.kind == .pointer || ((event.kind == .buttonDown || event.kind == .buttonUp) && event.x != nil && event.y != nil) {
+                            result.absolutePointer = true; result.relativePointer = true
+                        }
                         if event.kind == .scroll { result.scroll = true }
                     }
                 }

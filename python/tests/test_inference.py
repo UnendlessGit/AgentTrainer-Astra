@@ -14,7 +14,7 @@ from astra.checkpoints import load_checkpoint, save_checkpoint
 from astra.data.actions import decode_commands
 from astra.data.observations import make_observation
 from astra.inference import InferenceError, InferenceManager, InferenceSession, prepare_metal_surface
-from astra.model.actions import ActionVocabulary, flatten_visual
+from astra.model.actions import ActionVocabulary, PacketBatch, flatten_visual
 from astra.model.config import ModelConfig
 from astra.model.policy import AgentPolicy
 from astra.protocol import Message
@@ -111,6 +111,112 @@ def _step(report, state, *, cutoff=None):
 
 def _acknowledge(process, acknowledgement):
     process.stdin.write(json.dumps({"release": acknowledgement}).encode() + b"\n"); process.stdin.flush()
+
+
+def test_collection_record_replays_exact_packet_anchor_and_rng_without_resampling(native_ring, checkpoint):
+    producer, report = native_ring
+    run_id = report["reference"]["runID"]
+    actor = InferenceSession()
+    try:
+        ready = actor.prepare({**_prepare(checkpoint, report, deterministic=False), "collection": True}, run_id=run_id)
+        assert ready["collectionVersion"] == 1 and ready["collection"]
+        state = actor.reset({"confirmed": True, "episodeID": str(uuid.uuid4()), "contextIDs": []}, run_id=run_id)
+        request = _step(report, state)
+        first = actor.step(request, run_id=run_id)
+        record = first["collectionRecord"]
+        assert record["frameIDs"] == [str(uuid.UUID(report["reference"]["metadata"]["id"]))]
+        assert record["previousStateID"] == state["stateID"] and record["nextStateID"] == first["stateID"]
+        assert record["episodeStep"] == record["sampler"]["drawIndex"] == 0
+        assert record["environmentResets"] == 1 and record["recurrentReset"] is True
+        assert record["elapsedSeconds"] == .1
+        assert not np.any(record["stateBefore"])
+        assert record["sampler"]["rngStreamID"] == ready["rngStreamID"]
+        np.testing.assert_array_equal(record["sampler"]["stateBefore"], np.asarray(mx.random.key(72)))
+        keys = np.asarray(mx.random.split(mx.random.key(72)))
+        np.testing.assert_array_equal(record["sampler"]["sampleKey"], keys[1])
+        np.testing.assert_array_equal(record["sampler"]["stateAfter"], keys[0])
+
+        policy = load_checkpoint(checkpoint).policy
+        pixels = np.array([np.uint8((value * 17) % 256) for value in range(140)], np.uint8).reshape(5, 7, 4)
+        observation = make_observation([(pixels, report["reference"]["metadata"])], request["controlState"],
+            cutoff_nanos=record["cutoffNanos"], elapsed_seconds=record["elapsedSeconds"], reset=record["recurrentReset"],
+            config=policy.config, context_ids=record["contextIDs"], executed_events=[], maximum_timestamp=2**64 - 1)
+        anchor = tuple(mx.array([layer], dtype=mx.float32) for layer in record["stateBefore"])
+        encoding = policy(observation, anchor)
+        packet = PacketBatch(**{name: mx.array([values], dtype=mx.int32) for name, values in record["packetFields"].items()})
+        decoded = decode_commands(packet, config=policy.config, vocabulary=policy.actions.vocabulary,
+            visual=flatten_visual(encoding.visual), surfaces=[report["reference"]["metadata"]["surface"]])
+        assert decoded == first["packet"]["commands"]
+        scored = policy.score(encoding, packet)
+        assert float(scored.log_probability.item()) == pytest.approx(record["logProbability"], abs=1e-5)
+        assert float(encoding.temporal.value.item()) == pytest.approx(record["value"], abs=1e-6)
+        json.dumps(first, allow_nan=False)
+        saved_anchor = [np.asarray(value)[0].copy() for value in actor._state]
+        _acknowledge(producer, first["releasedFrames"][0])
+        second_report = _message(producer)
+        second = actor.step(_step(second_report, first, cutoff=request["cutoffNanos"] + 100_123_456), run_id=run_id)
+        followup = second["collectionRecord"]
+        assert followup["elapsedSeconds"] == .100123456 and followup["recurrentReset"] is False
+        np.testing.assert_array_equal(followup["stateBefore"], saved_anchor)
+        assert followup["episodeStep"] == followup["sampler"]["drawIndex"] == 1
+        assert followup["sampler"]["stateBefore"] == record["sampler"]["stateAfter"]
+        _acknowledge(producer, second["releasedFrames"][0]); assert _message(producer)["closed"]
+        assert producer.wait(timeout=10) == 0
+    finally:
+        actor.close()
+
+
+def test_collection_warmup_has_no_record_and_restores_all_stream_counters(native_ring, checkpoint):
+    producer, report = native_ring
+    run_id = report["reference"]["runID"]
+    actor = InferenceSession()
+    try:
+        with pytest.raises(InferenceError, match="categorical"):
+            actor.prepare({**_prepare(checkpoint, report), "collection": True}, run_id=run_id)
+        actor.prepare({**_prepare(checkpoint, report, deterministic=False), "collection": True}, run_id=run_id)
+        state = actor.reset({"confirmed": True, "episodeID": str(uuid.uuid4()), "contextIDs": []}, run_id=run_id)
+        key = np.asarray(actor._key).copy()
+        warmed = actor.warmup(_step(report, state), run_id=run_id)
+        assert "collectionRecord" not in warmed
+        assert actor._draw_index == actor._episode_step == actor._sequence == 0
+        assert actor._environment_resets == 1 and not actor._warming
+        np.testing.assert_array_equal(np.asarray(actor._key), key)
+        _acknowledge(producer, warmed["releasedFrames"][0])
+        second_report = _message(producer)
+        actual = actor.step(_step(second_report, state), run_id=run_id)
+        assert actual["collectionRecord"]["sampler"]["drawIndex"] == 0
+        _acknowledge(producer, actual["releasedFrames"][0]); assert _message(producer)["closed"]
+        assert producer.wait(timeout=10) == 0
+    finally:
+        actor.close()
+
+
+def test_collection_episode_reset_preserves_random_stream_and_zeroes_only_recurrence(native_ring, checkpoint):
+    producer, report = native_ring
+    run_id = report["reference"]["runID"]
+    actor = InferenceSession()
+    try:
+        actor.prepare({**_prepare(checkpoint, report, deterministic=False), "collection": True}, run_id=run_id)
+        state = actor.reset({"confirmed": True, "episodeID": str(uuid.uuid4()), "contextIDs": []}, run_id=run_id)
+        first_request = _step(report, state)
+        first = actor.step(first_request, run_id=run_id)
+        reset_request = {"confirmed": True, "episodeID": str(uuid.uuid4()), "contextIDs": []}
+        with pytest.raises(InferenceError, match="random stream"):
+            actor.reset({**reset_request, "seed": 72}, run_id=run_id)
+        assert actor._needs_reset
+        state = actor.reset(reset_request, run_id=run_id)
+        _acknowledge(producer, first["releasedFrames"][0]); second_report = _message(producer)
+        second = actor.step(_step(second_report, state, cutoff=first_request["cutoffNanos"] + 100_000_000), run_id=run_id)
+        record = second["collectionRecord"]
+        assert record["episodeStep"] == 0 and record["environmentResets"] == 2 and record["recurrentReset"]
+        assert not np.any(record["stateBefore"])
+        assert record["sampler"]["drawIndex"] == 1
+        assert record["sampler"]["stateBefore"] == first["collectionRecord"]["sampler"]["stateAfter"]
+        assert record["sampler"]["rngStreamID"] == first["collectionRecord"]["sampler"]["rngStreamID"]
+        _acknowledge(producer, second["releasedFrames"][0]); assert _message(producer)["closed"]
+        assert producer.wait(timeout=10) == 0
+    finally:
+        actor.close()
 
 
 def test_warmup_preserves_actor_state_and_rng_but_consumes_its_frame_lease(native_ring, checkpoint):

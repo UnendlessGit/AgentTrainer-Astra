@@ -74,6 +74,7 @@ public struct LibrarySnapshot: Sendable {
     public var checkpoints: [CheckpointDocument]
     public var issues: [LibraryIssue]
     public var rewardPrograms: [RewardProgram] = []
+    public var recordingSelections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
 }
 
 public enum DocumentNames {
@@ -99,15 +100,24 @@ public actor LibraryStore {
         try database.transaction {
             try database.execute("CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL)")
             let versions = try database.query("SELECT version FROM schema_info")
-            if versions.isEmpty { try database.execute("INSERT INTO schema_info VALUES (?)", [.integer(1)]) }
-            else if versions.count != 1 || versions.first?["version"]?.integer != 1 {
+            let previousVersion = versions.first?["version"]?.integer
+            if versions.isEmpty { try database.execute("INSERT INTO schema_info VALUES (?)", [.integer(2)]) }
+            else if versions.count != 1 || ![Int64(1), 2].contains(previousVersion ?? -1) {
                 throw AstraError("library.version", "This library was created by an unsupported Astra version.")
             }
             try database.execute("CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
             try database.execute("CREATE TABLE IF NOT EXISTS recordings (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
-            try database.execute("CREATE TABLE IF NOT EXISTS agent_recordings (agent_id TEXT NOT NULL REFERENCES agents(id), recording_id TEXT NOT NULL REFERENCES recordings(id), PRIMARY KEY(agent_id,recording_id))")
+            if previousVersion == 1 {
+                // Early schema-1 workspaces predate recording links entirely.
+                // Create the old shape first, then apply the same atomic upgrade.
+                try database.execute("CREATE TABLE IF NOT EXISTS agent_recordings (agent_id TEXT NOT NULL REFERENCES agents(id), recording_id TEXT NOT NULL REFERENCES recordings(id), PRIMARY KEY(agent_id,recording_id))")
+                try database.execute("ALTER TABLE agent_recordings ADD COLUMN selection BLOB")
+                try database.execute("UPDATE schema_info SET version=2")
+            } else {
+                try database.execute("CREATE TABLE IF NOT EXISTS agent_recordings (agent_id TEXT NOT NULL REFERENCES agents(id), recording_id TEXT NOT NULL REFERENCES recordings(id), selection BLOB, PRIMARY KEY(agent_id,recording_id))")
+            }
             try database.execute("CREATE TABLE IF NOT EXISTS learning_runs (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS agent_checkpoints (agent_id TEXT NOT NULL REFERENCES agents(id), checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id), PRIMARY KEY(agent_id,checkpoint_id))")
@@ -144,7 +154,24 @@ public actor LibraryStore {
             do { return try value.validated() }
             catch { issues.append(.init(id: value.id.uuidString, collection: "reward_programs", message: error.localizedDescription)); return nil }
         }
-        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues, rewardPrograms: rewards)
+        var selections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
+        let recordingsByID = Dictionary(uniqueKeysWithValues: recordings.map { ($0.id, $0) })
+        for agent in agents {
+            for row in try database.query("SELECT recording_id,CASE WHEN selection IS NULL OR (typeof(selection)='blob' AND length(selection)<=65536) THEN selection ELSE 0 END AS selection FROM agent_recordings WHERE agent_id=?", [.text(agent.id.uuidString)]) {
+                let identifier = row["recording_id"]?.string.flatMap(UUID.init(uuidString:))
+                do {
+                    guard let identifier, let recording = recordingsByID[identifier] else {
+                        throw AstraError("selection.source", "A linked recording is unavailable in the catalog.")
+                    }
+                    let selection = try decodeRecordingSelection(row["selection"])
+                    if selection.ranges != nil { _ = try selection.resolved(for: recording) }
+                    selections[agent.id, default: [:]][identifier] = selection
+                } catch {
+                    issues.append(.init(id: "\(agent.id).\(identifier?.uuidString ?? "unknown").selection", collection: "recording selections", message: error.localizedDescription))
+                }
+            }
+        }
+        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues, rewardPrograms: rewards, recordingSelections: selections)
     }
 
     public func saveRewardProgram(_ document: RewardProgram, for agentID: UUID) throws {
@@ -292,7 +319,7 @@ public actor LibraryStore {
                 .text(value.id.uuidString), .text(value.name), .blob(try encode(value)), .real(value.createdAt.timeIntervalSince1970)
             ])
             if let agentID {
-                try database.execute("INSERT OR IGNORE INTO agent_recordings VALUES(?,?)", [.text(agentID.uuidString), .text(value.id.uuidString)])
+                try database.execute("INSERT OR IGNORE INTO agent_recordings(agent_id,recording_id) VALUES(?,?)", [.text(agentID.uuidString), .text(value.id.uuidString)])
             }
         }
     }
@@ -321,7 +348,9 @@ public actor LibraryStore {
                     agentID = nil
                     issues.append(.init(id: id.uuidString + ".agent", collection: "recordings", message: "The recording's original agent is unavailable; the shared source remains in the library."))
                 }
-                try saveRecording(result.manifest, linkTo: agentID)
+                // A known recording may have been intentionally unlinked. Its
+                // immutable creator identity is provenance, not current membership.
+                try saveRecording(result.manifest, linkTo: catalog[id] == nil ? agentID : nil)
                 if result.recovered || result.manifest.status == .failed || result.manifest.status == .interrupted {
                     let detail = result.issues.first ?? result.manifest.issue ?? "The interrupted recording's durable source prefix was recovered."
                     issues.append(.init(id: id.uuidString + ".recovery", collection: "recordings", message: "\(result.manifest.name): \(detail)"))
@@ -343,6 +372,51 @@ public actor LibraryStore {
             .compactMap { $0["recording_id"]?.string.flatMap(UUID.init(uuidString:)) })
     }
 
+    public func linkRecordings(_ identifiers: Set<UUID>, to agentID: UUID) throws {
+        guard !identifiers.isEmpty, identifiers.count <= 4096 else { throw AstraError("selection.sources", "Choose between 1 and 4,096 recordings.") }
+        try database.transaction {
+            guard try !database.query("SELECT id FROM agents WHERE id=? AND archived=0", [.text(agentID.uuidString)]).isEmpty else {
+                throw AstraError("selection.agent", "The destination agent is unavailable.")
+            }
+            for id in identifiers {
+                let recording = try recordingDocument(id)
+                _ = try RecordingTrainingSelection.whole.resolved(for: recording)
+                try database.execute("INSERT OR IGNORE INTO agent_recordings(agent_id,recording_id) VALUES(?,?)", [.text(agentID.uuidString), .text(id.uuidString)])
+            }
+        }
+    }
+
+    public func unlinkRecording(_ recordingID: UUID, from agentID: UUID) throws {
+        try database.execute("DELETE FROM agent_recordings WHERE agent_id=? AND recording_id=?", [.text(agentID.uuidString), .text(recordingID.uuidString)])
+    }
+
+    public func saveRecordingSelection(_ selection: RecordingTrainingSelection, recordingID: UUID, agentID: UUID) throws {
+        try database.transaction {
+            _ = try selection.resolved(for: recordingDocument(recordingID))
+            guard try !database.query("SELECT recording_id FROM agent_recordings JOIN agents ON agents.id=agent_recordings.agent_id WHERE agent_id=? AND recording_id=? AND agents.archived=0", [.text(agentID.uuidString), .text(recordingID.uuidString)]).isEmpty else {
+                throw AstraError("selection.link", "This recording is no longer linked to the agent.")
+            }
+            try database.execute("UPDATE agent_recordings SET selection=? WHERE agent_id=? AND recording_id=?", [
+                selection.ranges == nil ? .null : .blob(try encode(selection)), .text(agentID.uuidString), .text(recordingID.uuidString)])
+        }
+    }
+
+    private func recordingDocument(_ id: UUID) throws -> RecordingManifest {
+        guard let bytes = try database.query("SELECT document FROM recordings WHERE id=? AND archived=0", [.text(id.uuidString)]).first?["document"]?.data else {
+            throw AstraError("selection.source", "The selected recording is unavailable.")
+        }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+        let value = try decoder.decode(RecordingManifest.self, from: bytes).validated()
+        guard value.id == id else { throw AstraError("selection.source", "The recording's catalog identity changed.") }
+        return value
+    }
+
+    private func decodeRecordingSelection(_ value: SQLValue?) throws -> RecordingTrainingSelection {
+        if value == .null { return .whole }
+        guard let bytes = value?.data, bytes.count <= 65_536 else { throw AstraError("selection.document", "The saved selection is missing, invalid or oversized.") }
+        return try JSONDecoder().decode(RecordingTrainingSelection.self, from: bytes).validated()
+    }
+
     /// Archiving is reversible and leaves shared artifacts untouched.
     public func archiveAgent(id: UUID, archived: Bool) throws {
         try database.execute("UPDATE agents SET archived=? WHERE id=?", [.integer(archived ? 1 : 0), .text(id.uuidString)])
@@ -357,8 +431,11 @@ public actor LibraryStore {
             for identifier in try checkpointIDs(for: source.id) {
                 try database.execute("INSERT OR IGNORE INTO agent_checkpoints VALUES(?,?)", [.text(copy.id.uuidString), .text(identifier.uuidString)])
             }
-            for identifier in try recordingIDs(for: source.id) {
-                try database.execute("INSERT OR IGNORE INTO agent_recordings VALUES(?,?)", [.text(copy.id.uuidString), .text(identifier.uuidString)])
+            for row in try database.query("SELECT recording_id,CASE WHEN selection IS NULL OR (typeof(selection)='blob' AND length(selection)<=65536) THEN selection ELSE 0 END AS selection FROM agent_recordings WHERE agent_id=?", [.text(source.id.uuidString)]) {
+                guard let identifier = row["recording_id"]?.string.flatMap(UUID.init(uuidString:)) else { throw AstraError("selection.source", "A recording link has an invalid identity.") }
+                let selection = try decodeRecordingSelection(row["selection"])
+                if selection.ranges != nil { _ = try selection.resolved(for: recordingDocument(identifier)) }
+                try database.execute("INSERT INTO agent_recordings(agent_id,recording_id,selection) VALUES(?,?,?)", [.text(copy.id.uuidString), .text(identifier.uuidString), row["selection"] ?? .null])
             }
         }
         return copy

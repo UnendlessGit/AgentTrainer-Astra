@@ -34,10 +34,15 @@ public enum ControlStopCause: String, Codable, Sendable {
 public protocol ControlInputBackend: Sendable {
     func prepare(_ request: ArmRequest) throws -> ControlState
     func physicalState() -> ControlState
+    func cleanupPhysicalState() -> ControlState
     /// Called on the independent watchdog; read cached proofs only, without OS IPC.
     func checkHealth() throws
     func validate(_ scope: ControlScope, pointer: Point2D?) throws
     func post(_ emission: InputEmission) throws
+}
+
+public extension ControlInputBackend {
+    func cleanupPhysicalState() -> ControlState { physicalState() }
 }
 
 /// One lease for this macOS user, independent of the selected Astra library.
@@ -54,7 +59,18 @@ public final class DesktopControlLock: @unchecked Sendable {
             throw AstraError("control.busy", "Another Astra process owns desktop control, or its lock is invalid.")
         }
     }
-    deinit { flock(descriptor, LOCK_UN); close(descriptor) }
+    /// Duplicates share one flock. Explicit LOCK_UN would also unlock the
+    /// surviving guardian's reference; closing our own handle is sufficient.
+    deinit { close(descriptor) }
+    public init(inheritedDescriptor: Int32) throws {
+        descriptor = fcntl(inheritedDescriptor, F_DUPFD_CLOEXEC, 64)
+        guard descriptor >= 0 else { throw AstraError("control.lock", "The inherited desktop lease is unavailable.") }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(), info.st_nlink == 1 else {
+            close(descriptor); throw AstraError("control.lock", "The inherited desktop lease is invalid.")
+        }
+    }
+    public func withFileDescriptor<T>(_ body: (Int32) throws -> T) rethrows -> T { try body(descriptor) }
 }
 
 /// The scheduler reserves possible owned holds before posting outside its lock.
@@ -79,6 +95,7 @@ public final class InputExecutor: @unchecked Sendable {
     private var watchdog: DispatchSourceTimer?
     private var lease = ControlLease()
     private var desktopLock: DesktopControlLock?
+    private var recovery: ControlRecoveryLedger?
     private var observed = ControlState()
     private var ownedKeys: Set<Int> = [], ownedButtons: Set<Int> = []
     private var scheduled: [Scheduled] = []
@@ -154,14 +171,22 @@ public final class InputExecutor: @unchecked Sendable {
         }
     }
 
-    public func arm(_ request: ArmRequest) throws {
+    public func arm(_ request: ArmRequest, recovery: ControlRecoveryLedger? = nil, desktopLease: DesktopControlLock? = nil) throws {
         let generation = try lock.withLock { () throws -> UInt64 in
             guard !arming, !driving, cleaning == 0, lease.request == nil, interruption == nil, ownedKeys.isEmpty, ownedButtons.isEmpty else { throw AstraError("control.busy", "Desktop control is still armed or cleaning up.") }
             arming = true; armingRunID = request.runID; return epoch
         }
-        defer { lock.withLock { arming = false; armingRunID = nil } }
+        defer { lock.withLock { arming = false; armingRunID = nil; settleRecoveryIfQuiescent() } }
         _ = try request.scope.validated(); _ = try request.capabilities.validated()
-        let owner = try desktopLockURL.map { try DesktopControlLock(url: $0) }
+        if let recovery {
+            let snapshot = try recovery.snapshot()
+            guard recovery.descriptor.runID == request.runID, recovery.matches(request.capabilities), snapshot.phase == .preparing,
+                  snapshot.guardianReady, snapshot.executorPID == getpid(), snapshot.guardianPID > 0,
+                  clock() >= snapshot.guardianHeartbeatNanos, clock() - snapshot.guardianHeartbeatNanos < 150_000_000 else {
+                throw AstraError("control.guardianUnavailable", "Independent input cleanup protection is not ready for this run.")
+            }
+        }
+        let owner = try desktopLease ?? desktopLockURL.map { try DesktopControlLock(url: $0) }
         let initial = try backend.prepare(request)
         try backend.checkHealth()
         guard initial.valid, initial.pointer.isFinite, initial.keys.isEmpty, initial.buttons.isEmpty else {
@@ -169,6 +194,8 @@ public final class InputExecutor: @unchecked Sendable {
         }
         try lock.withLock {
             guard epoch == generation else { throw AstraError("control.cancelled", "Control was stopped while arming.") }
+            self.recovery = recovery
+            guard recovery?.arm() ?? true else { throw AstraError("control.guardianStopped", "Input cleanup protection was stopped while arming.") }
             try lease.arm(request, now: clock()); desktopLock = owner
             observed = initial; ownedKeys = []; ownedButtons = []; lastEnd = 0
             executedEvents = []; nextEventSequence = 0; acknowledgedEventSequence = nil; deliveredEventSequence = nil; historyCovered = true
@@ -209,6 +236,9 @@ public final class InputExecutor: @unchecked Sendable {
 
     public func checkWatchdog() {
         if let generation = lock.withLock({ lease.request == nil ? nil : epoch }) {
+            if let recovery = lock.withLock({ recovery }), !recovery.guardianIsFresh(now: clock()) {
+                requestDisarm(reason: "The independent cleanup guardian stopped responding.", expectedGeneration: generation); return
+            }
             do { try backend.checkHealth() }
             catch { requestDisarm(reason: error.localizedDescription, expectedGeneration: generation); return }
         }
@@ -230,6 +260,7 @@ public final class InputExecutor: @unchecked Sendable {
             if let expectedGeneration, epoch != expectedGeneration { return nil }
             if let runID, lease.request?.runID != runID && armingRunID != runID { return nil }
             guard interruption == nil else { return nil }
+            recovery?.stop()
             interruption = reason; interruptionCause = cause; epoch &+= 1; return epoch
         }
         if let generation { stopQueue.async { [weak self] in self?.disarm(reason: reason, cause: cause, expectedGeneration: generation) } }
@@ -247,6 +278,7 @@ public final class InputExecutor: @unchecked Sendable {
             let active = lease.request != nil || arming || driving
             let runID = lease.request?.runID
             lease.disarm(); scheduled.removeAll(); observed.valid = false
+            recovery?.stop()
             let keys = ownedKeys, buttons = ownedButtons
             ownedKeys = []; ownedButtons = []; observed.keys = []; observed.buttons = []
             let receipts = pending.values.filter { $0.packet.id != inFlightPacketID }.sorted { $0.packet.sequence < $1.packet.sequence }.map { value in
@@ -262,14 +294,14 @@ public final class InputExecutor: @unchecked Sendable {
         }
         guard let captured else { return }
         cleanup(keys: captured.0, buttons: captured.1)
-        lock.withLock { cleaning -= 1; if !driving, cleaning == 0, ownedKeys.isEmpty, ownedButtons.isEmpty { desktopLock = nil } }
+        lock.withLock { cleaning -= 1; settleRecoveryIfQuiescent(); if !driving, cleaning == 0, ownedKeys.isEmpty, ownedButtons.isEmpty { desktopLock = nil } }
         for var receipt in captured.2 { receipt.resultingState = state(); onReceipt(receipt) }
         if captured.3 { onStop(captured.4, captured.5, captured.6) }
     }
 
     public func service() {
         guard lock.withLock({ if driving || arming || lease.request == nil || interruption != nil { return false }; driving = true; return true }) else { return }
-        defer { lock.withLock { driving = false; if lease.request == nil, cleaning == 0, ownedKeys.isEmpty, ownedButtons.isEmpty { desktopLock = nil } } }
+        defer { lock.withLock { driving = false; settleRecoveryIfQuiescent(); if lease.request == nil, cleaning == 0, ownedKeys.isEmpty, ownedButtons.isEmpty { desktopLock = nil } } }
         while true {
             let item = lock.withLock { () -> (Scheduled, ArmRequest, UInt64)? in
                 guard interruption == nil, let request = lease.request, let first = scheduled.first, first.time <= clock() else { return nil }
@@ -330,7 +362,14 @@ public final class InputExecutor: @unchecked Sendable {
                 }
                 guard let (emission, possibleKeys, possibleButtons) = reserved else { return }
                 var postError: (any Error)?
-                if let emission { do { try backend.post(emission) } catch { postError = error } }
+                if let emission {
+                    let journal = lock.withLock { recovery }
+                    let protected = journal.map { $0.guardianIsFresh(now: clock()) && $0.beginPost(operation: emission.operation, keyCode: emission.keyCode, button: emission.button) } ?? true
+                    if protected {
+                        do { try backend.post(emission) } catch { postError = error }
+                        journal?.endPost(operation: emission.operation, keyCode: emission.keyCode, button: emission.button, success: postError == nil)
+                    } else { postError = AstraError("control.guardianStopped", "Posting was cancelled because independent cleanup protection stopped.") }
+                }
                 let postedAt = clock()
                 var historyOverflow = false
                 let stale = lock.withLock { () -> Bool in
@@ -404,8 +443,25 @@ public final class InputExecutor: @unchecked Sendable {
         if let receipt { onReceipt(receipt) }
     }
 
+    /// Called under the executor lock only after every local posting and
+    /// provisional cleanup path has joined. The guardian does not clear this
+    /// conservative journal while the executor can still return from a post.
+    private func settleRecoveryIfQuiescent() {
+        guard lease.request == nil, !arming, !driving, inFlightPacketID == nil, cleaning == 0,
+              ownedKeys.isEmpty, ownedButtons.isEmpty, interruption == nil else { return }
+        recovery?.stop(); recovery?.settleLocally(now: clock())
+    }
+
     private func cleanup(keys: Set<Int>, buttons: Set<Int>) {
-        let physical = backend.physicalState()
+        guard !keys.isEmpty || !buttons.isEmpty else { return }
+        let physical = backend.cleanupPhysicalState()
+        guard physical.valid, physical.pointer.isFinite else {
+            lock.withLock {
+                ownedKeys.formUnion(keys); ownedButtons.formUnion(buttons)
+                observed.keys.formUnion(keys); observed.buttons.formUnion(buttons); observed.valid = false
+            }
+            return
+        }
         let location = physical.valid && physical.pointer.isFinite ? physical.pointer : state().pointer
         var remaining = keys
         for key in keys.sorted() {
@@ -476,6 +532,9 @@ public final class InputExecutor: @unchecked Sendable {
 /// separate from the HID state used to recognize a person's held controls.
 public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendable {
     private let source: CGEventSource
+    private let keyboardTrust: KeyboardObservationTrust
+    private let permissionProbe: @Sendable () -> (accessibility: Bool, eventPosting: Bool, inputMonitoring: Bool)
+    private let hidProbe: (@Sendable () -> ControlState)?
     private let lock = NSLock()
     private var launchDate: Date?
     private var activeScope: ControlScope?
@@ -486,14 +545,22 @@ public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendab
     private var permissionCheckedAt: UInt64?
     private var permissionAvailable = false
     private var permissionTimer: DispatchSourceTimer?
+    private var keyboardGeneration: UInt64?
     public static let permissionFreshnessNanos: UInt64 = 250_000_000
     public static let scopeFreshnessNanos: UInt64 = 100_000_000
-    public init() throws {
+    public init(keyboardTrust: KeyboardObservationTrust = .shared,
+                permissionProbe: @escaping @Sendable () -> (accessibility: Bool, eventPosting: Bool, inputMonitoring: Bool) = {
+                    (AXIsProcessTrusted(), CGPreflightPostEventAccess(), CGPreflightListenEventAccess())
+                },
+                hidProbe: (@Sendable () -> ControlState)? = nil) throws {
         guard let source = CGEventSource(stateID: .privateState) else { throw AstraError("control.source", "A private input source could not be created.") }
         self.source = source
+        self.keyboardTrust = keyboardTrust; self.permissionProbe = permissionProbe; self.hidProbe = hidProbe
     }
     deinit { permissionTimer?.cancel(); scopeTimer?.cancel() }
     public func prepare(_ request: ArmRequest) throws -> ControlState {
+        let keyboard = keyboardTrust.refreshSynchronously(); try keyboard.requireTrusted()
+        lock.withLock { keyboardGeneration = keyboard.interruptionGeneration }
         refreshPermissionProof(); try requirePermissionProof()
         lock.withLock {
             if permissionTimer == nil {
@@ -525,6 +592,15 @@ public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendab
         return physicalState()
     }
     public func physicalState() -> ControlState {
+        let before = keyboardTrust.snapshot()
+        guard before.trusted, lock.withLock({ keyboardGeneration.map { $0 == before.interruptionGeneration } ?? true }) else { return ControlState() }
+        let result = readHIDState()
+        let after = keyboardTrust.snapshot()
+        guard after.trusted, after.interruptionGeneration == before.interruptionGeneration else { return ControlState() }
+        return result
+    }
+    private func readHIDState() -> ControlState {
+        if let hidProbe { return hidProbe() }
         var result = ControlState()
         result.keys = Set((0...127).filter { CGEventSource.keyState(.hidSystemState, key: CGKeyCode($0)) })
         result.buttons = Set((0...31).filter { CGEventSource.buttonState(.hidSystemState, button: CGMouseButton(rawValue: UInt32($0))!) })
@@ -533,9 +609,21 @@ public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendab
         result.observedNanos = MonotonicClock.now
         return result
     }
+    public func cleanupPhysicalState() -> ControlState {
+        // Cleanup may run after ordinary health proof has expired, including in
+        // the guardian that never entered normal policy execution. Verify HID
+        // access directly before attributing a hold to a person.
+        let before = keyboardTrust.refreshSynchronously()
+        guard before.trusted, permissionProbe().inputMonitoring else { return ControlState() }
+        let state = readHIDState()
+        let after = keyboardTrust.refreshSynchronously()
+        guard after.trusted, after.interruptionGeneration == before.interruptionGeneration else { return ControlState() }
+        return state
+    }
     private func refreshPermissionProof() {
         let began = MonotonicClock.now
-        let available = AXIsProcessTrusted() && CGPreflightPostEventAccess() && CGPreflightListenEventAccess()
+        let permissions = permissionProbe()
+        let available = permissions.accessibility && permissions.eventPosting && permissions.inputMonitoring
         lock.withLock {
             if began >= (permissionCheckedAt ?? 0) { permissionCheckedAt = began; permissionAvailable = available }
         }
@@ -549,6 +637,10 @@ public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendab
         }
     }
     public func checkHealth() throws {
+        let proof = keyboardTrust.snapshot(); try proof.requireTrusted()
+        guard lock.withLock({ keyboardGeneration == proof.interruptionGeneration }) else {
+            throw AstraError("input.keyboardInterrupted", "Keyboard observation was interrupted after this control run armed.")
+        }
         try requirePermissionProof()
         let failure = lock.withLock { () -> String? in
             if let scopeFailure { return scopeFailure }
@@ -632,9 +724,13 @@ public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendab
         }
     }
     public func post(_ emission: InputEmission) throws {
+        var cleanupKeyboard: KeyboardObservationProof?
         if emission.cleanup {
-            guard emission.operation == .keyUp || emission.operation == .buttonUp, CGPreflightPostEventAccess() else {
-                throw AstraError("permission.cleanup", "macOS is not permitting release of an owned input. Cleanup remains pending.")
+            let proof = keyboardTrust.refreshSynchronously(); try proof.requireTrusted(); cleanupKeyboard = proof
+            let permissions = permissionProbe()
+            guard emission.operation == .keyUp || emission.operation == .buttonUp,
+                  permissions.eventPosting, permissions.inputMonitoring else {
+                throw AstraError("permission.cleanup", "macOS is not permitting owned input release or physical-hold verification. Cleanup remains pending.")
             }
         } else { try checkHealth() }
         let event: CGEvent?
@@ -666,6 +762,24 @@ public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendab
         }
         guard let event else { throw AstraError("control.event", "macOS could not allocate an input event.") }
         event.flags = flags; event.setIntegerValueField(.eventSourceUserData, value: AstraSyntheticInput.tag)
+        // A long release batch must not rely only on its first HID snapshot.
+        // Recheck immediately before submission so a newly physical hold takes
+        // ownership instead of receiving an artificial up event.
+        if emission.cleanup {
+            let proof = keyboardTrust.refreshSynchronously(); try proof.requireTrusted()
+            guard proof.interruptionGeneration == cleanupKeyboard?.interruptionGeneration else {
+                throw AstraError("input.keyboardInterrupted", "Keyboard trust changed during owned input cleanup.")
+            }
+            let keyHeld = emission.keyCode.map { CGEventSource.keyState(.hidSystemState, key: CGKeyCode($0)) } ?? false
+            let buttonHeld = emission.button.flatMap { CGMouseButton(rawValue: UInt32($0)) }.map {
+                CGEventSource.buttonState(.hidSystemState, button: $0)
+            } ?? false
+            let after = keyboardTrust.refreshSynchronously(); try after.requireTrusted()
+            guard after.interruptionGeneration == proof.interruptionGeneration else {
+                throw AstraError("input.keyboardInterrupted", "Keyboard trust changed during physical-hold verification.")
+            }
+            if keyHeld || buttonHeld { return }
+        }
         event.post(tap: .cgSessionEventTap)
     }
     public static func modifierFlags(keys: Set<Int>) -> CGEventFlags {

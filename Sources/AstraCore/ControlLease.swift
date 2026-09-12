@@ -37,8 +37,9 @@ public struct ArmRequest: Codable, Hashable, Sendable {
     public var scope: ControlScope
     public var capabilities: ActionCapabilities
     public var packetCapacity: Int
-    public init(runID: UUID, scope: ControlScope, capabilities: ActionCapabilities, packetCapacity: Int = 16) {
-        self.runID = runID; self.scope = scope; self.capabilities = capabilities; self.packetCapacity = packetCapacity
+    public var recovery: ControlRecoveryDescriptor?
+    public init(runID: UUID, scope: ControlScope, capabilities: ActionCapabilities, packetCapacity: Int = 16, recovery: ControlRecoveryDescriptor? = nil) {
+        self.runID = runID; self.scope = scope; self.capabilities = capabilities; self.packetCapacity = packetCapacity; self.recovery = recovery
     }
 }
 

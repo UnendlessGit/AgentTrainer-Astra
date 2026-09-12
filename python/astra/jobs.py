@@ -135,16 +135,33 @@ def validate_request(request: Message) -> dict:
             raise JobError("job.invalidConfiguration", "Dataset pointerMode must be absolute or relative")
         if not isinstance(value["selections"], list) or not 1 <= len(value["selections"]) <= 4096:
             raise JobError("job.invalidConfiguration", "Dataset requires a bounded recording selection list")
+        total_ranges = 0
         for selection in value["selections"]:
-            _object(selection, ("recording_id", "start_nanos", "end_nanos", "context_ids"), ("recording_id",))
+            _object(selection, ("recording_id", "start_nanos", "end_nanos", "ranges", "context_ids"), ("recording_id",))
             uuid.UUID(selection["recording_id"])
             for name in ("start_nanos", "end_nanos"):
                 if selection.get(name) is not None: _integer(selection[name])
             if selection.get("start_nanos") is not None and selection.get("end_nanos") is not None and selection["start_nanos"] >= selection["end_nanos"]:
                 raise JobError("job.invalidConfiguration", "Recording selection must have a positive duration")
+            if "ranges" in selection:
+                ranges = selection["ranges"]
+                if "start_nanos" in selection or "end_nanos" in selection or not isinstance(ranges, list) or not 1 <= len(ranges) <= 256:
+                    raise JobError("job.invalidConfiguration", "Choose 1–256 ranges without mixing legacy selection bounds")
+                previous_end = 0
+                for interval in ranges:
+                    _object(interval, ("start_nanos", "end_nanos"), ("start_nanos", "end_nanos"))
+                    start, end = _integer(interval["start_nanos"]), _integer(interval["end_nanos"])
+                    if start < previous_end or start >= end:
+                        raise JobError("job.invalidConfiguration", "Recording ranges must be ordered, non-overlapping and nonempty")
+                    previous_end = end
+                total_ranges += len(ranges)
+            else:
+                total_ranges += 1
             if not isinstance(selection.get("context_ids", []), list):
                 raise JobError("job.invalidConfiguration", "Context choices must be an integer array")
             for choice in selection.get("context_ids", []): _integer(choice, high=65535)
+        if total_ranges > 100_000:
+            raise JobError("job.invalidConfiguration", "Dataset selection exceeds its range budget")
     elif request.kind == "train.reinforcement":
         _object(value, ("checkpointPath", "environment", "training", "iterations", "destination", "resume", "contextIDs"),
                 ("checkpointPath", "environment", "training", "iterations", "destination"))
@@ -349,7 +366,7 @@ class JobManager:
             return {"checkpointPath": value["destination"], "manifest": manifest, "checkpointPublished": True,
                     "parameterCount": policy.config.parameter_count}
         if operation == "dataset.prepare":
-            selections = [RecordingSelection(**{**item, "context_ids": tuple(item.get("context_ids", []))}) for item in value["selections"]]
+            selections = [RecordingSelection.from_payload(item) for item in value["selections"]]
             manifest = build_dataset(Path(value["destination"]), recording_root=Path(value["recordingRoot"]), selections=selections,
                                      config=ModelConfig.from_dict(value["model"]), vocabulary=ActionVocabulary.from_dict(value["actions"]),
                                      pointer_mode=value["pointerMode"], split_seed=value.get("splitSeed", 0), cancelled=job.cancel.is_set)

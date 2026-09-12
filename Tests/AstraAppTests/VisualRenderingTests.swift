@@ -44,6 +44,13 @@ import AstraCore
     try await store.saveLearningRun(run)
     let recording = try makeRenderRecording(root: root, environment: environment)
     try await store.saveRecording(recording)
+    let selectionAgent = AgentDocument(name: "Selected demonstrations · reusable source")
+    try await store.save(selectionAgent)
+    try await store.linkRecordings([recording.id], to: selectionAgent.id)
+    let ranges = RecordingTrainingSelection(ranges: [
+        .init(startNanos: 1_000_010_000, endNanos: 1_100_000_000),
+        .init(startNanos: 1_200_000_000, endNanos: 1_350_000_000)])
+    try await store.saveRecordingSelection(ranges, recordingID: recording.id, agentID: selectionAgent.id)
     let score = RewardSignal(name: "Visible score", kind: .ocrNumber, surfaceID: "generated-render-fixture", region: .init(x: 0.1, y: 0.1, width: 0.3, height: 0.2))
     var rewards = RewardProgram(name: "Desktop feedback · recorded visual signals", signals: [score], rules: [
         .init(name: "Score change", kind: .scoreDelta, amount: 0.1, signalID: score.id),
@@ -71,6 +78,8 @@ import AstraCore
         reinforcement.append(try #require(ReinforcementMetric(fields)))
     }
     var evidence: [[String: Any]] = []
+    let requestedNames = Set((ProcessInfo.processInfo.environment["ASTRA_UI_RENDER_NAMES"] ?? "").split(separator: ",").map(String.init))
+    func includes(_ name: String) -> Bool { requestedNames.isEmpty || requestedNames.contains(name) }
     for size in [NSSize(width: 1120, height: 760), NSSize(width: 860, height: 580)] {
         for scheme in [ColorScheme.light, .dark] {
             let variants: [(String, AnyView)] = [
@@ -89,22 +98,26 @@ import AstraCore
                     rolloutTarget: 512, rolloutDecisions: 576, updates: 192, elapsedSeconds: 438, peakMemoryBytes: 4_182_662_144).padding(28))),
                 ("recording-inspector", AnyView(RecordingInspector(recording: recording, directory: root.appendingPathComponent("Recordings/" + recording.id.uuidString + ".astrarecord")))),
                 ("recording-interrupted", AnyView(RecordingInspector(recording: interrupted, directory: interruptedRoot.appendingPathComponent("Recordings/" + interrupted.id.uuidString + ".astrarecord")))),
+                ("recording-selections", AnyView(RecordingInspector(recording: recording, directory: root.appendingPathComponent("Recordings/" + recording.id.uuidString + ".astrarecord"), workspace: model, agentID: selectionAgent.id))),
+                ("recording-link", AnyView(RecordingLinkSheet(model: model, request: .init(agentID: agent.id)))),
                 ("reward-signals", AnyView(RewardEditor(agent: agent, model: model, referenceRecordingID: recording.id))),
                 ("reward-rules", AnyView(RewardEditor(agent: agent, model: model, initialPage: "Rewards"))),
                 ("reward-episode", AnyView(RewardEditor(agent: agent, model: model, initialPage: "Episode"))),
                 ("reward-rehearse", AnyView(RewardEditor(agent: agent, model: model, initialPage: "Rehearse", referenceRecordingID: recording.id))),
             ]
-            for (name, view) in variants {
+            for (name, view) in variants where includes(name) {
                 evidence.append(try await renderOwnedView(view, name: name, size: size, scheme: scheme, output: output))
             }
             model.destination = .library
-            evidence.append(try await renderOwnedView(AnyView(WorkspaceView(model: model)), name: "workspace-library", size: size, scheme: scheme, output: output))
+            if includes("workspace-library") { evidence.append(try await renderOwnedView(AnyView(WorkspaceView(model: model)), name: "workspace-library", size: size, scheme: scheme, output: output)) }
             model.destination = .agent(agent.id); model.section = .training
-            evidence.append(try await renderOwnedView(AnyView(WorkspaceView(model: model)), name: "workspace-training", size: size, scheme: scheme, output: output))
+            if includes("workspace-training") { evidence.append(try await renderOwnedView(AnyView(WorkspaceView(model: model)), name: "workspace-training", size: size, scheme: scheme, output: output)) }
+            model.destination = .agent(selectionAgent.id)
             model.section = .demonstrations
-            evidence.append(try await renderOwnedView(AnyView(WorkspaceView(model: model)), name: "workspace-demonstrations", size: size, scheme: scheme, output: output))
+            if includes("workspace-demonstrations") { evidence.append(try await renderOwnedView(AnyView(WorkspaceView(model: model)), name: "workspace-demonstrations", size: size, scheme: scheme, output: output)) }
+            model.destination = .agent(agent.id)
             model.section = .run
-            evidence.append(try await renderOwnedView(AnyView(WorkspaceView(model: model)), name: "workspace-run", size: size, scheme: scheme, output: output))
+            if includes("workspace-run") { evidence.append(try await renderOwnedView(AnyView(WorkspaceView(model: model)), name: "workspace-run", size: size, scheme: scheme, output: output)) }
         }
     }
     await model.prepareForTermination()

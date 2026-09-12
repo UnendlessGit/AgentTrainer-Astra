@@ -177,17 +177,23 @@ public final class PhysicalInputMonitor: @unchecked Sendable {
     public typealias FaultHandler = @Sendable (AstraError) -> Void
     private let lock = NSLock()
     private var context: InputTapContext?
+    private let keyboardTrust: KeyboardObservationTrust
+    private let listenAccess: @Sendable () -> Bool
 
-    public init() {}
+    public init(keyboardTrust: KeyboardObservationTrust = .shared,
+                listenAccess: @escaping @Sendable () -> Bool = { CGPreflightListenEventAccess() }) {
+        self.keyboardTrust = keyboardTrust; self.listenAccess = listenAccess
+    }
     deinit { context?.requestStop() }
 
     public func start(source: CaptureSource? = nil, onEvents: @escaping EventHandler, onFault: @escaping FaultHandler,
                       onEmergency: @escaping @Sendable () -> Void,
                       onBoundary: @escaping @Sendable (InputObservationBoundary) -> Void = { _ in }) async throws {
-        guard CGPreflightListenEventAccess() else {
+        try keyboardTrust.refreshSynchronously().requireTrusted()
+        guard listenAccess() else {
             throw AstraError("permission.inputMonitoring", "Allow Input Monitoring for AgentTrainer Astra before recording controls.")
         }
-        let candidate = InputTapContext(source: source, onEvents: onEvents, onFault: onFault,
+        let candidate = InputTapContext(source: source, keyboardTrust: keyboardTrust, onEvents: onEvents, onFault: onFault,
                                         onEmergency: onEmergency, onBoundary: onBoundary)
         try lock.withLock {
             guard context == nil else { throw AstraError("input.busy", "Input observation is already running or stopping.") }
@@ -301,16 +307,20 @@ private final class InputTapContext: @unchecked Sendable {
     // Only prepare (before the thread starts) and drainQueue access this.
     private var scopeSnapshot: InputScopeSnapshot?
     private var scopeFailed = false
+    private let keyboardTrust: KeyboardObservationTrust
+    private var keyboardContinuity: KeyboardObservationContinuity?
 
-    init(source: CaptureSource?, onEvents: @escaping PhysicalInputMonitor.EventHandler,
+    init(source: CaptureSource?, keyboardTrust: KeyboardObservationTrust, onEvents: @escaping PhysicalInputMonitor.EventHandler,
          onFault: @escaping PhysicalInputMonitor.FaultHandler, onEmergency: @escaping @Sendable () -> Void,
          onBoundary: @escaping @Sendable (InputObservationBoundary) -> Void) {
         self.scopeSource = source; self.onEvents = onEvents; self.onFault = onFault
         self.onEmergency = onEmergency; self.onBoundary = onBoundary
+        self.keyboardTrust = keyboardTrust
     }
 
     func prepare() throws {
         do {
+            keyboardContinuity = try KeyboardObservationContinuity(keyboardTrust.refreshSynchronously())
             if let scopeSource, scopeSource.kind != .desktop {
                 let snapshot = try InputScopeSnapshot.current(for: scopeSource)
                 try snapshot.verifyTarget(scopeSource)
@@ -356,7 +366,12 @@ private final class InputTapContext: @unchecked Sendable {
             if shouldRun {
                 CFRunLoopAddSource(loop, source, .commonModes)
                 CGEvent.tapEnable(tap: tap, enable: true)
-                seedPhysicalState()
+                do { try seedPhysicalState() }
+                catch {
+                    let failure = (error as? AstraError) ?? AstraError("input.keyboardTrust", error.localizedDescription)
+                    lock.withLock { startupFailure = failure }
+                    onFault(failure); requestStop()
+                }
                 let timer = DispatchSource.makeTimerSource(queue: drainQueue)
                 timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(2))
                 timer.setEventHandler { [weak self] in self?.drain() }
@@ -414,7 +429,8 @@ private final class InputTapContext: @unchecked Sendable {
         if emergency { onEmergency() }
     }
 
-    private func seedPhysicalState() {
+    private func seedPhysicalState() throws {
+        let before = keyboardTrust.snapshot(); try before.requireTrusted()
         let now = MonotonicClock.now
         let pointer = CGEvent(source: nil)?.location ?? .zero
         let flags = CGEventSource.flagsState(.hidSystemState).rawValue
@@ -433,6 +449,10 @@ private final class InputTapContext: @unchecked Sendable {
         // Reconciliation is an observed snapshot, not a physical edge. Do not
         // backdate the result to before the hardware queries completed.
         let completed = MonotonicClock.now
+        let after = keyboardTrust.snapshot(); try after.requireTrusted()
+        guard after.interruptionGeneration == before.interruptionGeneration else {
+            throw AstraError("input.keyboardInterrupted", "Keyboard observation changed while its initial state was being read.")
+        }
         lock.withLock {
             for var event in seed {
                 event.sequence = sequence; event.eventNanos = completed; event.observedNanos = completed
@@ -447,6 +467,17 @@ private final class InputTapContext: @unchecked Sendable {
             return batch
         }
         guard !scopeFailed else { return }
+        if let boundary = keyboardContinuity?.inspect(keyboardTrust.snapshot()) {
+            scopeFailed = true; requestStop()
+            let gap = lock.withLock { () -> RawInputEvent in
+                let gap = RawInputEvent(sequence: sequence, eventNanos: boundary.observedNanos, observedNanos: boundary.observedNanos,
+                    origin: .boundary, kind: .gap, detail: boundary.message)
+                sequence += 1; events.removeAll(); retainedBytes = 0; return gap
+            }
+            onEvents([gap]); onBoundary(boundary)
+            onFault(AstraError("input.keyboardInterrupted", boundary.message))
+            return
+        }
         if let scopeSource, scopeSource.kind != .desktop, let previous = scopeSnapshot {
             // Verify every nonempty delivery batch and at least ten times per
             // second while idle. A blocked WindowServer never blocks the tap;

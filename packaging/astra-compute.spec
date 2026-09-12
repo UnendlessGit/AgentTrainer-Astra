@@ -1,7 +1,9 @@
 from pathlib import Path
+import plistlib
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 root = Path(SPECPATH).parent
+app_info = plistlib.loads((root / "Resources/Info.plist").read_bytes())
 analysis = Analysis(
     [str(root / "python/astra/worker.py")],
     pathex=[str(root / "python")],
@@ -26,5 +28,6 @@ executable = EXE(
 collection = COLLECT(executable, analysis.binaries, analysis.datas, strip=False, upx=False, name="AstraCompute")
 app = BUNDLE(
     collection, name="AstraCompute.app", bundle_identifier="com.unendless.agenttrainer.astra.compute",
-    info_plist={"CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "1", "LSMinimumSystemVersion": "15.0", "LSBackgroundOnly": True},
+    info_plist={"CFBundleShortVersionString": app_info["CFBundleShortVersionString"],
+                "CFBundleVersion": app_info["CFBundleVersion"], "LSMinimumSystemVersion": "15.0", "LSBackgroundOnly": True},
 )

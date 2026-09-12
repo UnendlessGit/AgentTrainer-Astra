@@ -33,6 +33,7 @@ def check_stream(binary: Path, source: str) -> list[dict]:
         raise RuntimeError(f"Control helper failed ({result.returncode}): {result.stderr[-4096:]}")
     responses = [json.loads(line) for line in result.stdout.splitlines()]
     assert responses[0]["kind"] == "hello" and responses[0]["payload"]["role"] == "control"
+    assert responses[0]["payload"]["recoveryVersion"] == 1
     assert [value["sequence"] for value in responses] == list(range(len(responses)))
     assert not any(value["kind"] == "control.receipt" for value in responses), responses
     return responses
@@ -116,11 +117,21 @@ def main() -> None:
     ]))
     assert [reply["kind"] for reply in inactive[1:]] == ["error", "error", "ack"], inactive
     assert inactive[-1]["payload"]["cleanupSettled"] is True
+    run = "00000000-0000-0000-0000-000000000099"
+    unprotected = request("arm", 0, runID=run)
+    unprotected["payload"] = dict(runID=run, packetCapacity=16,
+        scope=dict(surfaces=[dict(id="display:1", globalBounds=dict(x=0,y=0,width=32,height=32),
+            pixelWidth=32,pixelHeight=32,contentBounds=dict(x=0,y=0,width=32,height=32),geometryRevision=0)],
+            wholeDesktop=True,stopOnPhysicalInput=True,geometryRevision=0),
+        capabilities=dict(keyCodes=[0],mouseButtons=[],absolutePointer=False,relativePointer=False,scroll=False))
+    rejected = check_stream(binary, framed([unprotected, request("shutdown", 1)]))
+    assert rejected[1]["kind"] == "error" and rejected[1]["payload"]["code"] == "control.recoveryRequired", rejected
+    assert rejected[-1]["payload"]["cleanupSettled"] is True
     check_signal(binary)
     check_backpressure(binary)
     print(json.dumps({"passed": True, "permissionsRequested": False, "controlArmed": False,
                       "cleanupSettled": True, "processExited": True,
-                      "checks": ["ordered IPC", "inactive observation/heartbeat", "graceful shutdown",
+                      "checks": ["ordered IPC", "inactive observation/heartbeat", "unprotected arm rejected before permissions", "graceful shutdown",
                                  "EOF", "malformed and oversized input", "SIGTERM", "output backpressure"]}, indent=2))
 
 

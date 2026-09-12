@@ -8,17 +8,20 @@ let package = Package(
         .library(name: "AstraCore", targets: ["AstraCore"]),
         .executable(name: "AgentTrainerAstra", targets: ["AgentTrainerAstra"]),
         .executable(name: "AstraFixture", targets: ["AstraFixture"]),
-        .executable(name: "AstraControl", targets: ["AstraControl"])
+        .executable(name: "AstraControl", targets: ["AstraControl"]),
+        .executable(name: "AstraRecoveryFixture", targets: ["AstraRecoveryFixture"])
     ],
     targets: [
         .systemLibrary(name: "CSQLite"),
-        .target(name: "AstraCore", dependencies: ["CSQLite"]),
-        .target(name: "AstraPlatform", dependencies: ["AstraCore"]),
+        .target(name: "CAstraRecovery", publicHeadersPath: "include"),
+        .target(name: "AstraCore", dependencies: ["CSQLite", "CAstraRecovery"]),
+        .target(name: "AstraPlatform", dependencies: ["AstraCore", "CAstraRecovery"]),
         .executableTarget(name: "AgentTrainerAstra", dependencies: ["AstraCore", "AstraPlatform"]),
         .executableTarget(name: "AstraFixture", dependencies: ["AstraCore"]),
         .executableTarget(name: "AstraControl", dependencies: ["AstraCore", "AstraPlatform"]),
+        .executableTarget(name: "AstraRecoveryFixture", dependencies: ["AstraCore", "AstraPlatform"], path: "Tests/RecoveryFixture"),
         .testTarget(name: "AstraCoreTests", dependencies: ["AstraCore"]),
-        .testTarget(name: "AstraPlatformTests", dependencies: ["AstraCore", "AstraPlatform"]),
+        .testTarget(name: "AstraPlatformTests", dependencies: ["AstraCore", "AstraPlatform", "AstraRecoveryFixture"]),
         .testTarget(name: "AstraAppTests", dependencies: ["AgentTrainerAstra", "AstraCore", "AstraPlatform"])
     ]
 )

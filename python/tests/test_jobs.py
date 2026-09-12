@@ -195,6 +195,39 @@ def test_native_recording_dataset_job_then_training_uses_real_sealed_source(work
     assert result["manifest"]["step"] == 2
 
 
+def test_multi_range_dataset_job_keeps_one_session_and_trains_both_episodes(worker, tmp_path, native_recording):
+    model = replace(ModelConfig.test_small(), period_ms=20, lead_ms=0)
+    vocabulary = ActionVocabulary((13,), (), True, False, True)
+    source = Path(native_recording["directory"])
+    prepared_path = tmp_path / str(uuid.uuid4())
+    prepared = worker.job("dataset.prepare", {"destination": str(prepared_path), "recordingRoot": str(source.parent),
+        "selections": [{"recording_id": source.stem, "ranges": [
+            {"start_nanos": 1_002_000_000, "end_nanos": 1_022_000_000},
+            {"start_nanos": 1_075_000_000, "end_nanos": 1_100_000_000}], "context_ids": []}],
+        "model": model.to_dict(), "actions": vocabulary.to_dict(), "pointerMode": "absolute"})
+    assert prepared["manifest"]["schemaVersion"] == 2 and prepared["manifest"]["steps"] == 2
+    assert len(prepared["manifest"]["sources"]) == 1 and len(prepared["manifest"]["sources"][0]["labelPartitions"]) == 2
+    origin = initial(worker, tmp_path, model=model, vocabulary=vocabulary)
+    result = worker.job("train.behavioral", {"checkpointPath": str(origin), "destination": str(tmp_path / str(uuid.uuid4())),
+        "dataset": {"kind": "recordings", "path": str(prepared_path), "recordingRoot": str(source.parent)},
+        "training": {"epochs": 1, "lanes": 1, "sequence_length": 2}})
+    assert result["manifest"]["metrics"]["decisions"] == 2 and result["manifest"]["step"] == 2
+
+
+@pytest.mark.parametrize("selection", [
+    {"ranges": []}, {"ranges": [{"start_nanos": 20, "end_nanos": 10}]},
+    {"start_nanos": None, "ranges": [{"start_nanos": 10, "end_nanos": 20}]},
+    {"ranges": [{"start_nanos": 10, "end_nanos": 30}, {"start_nanos": 20, "end_nanos": 40}]},
+    {"ranges": [{"start_nanos": 10, "end_nanos": 20}] * 257},
+])
+def test_invalid_multi_range_job_is_rejected_before_worker_admission(worker, tmp_path, selection):
+    result = worker.request("dataset.prepare", {"destination": str(tmp_path / str(uuid.uuid4())), "recordingRoot": str(tmp_path),
+        "selections": [{"recording_id": str(uuid.uuid4()), **selection}], "model": ModelConfig.test_small().to_dict(),
+        "actions": ActionVocabulary((13,), (), True, False, True).to_dict(), "pointerMode": "absolute"}, run_id=str(uuid.uuid4()))
+    assert result["kind"] == "error" and result["payload"]["code"] == "job.invalidConfiguration"
+    assert not list(tmp_path.iterdir())
+
+
 def test_invalid_requests_and_failed_jobs_do_not_terminate_valid_control(worker, tmp_path):
     missing_run = worker.request("checkpoint.inspect", {"path": str(tmp_path)})
     assert missing_run["kind"] == "error" and missing_run["payload"]["code"] == "job.missingRunID"

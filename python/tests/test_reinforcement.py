@@ -380,3 +380,88 @@ def test_cancelled_update_preserves_retry_storage_then_discard_releases_it(tmp_p
     worker.discard_rollout(collected)
     assert not list(tmp_path.iterdir())
     worker.stop()
+
+
+def test_saved_burnin_anchor_is_checked_even_when_actor_logits_and_values_are_untouched():
+    worker = trainer()
+    collected = worker.collect()
+    item = collected.decisions[1]
+    changed = replace(item, state_before=tuple(value + .1 for value in item.state_before))
+    tampered = replace(collected, decisions=(collected.decisions[0], changed, *collected.decisions[2:]))
+    before = parameters(worker.policy)
+    with pytest.raises(ValueError, match='recurrent anchor'):
+        worker.update(tampered)
+    assert_parameters_equal(worker.policy, before)
+    assert worker.optimizer_updates == 0
+    worker.discard_rollout(collected); worker.stop()
+
+
+def test_truncation_bootstrap_value_is_replayed_before_it_can_change_gae_targets():
+    worker = trainer()
+    collected = worker.collect()
+    item = collected.decisions[-1]
+    scalar = replace(item.transition, bootstrap=replace(item.transition.bootstrap, value=item.transition.bootstrap.value + 1))
+    decisions = (*collected.decisions[:-1], replace(item, transition=scalar))
+    tampered = replace(collected, decisions=decisions, rollout=Rollout(tuple(item.transition for item in decisions)))
+    with pytest.raises(ValueError, match='truncation bootstrap'):
+        worker.update(tampered)
+    assert worker.optimizer_updates == 0
+    worker.discard_rollout(collected); worker.stop()
+
+
+def test_mixed_width_ppo_batch_reindexes_only_cells_and_preserves_likelihood_and_gradients():
+    from types import SimpleNamespace
+    from astra.environments.practice_adapter import PracticeAdapter
+    from astra.learning.reinforcement import ObservationRecord
+    from astra.data.batching import LearningSample, pointing_layout, training_batch
+    from astra.data.actions import encode_commands, decode_commands
+    from astra.model.actions import PacketBatch, flatten_visual
+    from astra.learning.backward import policy_gradients
+    from astra.learning.optimizers import finite_gradients
+    from astra.learning.rl import ppo_loss, PPOConfig
+    worker = trainer()
+    records, old_packets, samples, old_logp, expected_commands = [], [], [], [], []
+    for width in (32, 64):
+        environment = PracticeEnvironment(PracticeConfig(pixel_width=width, pixel_height=64,
+            logical_bounds=(0, 0, width, 64)))
+        source = PracticeAdapter(environment)
+        observed = source.reset(seed=0, cancelled=lambda: False)
+        record = ObservationRecord.capture(observed, elapsed_seconds=.1, reset=True)
+        observation = record.prepare(worker.policy.config, ())
+        surfaces = tuple(image.metadata['surface'] for image in record.images)
+        commands = ({'operation': 'pointerAbsolute', 'offsetMs': 0, 'surfaceID': 'practice', 'x': .875, 'y': .3125},)
+        encoding = worker.policy(observation)
+        packet = encode_commands(commands, config=worker.policy.config, vocabulary=environment.action_vocabulary,
+                                 visual=flatten_visual(encoding.visual), surfaces=surfaces)
+        expected_commands.append(decode_commands(packet, config=worker.policy.config, vocabulary=environment.action_vocabulary,
+                                                 visual=flatten_visual(encoding.visual), surfaces=surfaces))
+        old_logp.append(worker.policy.score(encoding, packet).log_probability.item())
+        values = tuple(tuple(int(value) for value in np.asarray(getattr(packet, field)[0])) for field in PacketBatch.__dataclass_fields__)
+        records.append(SimpleNamespace(observation=record, transition=SimpleNamespace(valid=True), packet_fields=values))
+        old_packets.append(packet)
+        samples.append(LearningSample(observation, surfaces, commands, observed.episode_id, 0))
+    batch, packet = worker._batch(records)
+    # The original narrow grid has four columns; the padded grid has eight.
+    assert [int(p.cell[0, 0]) for p in old_packets] == [11, 22]
+    assert packet.cell[:, 0].tolist() == [19, 22]
+    for field in PacketBatch.__dataclass_fields__:
+        if field != 'cell':
+            np.testing.assert_array_equal(np.asarray(getattr(packet, field)),
+                                          np.concatenate([np.asarray(getattr(value, field)) for value in old_packets]))
+    for index, sample in enumerate(samples):
+        decoded = decode_commands(packet, config=worker.policy.config, vocabulary=worker.policy.actions.vocabulary,
+                                  visual=pointing_layout(batch), surfaces=sample.surfaces, batch_index=index)
+        assert decoded == expected_commands[index]
+    _, bc_packet = training_batch([samples], worker.policy.config, worker.policy.actions.vocabulary)
+    assert bc_packet.cell[:, 0].tolist() == [19, 22]  # BC already encodes after padding.
+    actual = worker.policy.score(worker.policy(batch), packet).log_probability
+    np.testing.assert_allclose(np.asarray(actual), old_logp, atol=2e-5, rtol=2e-5)
+    def objective(logp, value, entropy):
+        result = ppo_loss(logp, value, entropy, old_log_probabilities=mx.array(old_logp),
+            advantages=mx.array([-1., 1.]), returns=mx.zeros(2), valid=mx.ones(2, dtype=mx.bool_),
+            config=PPOConfig(entropy_coefficient=0, value_coefficient=0))
+        return result.total, (result.ratio_min, result.ratio_max)
+    gradients = policy_gradients(worker.policy, batch, packet, objective)
+    assert finite_gradients(gradients.gradients)
+    np.testing.assert_allclose([float(value) for value in gradients.auxiliary], [1, 1], atol=2e-5)
+    worker.stop()

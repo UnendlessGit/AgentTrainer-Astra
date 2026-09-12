@@ -2,10 +2,10 @@
 """Run the actual native coordinator against an assembled local compute bundle."""
 import argparse
 import json
-import os
 from pathlib import Path
 import subprocess
 import uuid
+from apple_toolchain import build_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,7 +22,7 @@ def main():
     if output.exists():
         parser.error("Use a new verification output directory to preserve earlier evidence")
     output.mkdir(parents=True)
-    environment = dict(os.environ, ASTRA_VERIFY_BUNDLE=str(bundle), ASTRA_NATIVE_VERIFY_ROOT=str(output))
+    environment = dict(build_environment(), ASTRA_VERIFY_BUNDLE=str(bundle), ASTRA_NATIVE_VERIFY_ROOT=str(output))
     with (output / "swift-test.log").open("wb") as log:
         subprocess.run(["swift", "test", "--filter", "BundledLearningTests"], cwd=ROOT, env=environment,
                        stdout=log, stderr=subprocess.STDOUT, check=True, timeout=300)

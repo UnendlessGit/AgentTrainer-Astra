@@ -2,6 +2,8 @@
 
 The new `AstraControl` Swift executable owns desktop input independently of the application UI. `InputExecutor` schedules validated timed packets against the host monotonic clock, with a 500 ms renewable ownership lease, a separate watchdog, a bounded queue (32 packets / 8,192 scheduled entries), and a per-user exclusive desktop lock shared across Astra libraries. Lock descriptors are close-on-exec and final symbolic links are rejected.
 
+Paired process recovery now protects the local ownership ledger against executor or guardian death independently. The executor remains the only active controller; its cleanup-only peer uses a shared atomic ledger and kernel death watch. See [guardian verification](control-guardian.md) and [the ownership design](../architecture/0005-paired-control-recovery.md). These permission-free fault checks do not replace installed physical-input qualification.
+
 `CGEventControlBackend` constructs actual Core Graphics key, modifier, button, pointer and pixel-scroll events. Its private event source and synthetic-event tag distinguish owned input from physical state. Apple documents separate private and HID state tables in [CGEventSourceStateID](https://developer.apple.com/documentation/coregraphics/cgeventsourcestateid). No real event posting has been exercised in this verification.
 
 ## Scheduling and cleanup
@@ -18,6 +20,8 @@ The new `AstraControl` Swift executable owns desktop input independently of the 
 ## Permissions and scope cost
 
 Arming requires existing Accessibility, Input Monitoring and event-posting permissions. No permission prompt or grant is issued by the helper. Caps Lock, Fn, media and power-key capabilities are explicitly rejected pending qualification.
+
+Keyboard observation additionally requires recent proof that Secure Event Input is inactive. Observed interruption stops active admission, invalidates physical-state trust, and retains pending cleanup ownership until fresh proof returns. The probe is serialized on the main thread while deadline/watchdog reads remain cached. See [Secure Input verification](secure-input.md) for recording boundaries, fixture evidence, and the limits of polling.
 
 Read-only profiling on the available M3 Max identified a serious hot-path mistake: repeated permission preflight calls cost approximately 9–10 ms each. The full window-list query itself measured approximately 0.35–0.39 ms. Moving permission checks to an independent 100 ms poll, with a conservative 250 ms freshness limit measured from the start of the check, reduced the measured whole-desktop scope check from 18–21 ms to approximately 0.025 ms. This probe created no executor lease, event tap, or posted input.
 

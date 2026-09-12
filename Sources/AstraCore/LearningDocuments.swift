@@ -74,7 +74,7 @@ public struct CheckpointDocument: Codable, Hashable, Identifiable, Sendable {
     /// Display names and serialized date precision do not change policy or
     /// provenance identity. Runtime admissions compare the immutable fields.
     public func matchesIdentity(of other: Self) -> Bool {
-        id == other.id && agentID == other.agentID && runID == other.runID && kind == other.kind
+        schemaVersion == other.schemaVersion && id == other.id && agentID == other.agentID && runID == other.runID && kind == other.kind
             && trainingStep == other.trainingStep && policySignature == other.policySignature && parameterCount == other.parameterCount
     }
 }

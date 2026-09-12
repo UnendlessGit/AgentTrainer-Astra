@@ -139,6 +139,54 @@ private final class Fixture {
 }
 
 @Suite(.serialized) @MainActor struct LearningCoordinatorTests {
+    @Test func recordedRangeSnapshotAndExactResumeIgnoreLaterAgentSelectionEdits() async throws {
+        let fixture = try Fixture("waitForCancel")
+        let library = try LibraryStore(root: fixture.root)
+        let agent = AgentDocument(name: "Selection snapshot")
+        try await library.save(agent)
+        var recording = RecordingManifest(name: "Protocol fixture", environment: .init(name: "Virtual source", kind: .desktop))
+        recording.frameCount = 1; recording.storedBytes = 4; recording.firstObservedNanos = 1_000_000_000
+        recording.stoppedNanos = 5_000_000_000; recording.status = .complete
+        try await library.saveRecording(recording, linkTo: agent.id)
+        let selection = RecordingTrainingSelection(ranges: [.init(startNanos: 1_000_000_000, endNanos: 2_000_000_000), .init(startNanos: 3_000_000_000, endNanos: 4_000_000_000)])
+        try await library.saveRecordingSelection(selection, recordingID: recording.id, agentID: agent.id)
+        let coordinator = LearningCoordinator(store: library, root: fixture.root, bundle: fixture.bundle, changed: {})
+        var options = BehaviorOptions(); options.recordingIDs = [recording.id]
+        try coordinator.start(agent: agent, options: options, recordings: [recording], selections: [recording.id: selection])
+        try await library.saveRecordingSelection(.whole, recordingID: recording.id, agentID: agent.id)
+        try await waitUntil { (coordinator.activeRun?.updates ?? 0) > 0 || !coordinator.isBusy }
+        await coordinator.stopAndWait()
+        #expect(coordinator.failure == nil)
+        let run = try #require(coordinator.activeRun), checkpointID = try #require(run.checkpointID)
+        let expected: JSONValue = .array([try selection.payload(recordingID: recording.id)])
+        let configuration = try await LearningFiles.read(fixture.root.appendingPathComponent("Jobs/\(run.id.uuidString.lowercased())/configuration.json"))
+        #expect(configuration.fields?["sourceSelections"] == expected)
+        let requests = try String(contentsOf: fixture.log, encoding: .utf8).split(separator: "\n").map { try JSONDecoder().decode(WireMessage.self, from: Data($0.utf8)) }
+        #expect(requests.first { $0.kind == "dataset.prepare" }?.payload.fields?["selections"] == expected)
+        try await library.unlinkRecording(recording.id, from: agent.id)
+        options.resume = true; options.initialCheckpointID = checkpointID; options.recordingIDs = []
+        try coordinator.start(agent: agent, options: options, recordings: [], selections: [:])
+        try await waitUntil { !coordinator.isBusy }
+        #expect(coordinator.failure == nil)
+        let resumed = try #require(coordinator.activeRun)
+        let resumedConfiguration = try await LearningFiles.read(fixture.root.appendingPathComponent("Jobs/\(resumed.id.uuidString.lowercased())/configuration.json"))
+        #expect(resumedConfiguration.fields?["sourceSelections"] == expected)
+        #expect(resumedConfiguration.fields?["dataset"] == configuration.fields?["dataset"])
+        #expect(try fixture.operations().filter { $0 == "dataset.prepare" }.count == 1)
+    }
+
+    @Test func unreadableSavedRangeCannotSilentlyTrainTheWholeRecording() async throws {
+        let fixture = try Fixture("earlyTerminal"), agent = AgentDocument(name: "Corrupt range")
+        let store = try LibraryStore(root: fixture.root)
+        try await store.save(agent)
+        var recording = RecordingManifest(name: "Protocol fixture", environment: .init(name: "Virtual", kind: .desktop))
+        recording.frameCount = 1; recording.storedBytes = 4; recording.firstObservedNanos = 1; recording.stoppedNanos = 100; recording.status = .complete
+        var options = BehaviorOptions(); options.recordingIDs = [recording.id]
+        let coordinator = LearningCoordinator(store: store, root: fixture.root, bundle: fixture.bundle, changed: {})
+        #expect(throws: AstraError.self) { try coordinator.start(agent: agent, options: options, recordings: [recording], selections: [:]) }
+        #expect(!coordinator.isBusy && coordinator.activeRun == nil && !FileManager.default.fileExists(atPath: fixture.log.path))
+    }
+
     @Test func reinforcementPipelinePublishesRealOperationAndMetricsWithoutOracleFlags() async throws {
         let fixture = try Fixture("earlyTerminal")
         let store = try LibraryStore(root: fixture.root)
@@ -519,5 +567,26 @@ private final class Fixture {
         try database.execute("UPDATE events SET observed=observed+1 WHERE sequence=0")
         try database.checkpoint(); try database.close()
         await #expect(throws: AstraError.self) { try await LearningFiles.recordedCapabilities([sealed], root: directory) }
+    }
+
+    @Test func capabilityDiscoveryExcludesGapKeysAndKeepsPointerAnchorsForSelectedClicks() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AstraSelectedControls-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manifest = RecordingManifest(name: "Selected controls", environment: .init(name: "Fixture", kind: .practice))
+        let package = directory.appendingPathComponent("Recordings/\(manifest.id.uuidString).astrarecord")
+        let writer = try RecordingWriter(directory: package, manifest: manifest)
+        let surface = SurfaceDescriptor(id: "fixture", globalBounds: .init(x: 0, y: 0, width: 2, height: 2), pixelWidth: 2, pixelHeight: 2)
+        try writer.append(FrameArchive.prepare(pixels: Data(repeating: 0, count: 16), metadata: .init(eventNanos: 1, observedNanos: 1, surface: surface, byteCount: 16)))
+        try writer.append(events: [
+            .init(sequence: 0, eventNanos: 5, observedNanos: 5, origin: .reconciliation, kind: .flags, keyCode: 57, modifiers: 0),
+            .init(sequence: 1, eventNanos: 10, observedNanos: 10, origin: .physical, kind: .keyDown, keyCode: 57),
+            .init(sequence: 2, eventNanos: 22, observedNanos: 22, origin: .physical, kind: .keyDown, keyCode: 13),
+            .init(sequence: 3, eventNanos: 25, observedNanos: 25, origin: .physical, kind: .buttonDown, button: 0, x: 1, y: 1),
+            .init(sequence: 4, eventNanos: 30, observedNanos: 30, origin: .physical, kind: .keyDown, keyCode: 59),
+            .init(sequence: 5, eventNanos: 21, observedNanos: 50, origin: .physical, kind: .keyDown, keyCode: 1)])
+        let sealed = try writer.finish(at: 100, status: .complete)
+        let selection = RecordingTrainingSelection(ranges: [.init(startNanos: 20, endNanos: 30)])
+        let result = try await LearningFiles.recordedCapabilities([sealed], root: directory, selections: [sealed.id: selection])
+        #expect(result.keyCodes == [1, 13] && result.mouseButtons == [0] && result.absolutePointer)
     }
 }

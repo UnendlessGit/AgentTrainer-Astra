@@ -90,6 +90,11 @@ class OwnedFrame:
         return dict(self._acknowledgement)
 
 
+@dataclass(frozen=True)
+class OwnedCPUFrame(OwnedFrame):
+    pixels: np.ndarray
+
+
 class FrameRingReader:
     def __init__(self, path: Path, *, run_id: str, ring_id: str):
         self._lock = threading.RLock()
@@ -142,6 +147,17 @@ class FrameRingReader:
         mx.array owns the single ingestion copy; mx.eval completes it before
         acknowledgements become available to the caller.
         """
+        return self._copy_frame(reference, cpu=False)
+
+    def copy_cpu_frame(self, reference: dict) -> OwnedCPUFrame:
+        """Detach immutable CPU BGRA for lossless rollout spooling.
+
+        This avoids a GPU upload/readback when the next consumer needs raw
+        source bytes. It shares every lease/header check with MLX ingestion.
+        """
+        return self._copy_frame(reference, cpu=True)
+
+    def _copy_frame(self, reference: dict, *, cpu: bool):
         with self._lock:
             self._current_header()
             fields = {"version", "runID", "ringID", "slot", "leaseID", "sequence", "offset", "size", "metadata"}
@@ -170,8 +186,11 @@ class FrameRingReader:
             view = np.ndarray((surface["pixelHeight"], surface["pixelWidth"], 4), dtype=np.uint8, buffer=self._mapping, offset=offset)
             view.setflags(write=False)
             try:
-                owned = mx.array(view)
-                mx.eval(owned)
+                if cpu:
+                    owned = np.frombuffer(view.tobytes(), dtype=np.uint8).reshape(view.shape)
+                else:
+                    owned = mx.array(view)
+                    mx.eval(owned)
             finally:
                 del view
             self._current_header()
@@ -183,7 +202,8 @@ class FrameRingReader:
             # changed by another callback while MLX completed the copy.
             acknowledgement = {"version": VERSION, "runID": str(self.run_id), "ringID": str(self.ring_id),
                                "slot": slot, "leaseID": str(lease_id), "sequence": sequence}
-            return OwnedFrame(owned, metadata, acknowledgement)
+            result_type = OwnedCPUFrame if cpu else OwnedFrame
+            return result_type(owned, metadata, acknowledgement)
 
     def close(self):
         with self._lock:

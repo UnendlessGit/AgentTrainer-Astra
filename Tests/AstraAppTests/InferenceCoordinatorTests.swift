@@ -19,11 +19,15 @@ private actor InferenceHarness {
     var armWaiting = false
     var stepWaiting = false
     var actorExitWaiting = false
+    var guardianRecoveryWaiting = false
+    var recoveryLedger: ControlRecoveryLedger?
     var ringPath: String?
     var references: [SharedFrameReference] = []
     var sequence: UInt64 = 0
     var stateID = UUID()
     var episodeID = UUID()
+    let rngStreamID = UUID()
+    var collecting = false
     var events: ComputeProcess.EventHandler?
     var failure: ComputeProcess.FailureHandler?
     var frameCallback: (@Sendable (InferenceImage) -> Void)?
@@ -60,8 +64,9 @@ private actor InferenceHarness {
         requests.append(role + ".start")
         if role == "control" { self.events = events }
         else { self.failure = failure }
-        return WireMessage(kind: "hello", sequence: 0, payload: .object([
-            "role": .string(mode == "wrongRuntime" && role == "actor" ? "compute" : role), "protocolVersion": .integer(1)]))
+        var payload: [String: JSONValue] = ["role": .string(mode == "wrongRuntime" && role == "actor" ? "compute" : role), "protocolVersion": .integer(1)]
+        if role == "control", mode == "protectedGuardianRecovery" { payload["recoveryVersion"] = .integer(1) }
+        return WireMessage(kind: "hello", sequence: 0, payload: .object(payload))
     }
     func ack(_ payload: JSONValue = .object([:]), run: UUID) -> WireMessage {
         WireMessage(kind: "ack", sequence: 1, requestID: UUID(), runID: run, payload: payload)
@@ -71,14 +76,18 @@ private actor InferenceHarness {
         switch kind {
         case "inference.prepare":
             sequence = 0
+            collecting = payload.fields?["collection"] == .bool(true)
             ringPath = payload.fields?["ring"]?.fields?["path"]?.text
             return ack(.object(["runID": .string(run.uuidString), "checkpointID": .string(checkpoint.id.uuidString),
                 "policySignature": .string(mode == "wrongPolicy" ? String(repeating: "b", count: 64) : checkpoint.policySignature),
                 "ringID": payload.fields?["ring"]?.fields?["ringID"] ?? .null,
                 "model": .object(["schema_version": .integer(2), "period_ms": .integer(100), "lead_ms": .integer(200),
                                    "packet_capacity": .integer(16), "context_sizes": .array([])]),
-                "actions": try .encode(ActionCapabilities(keyCodes: [0]))]), run: run)
+                "actions": try .encode(ActionCapabilities(keyCodes: [0])),
+                "collection": .bool(collecting && mode != "oldCollection"), "collectionVersion": .integer(1),
+                "rngStreamID": .string(rngStreamID.uuidString), "deterministic": .bool(!collecting)]), run: run)
         case "inference.reset":
+            if collecting, payload.fields?["seed"] != nil { throw AstraError("fixture.reseed", "Collecting resets cannot reseed") }
             episodeID = try payload.required("episodeID").decode(UUID.self); stateID = UUID()
             return ack(.object(["runID": .string(run.uuidString), "episodeID": .string(episodeID.uuidString),
                                "stateID": .string(stateID.uuidString), "needsReset": .bool(false)]), run: run)
@@ -114,13 +123,36 @@ private actor InferenceHarness {
                                                       leaseID: UUID(), sequence: reference.sequence)
                 fields["releasedFrames"] = try .encode([wrong])
             }
+            if collecting && !warming && mode != "missingCollection" {
+                fields["collectionRecord"] = .object([
+                    "schemaVersion": .integer(1), "checkpointID": .string(checkpoint.id.uuidString),
+                    "policySignature": .string(checkpoint.policySignature), "episodeID": .string(episodeID.uuidString),
+                    "observationID": payload.fields?["observationID"] ?? .null,
+                    "previousStateID": payload.fields?["previousStateID"] ?? .null, "nextStateID": fields["stateID"] ?? .null,
+                    "cutoffNanos": .unsigned(cutoff), "frameIDs": try .encode([reference.metadata.id]),
+                    "contextIDs": .array([]), "episodeStep": .unsigned(sequence), "recurrentReset": .bool(sequence == 0),
+                    "logProbability": fields["logProbability"] ?? .null, "value": fields["value"] ?? .null,
+                    "sampler": .object(["kind": .string("categorical"), "temperature": .integer(1), "mixture": .string("none"),
+                                         "rngStreamID": .string(rngStreamID.uuidString), "drawIndex": .unsigned(sequence)])])
+            }
             if warming { fields["warmup"] = .bool(true) }
             else { sequence += 1; stateID = nextState }
             return ack(.object(fields), run: run)
         case "arm":
+            if mode == "protectedGuardianRecovery" {
+                let request = try payload.decode(ArmRequest.self)
+                let ledger = try ControlRecoveryLedger(open: #require(request.recovery))
+                guard ledger.registerExecutor(pid: getpid()), ledger.registerGuardian(pid: getpid(), now: MonotonicClock.now), ledger.arm() else {
+                    throw AstraError("fixture.recovery", "The virtual recovery interface did not arm.")
+                }
+                recoveryLedger = ledger
+            }
             if mode == "blockedArm" {
                 armWaiting = true
                 return try await withCheckedThrowingContinuation { suspendedArm = $0 }
+            }
+            if let recoveryLedger {
+                return ack(.object(["armed": .bool(true), "recoveryLedgerID": .string(recoveryLedger.descriptor.ledgerID.uuidString), "guardianPID": .integer(Int64(getpid()))]), run: run)
             }
             return ack(.object(["armed": .bool(true)]), run: run)
         case "observation":
@@ -131,6 +163,10 @@ private actor InferenceHarness {
                        run: mode == "wrongControlRun" ? UUID() : run)
         case "execute":
             let packet = try payload.decode(ActionPacket.self)
+            if let recoveryLedger {
+                guard recoveryLedger.beginPost(operation: .keyDown, keyCode: 0, button: nil) else { throw AstraError("fixture.recovery", "The virtual reservation was rejected.") }
+                recoveryLedger.endPost(operation: .keyDown, keyCode: 0, button: nil, success: true)
+            }
             var controls = ControlState(); controls.valid = true
             let results = packet.commands.enumerated().map { index, command in
                 CommandResult(commandIndex: index, scheduledNanos: packet.executeAtNanos + UInt64(command.offsetMs) * 1_000_000,
@@ -152,6 +188,9 @@ private actor InferenceHarness {
         if let suspendedArm, let currentRun { self.suspendedArm = nil; suspendedArm.resume(returning: ack(.object(["armed": .bool(true)]), run: currentRun)) }
     }
     func resumeExit() { suspendedExit?.resume(); suspendedExit = nil }
+    func completeGuardianRecovery() {
+        recoveryLedger?.releaseKey(0); recoveryLedger?.settleGuardian(now: MonotonicClock.now)
+    }
     func shutdown(_ role: String) async -> Int32? {
         requests.append(role + ".shutdown")
         if role == "actor" {
@@ -161,8 +200,50 @@ private actor InferenceHarness {
                 await withCheckedContinuation { suspendedExit = $0 }
             }
             actorExited = true
-        } else { controlExited = true }
+        } else {
+            if collecting, let currentRun {
+                events?(WireMessage(kind: "control.stopped", sequence: 3, runID: currentRun,
+                                    payload: .object(["cause": .string("shutdown"), "reason": .string("Fixture finalized control") ])))
+            }
+            controlExited = true
+            if mode == "protectedGuardianRecovery", let recoveryLedger {
+                recoveryLedger.stop()
+                _ = recoveryLedger.claimAfterExecutorExit() // Virtual process boundary only; real death watches are tested in GuardianTests.
+                guardianRecoveryWaiting = true
+                return 15
+            }
+        }
         return role == "control" && mode == "controlCrashOnShutdown" ? 15 : 0
+    }
+}
+
+private final class CollectionSpy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [InferenceCollectionEvent] = []
+    private var closed = false
+    private var seenLateEvent = false
+    var rejectObservations = false
+    var failFinish = false
+    var rejectShutdownEvidence = false
+    var events: [InferenceCollectionEvent] { lock.withLock { values } }
+    var completed: Bool { lock.withLock { closed } }
+    var lateEvent: Bool { lock.withLock { seenLateEvent } }
+    func sink() -> InferenceCollectionSink {
+        .init(offer: { [self] event in
+            try lock.withLock {
+                if closed { seenLateEvent = true }
+                if rejectObservations, case .observation = event { throw AstraError("collector.full", "Fixture collector capacity is full") }
+                if rejectShutdownEvidence, case .control(let message) = event, message.kind == "control.stopped" {
+                    throw AstraError("collector.closed", "Fixture collector could not retain final control evidence")
+                }
+                values.append(event)
+            }
+        }, finish: { [self] _ in
+            try lock.withLock {
+                closed = true
+                if failFinish { throw AstraError("collector.finish", "Fixture collector could not persist its audit") }
+            }
+        })
     }
 }
 
@@ -182,7 +263,9 @@ private actor InferenceHarness {
         let store = try LibraryStore(root: root)
         try await store.save(agent); try await store.saveCheckpoint(checkpoint)
         harness = InferenceHarness(mode: mode, checkpoint: checkpoint)
-        coordinator = InferenceCoordinator(store: store, root: root, dependencies: harness.dependencies())
+        var dependencies = harness.dependencies()
+        dependencies.protectsPhysicalInputs = mode == "protectedGuardianRecovery" || mode == "oldControlProtection"
+        coordinator = InferenceCoordinator(store: store, root: root, dependencies: dependencies)
     }
     deinit { try? FileManager.default.removeItem(at: root) }
     func start() throws { try coordinator.start(agent: agent, checkpoint: checkpoint, source: source, options: InferenceOptions()) }
@@ -196,6 +279,67 @@ private actor InferenceHarness {
 }
 
 @MainActor struct InferenceCoordinatorTests {
+    @Test func collectionOwnsExactPixelsAndReceivesShutdownEvidenceBeforeFinalization() async throws {
+        let test = try await InferenceTestCase(mode: "success"), spy = CollectionSpy()
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: spy.sink())
+        try await test.wait { test.coordinator.executedPackets >= 2 }
+        await test.coordinator.stopAndWait()
+        #expect(test.coordinator.failure == nil && test.coordinator.cleanupConfirmed && spy.completed && !spy.lateEvent)
+        let events = spy.events
+        #expect(events.filter { if case .prepared = $0 { true } else { false } }.count == 1)
+        let observations = events.compactMap { if case .observation(let value) = $0 { value } else { nil } }
+        let decisions = events.compactMap { if case .decision(let value) = $0 { value } else { nil } }
+        #expect(decisions.count >= 2 && observations.count >= decisions.count)
+        for value in observations {
+            #expect(value.pixels == Data(repeating: 255, count: 32 * 32 * 4))
+            #expect(value.actorInput.fields?["frames"] == nil)
+            #expect(value.actorInput.fields?["observationID"]?.text.flatMap(UUID.init(uuidString:)) != nil)
+        }
+        #expect(events.contains { event in
+            if case .control(let message) = event { return message.kind == "control.stopped" && message.payload.fields?["cause"] == .string("shutdown") }
+            return false
+        })
+        #expect(await test.harness.allClosed)
+        #expect(!FileManager.default.fileExists(atPath: try #require(await test.harness.ringPath)))
+    }
+
+    @Test(arguments: ["full", "missingCollection", "oldCollection"])
+    func collectionAdmissionFailuresStopBeforePosting(_ failure: String) async throws {
+        let test = try await InferenceTestCase(mode: failure), spy = CollectionSpy()
+        spy.rejectObservations = failure == "full"
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: spy.sink())
+        try await test.wait { !test.coordinator.isBusy }
+        #expect(test.coordinator.failure != nil && test.coordinator.cleanupConfirmed && spy.completed)
+        #expect(!(await test.harness.requests).contains("execute"))
+    }
+
+    @Test func collectionFinalizationFailureIsSavedWithoutLosingControlCleanupProof() async throws {
+        let test = try await InferenceTestCase(mode: "success"), spy = CollectionSpy()
+        spy.failFinish = true
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: spy.sink())
+        try await test.wait { test.coordinator.executedPackets >= 1 }
+        await test.coordinator.stopAndWait()
+        #expect(test.coordinator.cleanupConfirmed && test.coordinator.failure?.contains("Collection could not be finalized") == true)
+        let result = try await LearningFiles.read(#require(test.coordinator.resultsURL))
+        #expect(result.fields?["status"] == .string("failed") && result.fields?["cleanupConfirmed"] == .bool(true))
+    }
+
+    @Test func shutdownOfferFailureCannotRaceASuccessfulCollectionSummary() async throws {
+        let test = try await InferenceTestCase(mode: "success"), spy = CollectionSpy()
+        spy.rejectShutdownEvidence = true
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: spy.sink())
+        try await test.wait { test.coordinator.executedPackets >= 1 }
+        await test.coordinator.stopAndWait()
+        let result = try await LearningFiles.read(#require(test.coordinator.resultsURL))
+        #expect(result.fields?["status"] == .string("failed"))
+        #expect(result.fields?["issue"]?.text?.contains("lost control evidence") == true)
+        #expect(test.coordinator.cleanupConfirmed && spy.completed)
+    }
+
     @Test func successfulRunWarmsWithoutControlAndReleasesResources() async throws {
         let test = try await InferenceTestCase(mode: "success")
         try test.start(); try await test.wait { test.coordinator.executedPackets >= 2 }
@@ -217,7 +361,7 @@ private actor InferenceHarness {
         #expect(test.coordinator.failure == nil && test.coordinator.runID != previousRun)
     }
 
-    @Test(arguments: ["wrongRuntime", "wrongPolicy", "slowWarmup"])
+    @Test(arguments: ["wrongRuntime", "wrongPolicy", "slowWarmup", "oldControlProtection"])
     func qualificationFailuresNeverArm(mode: String) async throws {
         let test = try await InferenceTestCase(mode: mode)
         try test.start(); try await test.wait { !test.coordinator.isBusy }
@@ -308,5 +452,19 @@ private actor InferenceHarness {
         let secondQuit = await workspace.prepareForTermination()
         #expect(secondQuit && workspace.isClosing)
         #expect(!test.coordinator.cleanupConfirmed)
+    }
+
+    @Test func hostWaitsForMappedGuardianProofAfterExecutorExit() async throws {
+        let test = try await InferenceTestCase(mode: "protectedGuardianRecovery")
+        try test.start(); try await test.wait { test.coordinator.executedPackets >= 1 }
+        let stop = Task { await test.coordinator.stopAndWait() }
+        try await test.wait { await test.harness.guardianRecoveryWaiting }
+        #expect(test.coordinator.isBusy && !test.coordinator.cleanupConfirmed)
+        #expect(test.coordinator.resultsURL == nil)
+        await test.harness.completeGuardianRecovery()
+        await stop.value
+        #expect(!test.coordinator.isBusy && test.coordinator.cleanupConfirmed && test.coordinator.cleanupRecoveredByGuardian)
+        let result = try await LearningFiles.read(try #require(test.coordinator.resultsURL))
+        #expect(result.fields?["cleanupRecoveredByGuardian"] == .bool(true))
     }
 }

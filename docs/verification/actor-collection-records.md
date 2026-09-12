@@ -1,0 +1,19 @@
+# Exact actor records and native collection hooks
+
+The collecting actor uses the same policy, Metal preprocessing, compiled execution, packet sampler and execution validation as ordinary inference. `inference.prepare` can opt into `collection: true` only with `deterministic: false`. Its acknowledgement advertises collection version 1 and a fresh RNG-stream identity; an older helper cannot silently act as a collecting actor.
+
+Each real response adds `collectionRecord`: immutable checkpoint/policy/model identities, episode/observation/state bindings, actual cutoff and elapsed time, frame/context IDs, FP32 recurrent state before this observation, exact integer packet fields, joint log probability/value, and categorical sampler/RNG evidence. The two-key split is the one actually used by `_policy_arrays`; no action is sampled or reconstructed to manufacture a training record. Stream counters advance across episode resets; reseeding a collecting reset is rejected. The reset-generation counter counts accepted actor reset calls, including a scratch reset before warmup; it does not prove a physical world reset.
+
+Warmup offers no collection record and restores state, RNG and counters while still consuming its real image lease. Collection mode can warm before the first decision of a newly confirmed actor episode, including after checkpoint activation. The native coordinator remains responsible for stopping physical control before that warmup. Production persistent state remains GRU-specific; an experimental transformer would require a separately qualified state transport/storage schema before promotion.
+
+`InferenceCollectionSink` introduces bounded nonblocking native offers for preparation, exact owned observation pixels, actor responses and control events. Collector observations exclude the actor's ephemeral single-consumer frame references; a concrete collector publishes its own leases or persists those bytes. Control evidence is offered synchronously from the process I/O callback, including during stop, before UI dispatch. Process shutdown joins those offers before collector finalization. A synchronous fault latch preserves an offer failure even when the UI has already requested stop. Hardware cleanup proof remains separate from successful experience publication.
+
+The native loop retains actual helper-read cutoffs rather than retiming or rounding them to the nominal cadence. The assembler uses their nanosecond differences for reward windows/returns while the action packet retains its trained fixed duration and lead. The first actual actor observation establishes the learning interval baseline; arming/warmup gaps are not fabricated decisions. Detector work and learner updates must not block these offers.
+
+## Evidence
+
+The Python actor suite passed 26 tests with warnings as errors. Three new real native-ring tests cover exact packet/command/likelihood replay, numeric recurrent anchors, jittered elapsed time, RNG split continuity, greedy/reseed rejection and warmup suppression. Existing preprocessing, checkpoint, stale identity, state, ownership, worker and compiled-policy checks remain active.
+
+Native fixtures exercise collecting preparation, copied pixels after actor-ring retirement, no warmup observations in the collector, complete shutdown-event delivery before finalization, queue/version/missing-record rejection before action submission, and publication failure without losing genuine control-cleanup proof. These use the actual coordinator and mapped ring with injected processes, not real OS input. Current logs are `.local/actor-collection-full-tests.log` and `.local/native-collection-final-tests.log`.
+
+These are integration boundaries for the asynchronous assembler. A concrete collector process client, native reward producer, episode/reset orchestration, actor/learner resource scheduling and complete desktop RL UI remain required before this becomes an installed-app learning workflow.

@@ -101,6 +101,7 @@ private actor ControlServer {
     private let output: ControlOutput
     private let routes: ReceiptRoutes
     private let monitor = PhysicalInputMonitor()
+    private var protection: ControlGuardianPair?
     private var sequence: UInt64 = 0
     private var closing = false
 
@@ -135,10 +136,23 @@ private actor ControlServer {
             case "arm":
                 let request = try message.payload.decode(ArmRequest.self)
                 guard message.runID == request.runID else { throw AstraError("control.session", "Arm request identity does not match its envelope.") }
-                guard executor.currentRunID == nil else { throw AstraError("control.busy", "Disarm the current control run before arming another.") }
+                guard executor.currentRunID == nil, protection == nil else { throw AstraError("control.busy", "Disarm the current control run before arming another.") }
+                guard let recovery = request.recovery, recovery.runID == request.runID else {
+                    throw AstraError("control.recoveryRequired", "A protected recovery ledger is required before desktop control can arm.")
+                }
+                _ = try request.scope.validated(); _ = try request.capabilities.validated()
+                let journal = try ControlRecoveryLedger(open: recovery)
+                guard journal.matches(request.capabilities) else { throw AstraError("control.recoveryCapabilities", "Recovery controls do not match this run's capabilities.") }
+                let lease = try DesktopControlLock()
+                let executor = executor
+                let pair = try ControlGuardianPair(ledger: journal, desktopLease: lease,
+                    executable: URL(fileURLWithPath: CommandLine.arguments[0]), onExit: {
+                        executor.requestDisarm(runID: request.runID, reason: "The independent cleanup guardian exited.")
+                    })
+                protection = pair
                 await monitor.stop()
                 do {
-                    let executor = executor
+                    try await pair.waitUntilReady()
                     let monitoring = MonitorFailure()
                     try await monitor.start(onEvents: { events in
                         if request.scope.stopOnPhysicalInput, events.contains(where: { $0.origin == .physical }) {
@@ -152,10 +166,20 @@ private actor ControlServer {
                        })
                     try monitoring.check()
                     guard !closing else { throw AstraError("control.closing", "The control helper is shutting down.") }
-                    try executor.arm(request)
+                    try executor.arm(request, recovery: journal, desktopLease: lease)
                     try monitoring.check()
-                } catch { executor.requestDisarm(reason: "Control arming failed."); await monitor.stop(); throw error }
-                payload = .object(["armed": .bool(true), "leaseNanos": .unsigned(ControlLease.durationNanos)])
+                } catch {
+                    executor.requestDisarm(reason: "Control arming failed."); await monitor.stop()
+                    journal.stop()
+                    if executor.cleanupSettled { journal.settleLocally(now: MonotonicClock.now) }
+                    if (try? journal.snapshot().cleanupConfirmed) == true {
+                        await pair.finishAfterLocalSettlement(); protection = nil
+                    }
+                    throw error
+                }
+                payload = .object(["armed": .bool(true), "leaseNanos": .unsigned(ControlLease.durationNanos),
+                                   "recoveryLedgerID": .string(journal.descriptor.ledgerID.uuidString),
+                                   "guardianPID": .integer(Int64(pair.guardianPID))])
             case "heartbeat":
                 guard let runID = message.runID else { throw AstraError("control.session", "Heartbeat requires a run identity.") }
                 try executor.heartbeat(runID: runID); payload = .object(["alive": .bool(true)])
@@ -200,6 +224,10 @@ private actor ControlServer {
             }
             try await Task.sleep(for: .milliseconds(5))
         }
+        if let protection {
+            protection.ledger.stop(); protection.ledger.settleLocally(now: MonotonicClock.now)
+            await protection.finishAfterLocalSettlement(); self.protection = nil
+        }
     }
     func disconnect() async {
         closing = true; executor.requestDisarm(reason: "The control owner disconnected.", cause: .disconnected); await monitor.stop()
@@ -207,16 +235,23 @@ private actor ControlServer {
         // still revive a hold. The independent watchdog continues retrying failed
         // releases and retains the desktop lock until settlement, even after EOF.
         while !executor.cleanupSettled { try? await Task.sleep(for: .milliseconds(25)) }
+        if let protection {
+            protection.ledger.stop(); protection.ledger.settleLocally(now: MonotonicClock.now)
+            await protection.finishAfterLocalSettlement(); self.protection = nil
+        }
     }
 }
 
 @main struct AstraControlMain {
     static func main() async {
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--guardian", let owner = Int32(CommandLine.arguments[2]) {
+            exit(ControlGuardian.runNative(ownerPID: owner))
+        }
         signal(SIGPIPE, SIG_IGN)
         let output = ControlOutput()
         do {
             let server = try ControlServer(output: output)
-            output.send("hello", .object(["role": .string("control"), "protocolVersion": .integer(1),
+            output.send("hello", .object(["role": .string("control"), "protocolVersion": .integer(1), "recoveryVersion": .integer(1),
                 "capabilities": .array(["ping", "permissions", "arm", "heartbeat", "execute", "disarm", "observation", "state", "shutdown"].map(JSONValue.string))]))
             let sleep = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { @Sendable _ in
                 server.stopImmediately(reason: "The Mac is going to sleep.", cause: .sleep)
