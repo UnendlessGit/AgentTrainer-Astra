@@ -47,8 +47,8 @@ def main() -> None:
     weights = ROOT / "vendor/weights" / weight_spec["artifact"]
     if not weights.exists():
         run(sys.executable, str(ROOT / "scripts/prepare_weights.py"))
-    with weights.open("rb") as source:
-        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    with weights.open("rb") as weight_file:
+        digest = hashlib.file_digest(weight_file, "sha256").hexdigest()
     if digest != weight_spec["artifactSHA256"]:
         raise RuntimeError("The pretrained backbone fails its pinned artifact digest; rebuild and qualify the conversion.")
     compute_dist = ROOT / "build" / "compute"
