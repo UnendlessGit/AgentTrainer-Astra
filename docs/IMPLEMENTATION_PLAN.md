@@ -32,7 +32,7 @@ The user's full requested scope remains active. A passing component check or a p
 | RL workflows | Fresh-policy and BC-initialized runs; manual and validated automatic reset; live target continuity | Practice PPO, native reward authoring/rehearsal, external adapter, asynchronous evidence assembly, exact actor collection records and native nonblocking hooks implemented/tested. Native worker/producer wiring, live actor/learner scheduling, checkpoint actor-progress handoff and reset actions pending |
 | Checkpoints | Atomic write/integrity; reload/resume; runtime policy version and recurrent isolation | Immutable publication/integrity, optimizer/freeze/RNG resume, shared catalog links, saved-configuration resume and actor identity/reset tests pass. Actual desktop policy handoff remains part of live qualification |
 | Evaluation | Frozen protocols/checkpoints; held-out seeds/layouts; action faults and interventions | Native checkpoint NLL evaluation and compiled-policy virtual closed-loop evaluation implemented; production pointing/memory evidence recorded. Broader task protocols and comparison UI pending |
-| Experiments | Three-seed detail/temporal/cadence/hybrid comparisons and evidence-based decisions | Matched initialization and192-update paired GRU diagnostics remain at chance; tiny immediate-cue readout can overfit. Experimental4×384 causal transformer passed22 checks and full-resolution frozen-feature pilot; no campaign/default change. Broad learning and required multi-seed ablations remain open |
+| Experiments | Three-seed detail/temporal/cadence/hybrid comparisons and evidence-based decisions | Matched initialization and192-update paired GRU diagnostics remain at chance; tiny immediate-cue readout can overfit. Further temporal work is GRU-only under verification/temporal-scope.md. Broad learning and required multi-seed ablations remain open |
 | UX | Both first-success paths, reusable library ownership, clear stops/takeover, errors/empty states | Pending |
 | Accessibility | Keyboard, VoiceOver, contrast, chart tables, light/dark, narrow windows/long names | Owned native renders cover both themes/sizes:72 base+30 scrolled overall views, plus16 base+4 scrolled selection views. Layout/contrast fixes inspected. Actual keyboard/VoiceOver and installed interaction remain pending |
 | Performance | Warm end-to-end latency, GPU contention, aggregate memory, capture/storage bottlenecks | Production compiled actor median 58.51 ms / p95 59.58 ms; exact B2T64 backward peak 8.10 GB. These exclude full native capture/IPC and aggregate contention; full performance gate pending |
@@ -50,6 +50,7 @@ The user's full requested scope remains active. A passing component check or a p
 - Personal installation with ad-hoc signing, no notarization requirement. Document real Gatekeeper/TCC limitations.
 - Final DMG: `dist/AgentTrainer-Astra-1.0.0-arm64.dmg`.
 - No automatic update service. Signed app contents remain read-only.
+- Transformers are excluded by the user's September 12 direction. Continue the recurrent GRU model and the remaining implementation/qualification plan; do not resume Transformer experiments or add Transformer architecture.
 
 ## Current state — 2026-09-11
 

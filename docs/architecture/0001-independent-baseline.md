@@ -128,7 +128,7 @@ Stop agent immediately cancels control; Stop recording finalizes data; Stop trai
 Use three fixed seeds, identical episode splits and sample budgets, and separate tuning/held-out tests.
 
 - Detail ablation: keep detail unless a smaller variant loses <=2 percentage points on every task and materially improves resources.
-- Temporal comparison: GRU versus four 384-wide causal transformer layers with a 512-step cache. Replace GRU only for >=5-point delayed-memory gain, <=2-point loss elsewhere, and equal deadline/resource qualification.
+- Temporal learning: evaluate GRU credit horizon, initialization and optimization against held-out delayed-memory success and equal deadline/resource qualification. The original alternative-architecture proposal is superseded by the [2026-09-12 scope decision](../verification/temporal-scope.md).
 - Cadence: 10 versus 20 Hz on tracking, taps/chords, small-target pointing, and dragging. Select by closed-loop benefit subject to measured deadlines, not nominal throughput.
 - Hybrid learning: PPO with and without decaying demonstration regularization; verify improvement over suboptimal demonstrations without more execution faults.
 

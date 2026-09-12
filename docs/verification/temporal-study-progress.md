@@ -1,6 +1,6 @@
 # Frozen-visual temporal study
 
-2026-09-12. The first Stage 1 GRU tranche and its paired-data follow-up are complete; the 90% memory target is not met. No production model, schema or training default changed. The [experimental transformer and numerical pilot](causal-transformer.md) are implemented; its learning comparison has not run.
+2026-09-12. The first Stage 1 GRU tranche and its paired-data follow-up are complete; the 90% memory target is not met. No production model, schema or training default changed. Further temporal work is limited to GRU diagnostics under the [current scope decision](temporal-scope.md).
 
 The experimental implementation lives in `experiments/temporal_study.py`, with `scripts/temporal_study.py` for bounded execution and `scripts/inspect_temporal.py` for representation/fit diagnostics. The cache contains exact production-resolution visual features from the common native initial checkpoint. Source pixels remain 1280×720 with the default global/detail/cursor processing. This freezes all visual parameters and therefore is not production end-to-end learning evidence.
 
@@ -61,7 +61,7 @@ The measured training/preparation/diagnostic tranche totals 1,796.82 seconds of 
 
 Both arms used the same 192 counterfactual episode-pair sequence and geometric GRU initialization. These are forced-choice validation results, not freely acting success. The paired source removes layout-to-answer memorization as a sufficient solution, yet neither objective learned useful cue-conditioned choice in this budget. This does not establish GRU incapacity: training duration, weak delayed gradients, frozen visual/readout compatibility and precise packet-target optimization remain possible limitations.
 
-The subsequent [immediate-cue readout diagnostic](immediate-cue-diagnostic.md) uses an actual rendered cue replay. Its matched 192-update multi-layout arm also remains at 50%, while 512 extra repetitions of one opposite-cue pair fit both choices and generate successful greedy packets when admitted at readiness. The evaluator agrees with directly rendered input and the temporal-to-action gradient is connected. Weak initial cue conditioning, exposure and optimization remain important confounds. A future GRU/transformer comparison must give both sufficient matched exposure; none of these 192-update chance results establishes architectural incapacity.
+The subsequent [immediate-cue readout diagnostic](immediate-cue-diagnostic.md) uses an actual rendered cue replay. Its matched 192-update multi-layout arm also remains at 50%, while 512 extra repetitions of one opposite-cue pair fit both choices and generate successful greedy packets when admitted at readiness. The evaluator agrees with directly rendered input and the temporal-to-action gradient is connected. Weak initial cue conditioning, exposure and optimization remain important confounds. Further GRU studies need sufficient exposure; none of these 192-update chance results establishes architectural incapacity.
 
 Final paired checkpoints:
 

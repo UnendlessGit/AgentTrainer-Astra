@@ -42,7 +42,7 @@ The saved tiny checkpoint is `.local/temporal-immediate-study/cd427845-130e-4841
 
 The checked source and evaluator wiring agree; the temporal-to-action derivative is nonzero; and the unchanged recurrent/action path can fit this tiny immediate-cue mapping. The evidence therefore does not support a disconnected head or an inherent inability to express these choices. It does expose weak initial cue conditioning and a substantial exposure/optimization requirement. The multi-layout arm visits each cue only twice, whereas the tiny arm repeats each cue 512 times with a fresh optimizer. These budgets are not interchangeable, and successful tiny overfit does not establish generalization.
 
-A future GRU/causal-transformer comparison must give both sufficient matched example exposure, preserve the full visual map and action interface, and report training fit as well as held-out choice and freely acting behavior. The frozen random visual-detail/query layers, optimizer sensitivity, loss normalization and multi-layout readout transfer remain possible limitations. No architectural default change follows from these diagnostics. The reserved unseen seeds 2000–2127 remain unused.
+Further GRU studies need sufficient example exposure, the full visual map and action interface, and training-fit evidence alongside held-out choice and freely acting behavior. The frozen random visual-detail/query layers, optimizer sensitivity, loss normalization and multi-layout readout transfer remain possible limitations. No architectural default change follows from these diagnostics. The reserved unseen seeds 2000–2127 remain unused.
 
 ## Reproduction and private artifacts
 

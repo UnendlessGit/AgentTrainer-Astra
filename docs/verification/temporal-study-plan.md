@@ -1,6 +1,6 @@
 # Proposed temporal credit and loss study
 
-Status: **Stage 1 GRU tranche, paired follow-up and short-credit diagnostic completed. Experimental transformer implementation and bounded numerical pilot approved and completed; no transformer learning campaign yet.** See [current GRU evidence](temporal-study-progress.md), [readout diagnosis](immediate-cue-diagnostic.md) and [transformer numerical/footprint evidence](causal-transformer.md). Production training remains a separate future gate. The preceding matched initialization result is in [temporal-initialization.md](temporal-initialization.md).
+Status: **Stage 1 GRU tranche, paired follow-up and short-credit diagnostic completed. Further temporal work is GRU-only.** See [current GRU evidence](temporal-study-progress.md), [readout diagnosis](immediate-cue-diagnostic.md) and the [current scope decision](temporal-scope.md). Production training remains a separate future gate. The preceding matched initialization result is in [temporal-initialization.md](temporal-initialization.md).
 
 ## Question and interpretation
 
@@ -24,12 +24,8 @@ Proposed contrasts:
 | B | Same GRU | 512 | Same natural loss |
 | C | Same GRU | 512 | Choice-packet-only diagnostic loss |
 | D | Native-initialized GRU, 2×512 | 512 | Choice-packet-only diagnostic loss |
-| E | Causal transformer, 4×384, cache 512 | 512 | Natural per-decision packet NLL |
-| F | Same transformer | 512 | Choice-packet-only diagnostic loss |
 
-A–B isolates horizon, B–C isolates label imbalance, C–D revisits initialization with informative credit, B–E and C–F compare temporal representation under matching objectives. Both objectives divide by the same total valid decisions in the two-episode optimizer batch. Choice-only does not introduce an episode-length gradient multiplier; its separately reported choice NLL divides by selected packets. The choice-only loss masks waiting labels **only in the diagnostic objective**; it does not alter observations, episodes, action labels or the decoder. A policy trained only this way is not a deployable imitation model because its early-action/idle behavior is unqualified.
-
-For transformer prototypes, preserve the original visual and packet modules. Project the 384-wide temporal output into the existing 512-wide decoder/value interface. Use explicit causal masking, reset/padding masks, observed-control/time inputs and an at-most-512-observation cache. Report parameter and compute differences. Keep the prototype and its artifacts experimental; do not serialize it as a standard GRU checkpoint or change `ModelConfig`/schemas before an architectural decision.
+A–B isolates horizon, B–C isolates label imbalance, and C–D revisits initialization with informative credit. Both objectives divide by the same total valid decisions in the two-episode optimizer batch. Choice-only does not introduce an episode-length gradient multiplier; its separately reported choice NLL divides by selected packets. The choice-only loss masks waiting labels **only in the diagnostic objective**; it does not alter observations, episodes, action labels or the decoder. A policy trained only this way is not a deployable imitation model because its early-action/idle behavior is unqualified.
 
 ## Fair optimizer comparison
 
@@ -37,7 +33,7 @@ A T64 run has more chunks than a T512 run. Comparing equal chunk/update counts w
 
 Use identical optimizer hyperparameters, clipping, seeds and 192 completed updates initially: four complete passes over the 96-episode training source. Save checkpoints at updates 32/64/128/192. A wall-limited partial run is resumable, not a matched final result. Compare only common completed update/example counts. Start with model seed 834 for mechanism screening, then replicate the informative comparisons at 835/836 before selecting an architecture.
 
-The subsequent tiny immediate-cue control needed hundreds of repeated pair exposures. Thus 192 updates were an initial screening budget, not enough evidence to conclude architectural incapacity. The future paired GRU/transformer campaign must specify adequate matched example exposure and inspect training fit; repeating the same shallow budget is not a decisive comparison.
+The subsequent tiny immediate-cue control needed hundreds of repeated pair exposures. Thus 192 updates were an initial screening budget, not enough evidence to conclude architectural incapacity. Further paired GRU studies must specify adequate example exposure and inspect training fit; repeating the same shallow budget is not a decisive comparison.
 
 ## Required checks before learning claims
 
@@ -45,7 +41,6 @@ The subsequent tiny immediate-cue control needed hundreds of repeated pair expos
 - For the same GRU weights and episode, T64 accumulation and T512 must have identical forward state, packet scores and loss before updating; only the intended gradient cut may differ.
 - Verify source/input causality, per-episode state reset, padding, cache eviction, no future-key attention and no demonstration-label state leakage.
 - Compare cached and ordinary frozen-vision gradients on a tractable sequence. Check nonzero cue gradients where they should exist, finite gradients and actual parameter updates.
-- For the transformer, verify step/sequence equivalence, reset behavior, full versus detached-cache gradients and exact shared decoder scoring. This requires implementation tests before learning curves can be interpreted.
 - Report action-time NLL separately from waiting NLL, balanced opposite-cue choice accuracy, cue-flip response, state/gradient sensitivity, and train-versus-validation curves. Overall packet NLL alone is insufficient.
 
 ## Budget and stopping decisions
@@ -56,7 +51,7 @@ The first proposed compute tranche is at most 30 minutes for the four GRU diagno
 
 Success for advancing a candidate requires a clear learning curve and at least 90% balanced validation choice accuracy at all three delays. If even choice-only T512 cannot overfit the training episodes, inspect the feature/gradient/decoder path before adding longer runs. If it overfits training but fails unseen paired layouts, increase demonstration diversity and investigate generalization. If natural loss fails while choice-only succeeds, test an explicitly specified curriculum/calibration strategy before attributing the failure to temporal architecture.
 
-After the GRU contrasts, implement and test the bounded transformer prototype and allocate a separate measured tranche for E/F. Replicate the decisive contrasts with three model seeds. No default change follows from one favorable seed.
+Replicate informative GRU contrasts with three model seeds. No default change follows from one favorable seed. Further runs require a coordinated GPU allocation; prior comparison-campaign approval does not authorize an automatic new tranche.
 
 ## Stage 2: production qualification
 
