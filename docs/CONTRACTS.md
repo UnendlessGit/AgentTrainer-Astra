@@ -58,6 +58,8 @@ Native LibraryStore is the sole metadata writer. Source recording files are appe
 
 Frame blocks use native LZFSE with explicit uncompressed byte size and checksum. A shared-memory frame reference is leased until the receiving process owns its MLX copy. Bounded queues have an explicit overload outcome; neither memory ownership nor dropped intervals may be implicit.
 
+The CPU collector uses its own separately bound ring and acknowledges only after owning an immutable CPU pixel copy. It never reuses the actor's retired single-consumer reference. Native collector and reward queues reserve owned memory before enqueueing and retain that reservation through in-flight work. Exact source/availability/verified-unchanged clocks remain distinct, and physical release is never inferred from a collector acknowledgement. See [native desktop collection](verification/native-desktop-collection.md) for the timing, ownership and readiness contracts.
+
 Cross-language fixtures, geometry mapping, malformed messages, causal input state, action admission/cancellation, exact raw round-trip, actual model gradients and production-entry workflows are required checks.
 
 ### Recording packages and recovery

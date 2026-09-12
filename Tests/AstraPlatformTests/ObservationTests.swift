@@ -49,7 +49,9 @@ import AstraCore
     CVPixelBufferUnlockBaseAddress(buffer, [])
     let surface = SurfaceDescriptor(id: "fixture", globalBounds: .init(x: 0, y: 0, width: 3, height: 2),
                                     pixelWidth: 3, pixelHeight: 2)
-    let frame = CapturedFrame(id: UUID(), eventNanos: 1, observedNanos: 2, surface: surface, pixelBuffer: buffer)
+    let metadata = FrameMetadata(eventNanos: 1, observedNanos: 2, surface: surface, byteCount: 24, codec: "raw")
+    let coverage = try CaptureFrameCoverage(streamID: UUID(), frame: metadata)
+    let frame = CapturedFrame(id: metadata.id, eventNanos: 1, observedNanos: 2, surface: surface, pixelBuffer: buffer, coverage: coverage)
     #expect(try frame.copyCompactPixels() == Data(repeating: 13, count: 12) + Data(repeating: 27, count: 12))
 }
 

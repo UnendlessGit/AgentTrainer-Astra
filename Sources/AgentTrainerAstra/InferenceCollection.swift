@@ -1,5 +1,6 @@
 import Foundation
 import AstraCore
+import AstraPlatform
 
 /// An owned copy of exactly what the actor observed. The actor's single-consumer
 /// ring references are deliberately excluded: collectors publish their own
@@ -9,6 +10,7 @@ struct InferenceCollectedObservation: Sendable {
     let actorInput: JSONValue
     let frame: FrameMetadata
     let pixels: Data
+    var coverage: CaptureFrameCoverage? = nil
 }
 
 enum InferenceCollectionEvent: Sendable {

@@ -1,0 +1,33 @@
+# Native desktop collection infrastructure
+
+September 12, 2026. The native collector transport and asynchronous reward analysis are implemented and tested with owned pixels and injected process boundaries. They are not yet wired into the complete desktop RL coordinator. No live learned OS input or installed-app RL success follows from these checks.
+
+## Source evidence
+
+`CaptureFrameCoverage` binds a capture stream, immutable frame UUID, exact surface geometry, original source and availability times, and a separately available coverage observation. A complete frame is fresh according to its source time. An explicit ScreenCaptureKit idle sample may extend coverage only when its source timestamp and complete geometry are valid and still match those pixels. Missing callbacks, ordinary idle health messages, suspended/blank sources and a later callback arrival do not extend source time.
+
+The SDK describes idle as no new frame because the display did not change, and `displayTime` as the mach absolute time of the source event. This implementation deliberately requires additional timestamp/geometry evidence before applying that statement to a retained source. See [Apple's idle status documentation](https://developer.apple.com/documentation/screencapturekit/scframestatus/idle) and the paired Xcode 26.5 `SCStream.h`. Actual idle attachment availability across window/display sources remains a live qualification requirement. A static source lacking adequate idle evidence will expire rather than silently refresh its pixels.
+
+The inference inbox retains one source buffer and its coverage. All actor predictions, including warmup and ordinary Run, require evidence within 250 ms of the actual control observation cutoff. Collector transport keeps original `FrameMetadata` timestamps; its frame coverage clock uses availability, while reward signal age uses the actual source event. The explicit bridge in `RewardAnalysisQueue` preserves this distinction.
+
+## Collector ownership
+
+`CollectorSession` starts the CPU collector and prepares its own mapped ring before returning a session. It never reuses the actor's acknowledged single-consumer leases. A serial background owner publishes owned BGRA bytes, sends exact actor records and preserves integer nanosecond cutoffs. Metadata attached to a collector reference is the ring's normalized raw metadata. Only a matching observation/lease acknowledgement releases a slot. A fault, duplicate release or cancelled startup joins the child before retiring its ring.
+
+Normal ingress reserves up to 256 MiB and 128 items by default, including the request currently awaiting acknowledgement. The ring separately reserves at most four source-sized slots, within approximately 256 MiB plus headers. Final native control audit messages have a separate 72-item metadata reservation so actor backpressure cannot consume their capacity. Input payloads have explicit protocol/metadata limits; no image is resized or dropped to fit these budgets.
+
+Before sending an input to the child, a separate native journal appends and synchronizes its original actor/control metadata. That journal includes actual sampled commands and final control receipts even if pixel publication or collector transport fails. It explicitly does not contain a replayable pixel spool. The Python collector's immutable package owns trainable image/evidence storage. Neither a native journal entry nor `collector.applied` is proof of successful learning admission or OS control release.
+
+Finish is an idempotent join: callers first join actor, reward and control producers, close ingress, drain accepted input, send the exact preceding request sequence, await a terminal package and join child I/O. A stopped/failed collector cannot cause slot reuse or a success result. The collector/learner wire schema is in [collector-worker.md](collector-worker.md).
+
+## Reward analysis
+
+`RewardAnalysisQueue` preloads frozen image templates and warms each visual signal's detector on its bound source before control is armed. It consumes bounded owned snapshots on a serial CPU queue while the actor continues independently. Repeated immutable frames reuse their detector readings; coverage still controls their age, and their original timestamps never change.
+
+The reset/control owner must explicitly confirm readiness, released controls and zero pending packets. The first actual actor cutoff initializes the score/edge baseline and rechecks readiness on those actual pixels; its source evidence must reach or follow the confirmed ready time. A cached pre-ready frame cannot initialize a new score merely because its lookup cutoff is later. Orchestration must wait for suitable post-ready source evidence before arming. No interval before the first actor cutoff receives policy credit. Later intervals use exact elapsed nanoseconds and separate manual stream coverage. Missing manual coverage remains unknown, including when no markers were delivered. A terminal evaluation stops later reward evaluation; actual suffix actions still belong in the collector/control audit. Output handlers must make bounded nonblocking offers, and detector/output failures request control stop through the caller.
+
+## Evidence and remaining integration
+
+The whole native run in `.local/full-native-collection-sep12.log` passed 170 reported tests, with two opt-in tests skipped, in 5.835 seconds. After the readiness refinement, `.local/reward-analysis-tests.log` passed 33 focused tests, including the new Core source-coverage checks, in 0.407 seconds. Parameterized cases are included within those reported tests. Checks cover source identity/geometry/time expiry, unchanged frame reuse, non-collecting inference lifecycle, exact collector bytes/cutoffs, private lease release and retirement, in-flight queue backpressure with retained final receipts, transport failure, duplicate release, cancellation during prepare, concurrent finish, duration-based rewards, explicit readiness, pre-ready baseline rejection, unknown manual feedback and first-terminal handling. These tests use production native classes, owned buffers and injected process/detector boundaries; existing inference tests also exercise mapped recovery proof.
+
+Complete native episode/reset orchestration, reward-to-packet binding and watermark publication, continuously running actor/learner scheduling, checkpoint activation/resume, multi-surface capture and actual installed capture/control/privacy qualification remain open. The final DMG gate remains unchanged.

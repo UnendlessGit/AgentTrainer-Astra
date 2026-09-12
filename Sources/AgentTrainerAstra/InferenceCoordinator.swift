@@ -14,6 +14,7 @@ struct InferenceOptions: Sendable {
 struct InferenceImage: Sendable {
     let metadata: FrameMetadata
     let pixels: @Sendable () throws -> Data
+    var coverage: CaptureFrameCoverage? = nil
 }
 
 struct InferenceCapture: Sendable {
@@ -54,7 +55,7 @@ struct InferenceDependencies: Sendable {
                 try await capture.start(source: source, fps: 30, showsCursor: false, onFrame: { frame in
                     let metadata = FrameMetadata(id: frame.id, eventNanos: frame.eventNanos, observedNanos: frame.observedNanos,
                         surface: frame.surface, byteCount: frame.surface.pixelWidth * frame.surface.pixelHeight * 4, codec: "raw")
-                    onFrame(InferenceImage(metadata: metadata, pixels: { try frame.copyCompactPixels() }))
+                    onFrame(InferenceImage(metadata: metadata, pixels: { try frame.copyCompactPixels() }, coverage: frame.coverage))
                 }, onHealth: onHealth)
             }, stop: { await capture.stop() })
         }, activate: { source in
@@ -71,7 +72,7 @@ struct InferenceDependencies: Sendable {
 
 /// The producer replaces one retained frame synchronously on the capture queue.
 /// No per-frame Task, compressed archive or UI actor queue retains SCK buffers.
-private final class InferenceFrameInbox: @unchecked Sendable {
+final class InferenceFrameInbox: @unchecked Sendable {
     private let lock = NSLock()
     private var latest: InferenceImage?
     private var issue: String?
@@ -91,6 +92,18 @@ private final class InferenceFrameInbox: @unchecked Sendable {
             switch value {
             case .unavailable(let message): issue = message
             case .stopped: issue = "The capture stream stopped unexpectedly."
+            case .coverage(let evidence):
+                guard var latest else { issue = "Capture coverage arrived without its source frame."; return }
+                do {
+                    try evidence.validated(frame: latest.metadata, cutoffNanos: evidence.verifiedAtNanos)
+                    if let previous = latest.coverage {
+                        guard previous.streamID == evidence.streamID, evidence.throughNanos >= previous.throughNanos,
+                              evidence.verifiedAtNanos >= previous.verifiedAtNanos else {
+                            throw AstraError("capture.coverageOrder", "Capture coverage changed stream or moved backwards.")
+                        }
+                    }
+                    latest.coverage = evidence; self.latest = latest
+                } catch { issue = error.localizedDescription }
             default: break
             }
         }
@@ -526,6 +539,13 @@ struct InferencePolicyDetails: Sendable {
                          observationID: UUID = UUID(), warmup: Bool = false) async throws -> WireMessage {
         try checkRunning()
         let collecting = collectionSink != nil && !warmup
+        if let coverage = frame.coverage { try coverage.validated(frame: frame.metadata, cutoffNanos: cutoff, maximumAgeMS: 250) }
+        else {
+            guard frame.metadata.eventNanos <= frame.metadata.observedNanos, frame.metadata.observedNanos <= cutoff,
+                  cutoff - frame.metadata.eventNanos <= 250_000_000 else {
+                throw AstraError("capture.stale", "The actor observation has no recent source coverage.")
+            }
+        }
         let (reference, collectedPixels) = try await Task.detached {
             let pixels = try frame.pixels()
             return (try ring.publish(pixels: pixels, metadata: frame.metadata), collecting ? pixels : nil)
@@ -538,7 +558,8 @@ struct InferencePolicyDetails: Sendable {
             "contextIDs": .array(contexts.map { .integer(Int64($0)) })])
         if let collectedPixels, let collectionSink, var input = payload.fields {
             input.removeValue(forKey: "frames")
-            try collectionSink.offer(.observation(.init(runID: run, actorInput: .object(input), frame: frame.metadata, pixels: collectedPixels)))
+            try collectionSink.offer(.observation(.init(runID: run, actorInput: .object(input), frame: frame.metadata,
+                pixels: collectedPixels, coverage: frame.coverage)))
         }
         let response = try await actor.request(warmup ? "inference.warmup" : "inference.step", payload, run, .seconds(120), true)
         guard response.runID == run else { throw AstraError("inference.run", "The actor replied for another run.") }
@@ -697,7 +718,7 @@ struct InferencePolicyDetails: Sendable {
     }
 }
 
-private extension JSONValue {
+extension JSONValue {
     var uuid: UUID? { text.flatMap(UUID.init(uuidString:)) }
     func requiredUUID(_ key: String) throws -> UUID {
         guard let value = fields?[key]?.uuid else { throw AstraError("inference.identity", "The runtime did not provide a valid \(key).") }

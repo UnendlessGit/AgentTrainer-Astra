@@ -65,10 +65,12 @@ public struct SignalReading: Sendable {
     public let observedNanos: UInt64
     public let confidence: Double
     public let value: SignalValue
+    public let sourceObservationID: UUID?
     public init(signalID: UUID, episodeID: UUID, eventNanos: UInt64, observedNanos: UInt64,
-                confidence: Double = 1, value: SignalValue) {
+                confidence: Double = 1, value: SignalValue, sourceObservationID: UUID? = nil) {
         self.signalID = signalID; self.episodeID = episodeID; self.eventNanos = eventNanos
         self.observedNanos = observedNanos; self.confidence = confidence; self.value = value
+        self.sourceObservationID = sourceObservationID
     }
 }
 
@@ -136,6 +138,7 @@ public struct RewardProgram: Codable, Hashable, Identifiable, Sendable {
     public var success: RewardPredicate?
     public var failure: RewardPredicate?
     public var ready: RewardPredicate?
+    public var resetPlan: ResetPlan?
     public var maximumEpisodeMS: Int = 120_000
     public init(id: UUID = UUID(), name: String, signals: [RewardSignal] = [], rules: [RewardRule] = []) {
         self.id = id; self.name = name; self.signals = signals; self.rules = rules
@@ -152,6 +155,10 @@ public struct RewardProgram: Codable, Hashable, Identifiable, Sendable {
         for predicate in [success, failure, ready].compactMap({ $0 }) { _ = try predicate.validated(signals: lookup) }
         if ready?.conditions.contains(where: { lookup[$0.signalID]?.kind == .elapsedSeconds }) == true {
             throw AstraError("reward.readyClock", "Elapsed episode time starts after readiness and cannot confirm the starting condition.")
+        }
+        if let resetPlan {
+            guard ready != nil else { throw AstraError("reset.readiness", "An authored reset requires an explicit starting condition.") }
+            value.resetPlan = try resetPlan.validated(signals: lookup)
         }
         for rule in rules {
             _ = try DocumentNames.validated(rule.name)

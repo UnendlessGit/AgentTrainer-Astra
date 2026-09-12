@@ -54,7 +54,7 @@ public enum VisualRewardDetector {
             }
             readings.append(SignalReading(signalID: signal.id, episodeID: episodeID,
                 eventNanos: frame.metadata.eventNanos, observedNanos: frame.metadata.observedNanos,
-                confidence: result.1, value: result.0))
+                confidence: result.1, value: result.0, sourceObservationID: frame.metadata.id))
         }
         return readings
     }

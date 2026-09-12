@@ -50,6 +50,7 @@ public enum CaptureDiscovery {
 
 public enum CaptureHealth: Sendable {
     case starting, live, idle, unavailable(String), stopped
+    case coverage(CaptureFrameCoverage)
 }
 
 enum CaptureGeometry {
@@ -90,6 +91,7 @@ public struct CapturedFrame: @unchecked Sendable {
     public let observedNanos: UInt64
     public let surface: SurfaceDescriptor
     public let pixelBuffer: CVPixelBuffer
+    public let coverage: CaptureFrameCoverage
 
     public func copyCompactPixels() throws -> Data {
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
@@ -130,6 +132,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
     private var generation: UUID?
     private var source: CaptureSource?
     private var surface: SurfaceDescriptor?
+    private var coverage: CaptureFrameCoverage?
     private var frameHandler: FrameHandler?
     private var healthHandler: HealthHandler?
     private var startingCompletion: AsyncCompletion?
@@ -152,7 +155,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
         let completion = AsyncCompletion()
         try lock.withLock {
             guard generation == nil, stopTask == nil else { throw AstraError("capture.busy", "A capture stream is already starting, running, or stopping.") }
-            generation = token; self.source = source; frameHandler = onFrame; healthHandler = onHealth
+            generation = token; self.source = source; frameHandler = onFrame; healthHandler = onHealth; coverage = nil
             startingCompletion = completion
         }
         defer { completion.finish() }
@@ -229,7 +232,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
             }
             let notify = lock.withLock {
                 if generation == token {
-                    generation = nil; stream = nil; self.source = nil; surface = nil
+                    generation = nil; stream = nil; self.source = nil; surface = nil; coverage = nil
                     frameHandler = nil; healthHandler = nil
                     return true
                 }
@@ -245,7 +248,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
             if let stopTask { return stopTask }
             let previous = stream, callback = healthHandler
             let completion = startingCompletion
-            generation = nil; stream = nil; frameHandler = nil; healthHandler = nil; source = nil; surface = nil
+            generation = nil; stream = nil; frameHandler = nil; healthHandler = nil; source = nil; surface = nil; coverage = nil
             let task = Task { [self] in
                 // A concurrent start may not have called startCapture yet. Join
                 // it so no late stream can briefly revive after Stop returns.
@@ -265,6 +268,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
     public func stream(_ stream: SCStream, didStopWithError error: any Error) {
         let callback = lock.withLock { () -> HealthHandler? in
             guard self.stream === stream else { return nil }
+            coverage = nil
             return healthHandler
         }
         callback?(.unavailable(error.localizedDescription))
@@ -275,19 +279,44 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
         let observed = MonotonicClock.now
         let attachments = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first
         let status = (attachments?[.status] as? Int).flatMap(SCFrameStatus.init(rawValue:))
-        let snapshot = lock.withLock { () -> (SurfaceDescriptor, FrameHandler, HealthHandler)? in
-            guard self.stream === stream, generation != nil, let surface, let frameHandler, let healthHandler else { return nil }
-            return (surface, frameHandler, healthHandler)
+        let snapshot = lock.withLock { () -> (UUID, SurfaceDescriptor, FrameHandler, HealthHandler)? in
+            guard self.stream === stream, let generation, let surface, let frameHandler, let healthHandler else { return nil }
+            return (generation, surface, frameHandler, healthHandler)
         }
-        guard let (initialDescriptor, frameCallback, healthCallback) = snapshot else { return }
-        if status == .idle { healthCallback(.idle); return }
+        guard let (token, initialDescriptor, frameCallback, healthCallback) = snapshot else { return }
+        let timestamp = (attachments?[.displayTime] as? NSNumber).map({ MonotonicClock.nanoseconds(fromMachTicks: $0.uint64Value) })
+            ?? MonotonicClock.nanoseconds(hostTime: sampleBuffer.presentationTimeStamp)
+        if status == .idle {
+            healthCallback(.idle)
+            // SCK explicitly reports no source change. An idle callback without
+            // its source clock and complete geometry cannot establish coverage.
+            guard let timestamp, timestamp <= observed,
+                  let descriptor = try? CaptureGeometry.resolve(previous: initialDescriptor,
+                    pixelWidth: initialDescriptor.pixelWidth, pixelHeight: initialDescriptor.pixelHeight,
+                    screenRect: Self.rect(attachments?[.screenRect]), contentRect: Self.rect(attachments?[.contentRect]),
+                    scaleFactor: (attachments?[.scaleFactor] as? NSNumber)?.doubleValue,
+                    contentScale: (attachments?[.contentScale] as? NSNumber)?.doubleValue) else { return }
+            do {
+                let verified = try lock.withLock { () throws -> CaptureFrameCoverage? in
+                    guard self.stream === stream, generation == token, let coverage else { return nil }
+                    // A late source event may precede delivery of its base frame;
+                    // it adds no evidence and must not refresh arrival time.
+                    guard timestamp >= coverage.throughNanos else { return nil }
+                    let next = try coverage.verifyingUnchanged(streamID: token, surface: descriptor,
+                        throughNanos: timestamp, verifiedAtNanos: observed)
+                    self.coverage = next
+                    return next
+                }
+                if let verified { healthCallback(.coverage(verified)) }
+            } catch { healthCallback(.unavailable(error.localizedDescription)) }
+            return
+        }
         if status == .started, sampleBuffer.imageBuffer == nil { healthCallback(.starting); return }
         guard status == .complete || status == .started else {
+            lock.withLock { if self.stream === stream { coverage = nil } }
             healthCallback(.unavailable("The capture surface is unavailable.")); return
         }
-        guard let pixels = sampleBuffer.imageBuffer,
-              let timestamp = (attachments?[.displayTime] as? NSNumber).map({ MonotonicClock.nanoseconds(fromMachTicks: $0.uint64Value) })
-                ?? MonotonicClock.nanoseconds(hostTime: sampleBuffer.presentationTimeStamp) else {
+        guard let pixels = sampleBuffer.imageBuffer, let timestamp, timestamp <= observed else {
             healthCallback(.unavailable("A capture frame has no valid timestamp or pixels.")); return
         }
         let width = CVPixelBufferGetWidth(pixels), height = CVPixelBufferGetHeight(pixels)
@@ -299,15 +328,24 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
                                                       scaleFactor: (attachments?[.scaleFactor] as? NSNumber)?.doubleValue,
                                                       contentScale: (attachments?[.contentScale] as? NSNumber)?.doubleValue)
         } catch { healthCallback(.unavailable(error.localizedDescription)); return }
-        let accepted = lock.withLock {
-            guard self.stream === stream, generation != nil else { return false }
-            surface = descriptor
-            return true
-        }
-        guard accepted else { return }
+        let id = UUID()
+        let evidence: CaptureFrameCoverage
+        do {
+            evidence = try CaptureFrameCoverage(streamID: token, frame: FrameMetadata(id: id, eventNanos: timestamp,
+                observedNanos: observed, surface: descriptor, byteCount: width * height * 4, codec: "raw"))
+            let accepted = try lock.withLock {
+                guard self.stream === stream, generation == token else { return false }
+                if let coverage, timestamp < (coverage.kind == .unchanged ? coverage.throughNanos : coverage.eventNanos) {
+                    throw AstraError("capture.sourceClock", "Capture source time moved backwards.")
+                }
+                surface = descriptor; coverage = evidence
+                return true
+            }
+            guard accepted else { return }
+        } catch { healthCallback(.unavailable(error.localizedDescription)); return }
         healthCallback(.live)
-        frameCallback(CapturedFrame(id: UUID(), eventNanos: timestamp, observedNanos: observed,
-                                    surface: descriptor, pixelBuffer: pixels))
+        frameCallback(CapturedFrame(id: id, eventNanos: timestamp, observedNanos: observed,
+                                    surface: descriptor, pixelBuffer: pixels, coverage: evidence))
     }
 
     private static func rect(_ value: Any?) -> CGRect? {

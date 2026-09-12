@@ -54,13 +54,40 @@ public struct RewardEvaluator: Sendable {
     }
 
     public func readiness(episodeID: UUID, cutoffNanos: UInt64, readings: [SignalReading]) throws -> RewardTruth {
-        let values = try resolve(readings, episodeID: episodeID, cutoff: cutoffNanos, startedAt: cutoffNanos, allowBeforeStart: true)
-        return program.ready.map { Self.test($0, values: values) } ?? .yes
+        try readiness(snapshot: resolveSnapshot(episodeID: episodeID, cutoffNanos: cutoffNanos, readings: readings))
+    }
+
+    public func resolveSnapshot(episodeID: UUID, cutoffNanos: UInt64, readings: [SignalReading],
+                                coverage: [RewardReadingCoverage]? = nil, scope: ControlScope? = nil,
+                                minimumEvidenceNanos: UInt64 = 0) throws -> ResolvedRewardSnapshot {
+        let values = try resolve(readings, episodeID: episodeID, cutoff: cutoffNanos, startedAt: cutoffNanos,
+                                 allowBeforeStart: true, coverage: coverage, scope: scope, minimumEvidenceNanos: minimumEvidenceNanos)
+        return ResolvedRewardSnapshot(definition: program, episodeID: episodeID, cutoffNanos: cutoffNanos,
+                                      readings: readings, coverage: coverage, values: values)
+    }
+
+    public func readiness(snapshot: ResolvedRewardSnapshot) throws -> RewardTruth {
+        try requireDefinition(snapshot)
+        return program.ready.map { Self.test($0, values: snapshot.values) } ?? .yes
+    }
+
+    public func predicate(_ predicate: RewardPredicate, snapshot: ResolvedRewardSnapshot) throws -> RewardTruth {
+        try requireDefinition(snapshot); _ = try predicate.validated(signals: signals)
+        return Self.test(predicate, values: snapshot.values)
+    }
+
+    private func requireDefinition(_ snapshot: ResolvedRewardSnapshot) throws {
+        guard snapshot.definition == program else { throw AstraError("reward.snapshotIdentity", "The resolved signals belong to another reward definition.") }
     }
 
     public mutating func reset(episodeID: UUID, readyAtNanos: UInt64, readings: [SignalReading], controlsReleased: Bool) throws {
+        try reset(snapshot: resolveSnapshot(episodeID: episodeID, cutoffNanos: readyAtNanos, readings: readings), controlsReleased: controlsReleased)
+    }
+
+    public mutating func reset(snapshot: ResolvedRewardSnapshot, controlsReleased: Bool) throws {
+        try requireDefinition(snapshot)
         guard controlsReleased else { throw AstraError("reward.reset", "Release owned controls before confirming episode readiness.") }
-        let values = try resolve(readings, episodeID: episodeID, cutoff: readyAtNanos, startedAt: readyAtNanos, allowBeforeStart: true)
+        let values = snapshot.values, episodeID = snapshot.episodeID, readyAtNanos = snapshot.cutoffNanos
         guard program.ready.map({ Self.test($0, values: values) }) ?? .yes == .yes else {
             throw AstraError("reward.notReady", "The starting condition is false or could not be read.")
         }
@@ -73,11 +100,12 @@ public struct RewardEvaluator: Sendable {
     }
 
     public mutating func evaluate(endNanos: UInt64, readings: [SignalReading], markers: [ManualRewardMarker] = [],
-                                  markerCoverage: ManualRewardCoverage? = nil) throws -> RewardEvaluation {
+                                  markerCoverage: ManualRewardCoverage? = nil, coverage: [RewardReadingCoverage]? = nil,
+                                  scope: ControlScope? = nil) throws -> RewardEvaluation {
         guard let episodeID, !finished, endNanos > cutoff, endNanos >= startedAt, markers.count <= 4096 else {
             throw AstraError("reward.interval", "Reward evaluation requires an active episode and the next increasing cutoff.")
         }
-        let values = try resolve(readings, episodeID: episodeID, cutoff: endNanos, startedAt: startedAt)
+        let values = try resolve(readings, episodeID: episodeID, cutoff: endNanos, startedAt: startedAt, coverage: coverage, scope: scope)
         var nextMarker = lastMarker, markerCounts: [UUID: Int] = [:]
         let manualRules = Set(program.rules.filter { $0.kind == .manualMarker }.map(\.id))
         for marker in markers {
@@ -154,9 +182,26 @@ public struct RewardEvaluator: Sendable {
     }
 
     private func resolve(_ readings: [SignalReading], episodeID: UUID, cutoff: UInt64, startedAt: UInt64,
-                         allowBeforeStart: Bool = false) throws -> [UUID: SignalValue] {
+                         allowBeforeStart: Bool = false, coverage: [RewardReadingCoverage]? = nil,
+                         scope: ControlScope? = nil, minimumEvidenceNanos: UInt64 = 0) throws -> [UUID: SignalValue] {
         guard readings.count <= signals.count, Set(readings.map(\.signalID)).count == readings.count else {
             throw AstraError("reward.readings", "A signal snapshot contains duplicate or excess readings.")
+        }
+        var proofs: [UUID: RewardSourceCoverage] = [:]
+        if let coverage {
+            guard let scope, coverage.count <= signals.count, Set(coverage.map(\.signalID)).count == coverage.count else {
+                throw AstraError("reward.coverage", "Signal coverage requires a bounded, unique mapping and an observed scope.")
+            }
+            _ = try scope.validated()
+            let byID = Dictionary(uniqueKeysWithValues: readings.map { ($0.signalID, $0) })
+            for item in coverage {
+                guard let signal = signals[item.signalID], signal.kind.isVisual, let reading = byID[item.signalID],
+                      signal.surfaceID == item.source.surface.id, reading.sourceObservationID == item.source.sourceObservationID,
+                      reading.eventNanos == item.source.eventNanos, reading.observedNanos == item.source.observedNanos else {
+                    throw AstraError("reward.coverageIdentity", "Signal coverage does not match its original observation and surface.")
+                }
+                proofs[item.signalID] = try item.source.validated(scope: scope, cutoffNanos: cutoff)
+            }
         }
         var result: [UUID: SignalValue] = [:]
         for reading in readings {
@@ -169,9 +214,12 @@ public struct RewardEvaluator: Sendable {
             case (_, .unknown), (.manual, _), (.ocrText, .text), (.ocrNumber, .number), (.imageMatch, .number): break
             default: throw AstraError("reward.signalType", "A reward detector supplied the wrong kind of value.")
             }
-            if reading.observedNanos > cutoff || (!allowBeforeStart && reading.eventNanos < startedAt) || cutoff < reading.eventNanos {
+            let through = proofs[signal.id]?.throughNanos ?? reading.eventNanos
+            if coverage != nil, signal.kind.isVisual, proofs[signal.id] == nil {
+                result[signal.id] = .unknown("The signal has no matching source coverage.")
+            } else if reading.observedNanos > cutoff || (!allowBeforeStart && through < startedAt) || cutoff < through || through < minimumEvidenceNanos {
                 result[signal.id] = .unknown("The signal is outside this episode's observation cutoff.")
-            } else if cutoff - reading.eventNanos > UInt64(signal.maximumAgeMS) * 1_000_000 {
+            } else if cutoff - through > UInt64(signal.maximumAgeMS) * 1_000_000 {
                 result[signal.id] = .unknown("The signal is stale.")
             } else if reading.confidence < signal.minimumConfidence { result[signal.id] = .unknown("The signal confidence is too low.") }
             else { result[signal.id] = reading.value }

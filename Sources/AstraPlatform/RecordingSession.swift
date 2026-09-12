@@ -224,7 +224,7 @@ public final class RecordingSession: @unchecked Sendable {
         let available: Bool
         switch health {
         case .live, .idle: available = true
-        case .starting, .stopped: return
+        case .starting, .stopped, .coverage: return
         case .unavailable(let message): fail(message); available = false
         }
         let time = MonotonicClock.now
