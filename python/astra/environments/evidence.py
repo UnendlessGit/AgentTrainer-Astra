@@ -63,9 +63,12 @@ class DecisionEvidence:
         if not same_id(receipt['packetID'], self.context.packet_id) or not same_id(receipt['runID'], self.context.run_id) or integer(receipt['sequence']) != self.sequence:
             raise EnvironmentError('Execution receipt identity does not match its policy packet')
         integer(receipt['observedNanos']); controls(receipt['resultingState'], receipt['observedNanos'])
-        if receipt['resultingState']['valid'] is not True:
-            raise EnvironmentError('Executor reported unavailable controls')
         status = receipt['status']
+        if receipt['resultingState']['valid'] is not True and (status=='admitted' or not retain_failure):
+            raise EnvironmentError('Executor reported unavailable controls for active admission')
+        # A disarmed executor truthfully reports inactive controls on final
+        # receipts. Retain those exact flags for audit; prefix admission below
+        # permits only the explicit episode-boundary cancellation exception.
         if status in ('late', 'rejected') and not retain_failure:
             raise EnvironmentError('A policy packet was late or rejected; rollout admission stopped')
         if status == 'admitted':
@@ -101,6 +104,8 @@ class DecisionEvidence:
     def execution_complete(self, boundary_nanos):
         receipt = self.receipt
         if receipt is None: return False
+        if receipt['status']=='executed' and receipt['resultingState']['valid'] is not True:
+            raise EnvironmentError('Inactive executed controls cannot enter the continuing policy prefix')
         if receipt['status'] in ('late', 'rejected') or any(result['status'] == 'failed' for result in receipt['commandResults']):
             raise EnvironmentError('Failed or late execution cannot enter the on-policy prefix')
         if receipt['status'] == 'cancelled':

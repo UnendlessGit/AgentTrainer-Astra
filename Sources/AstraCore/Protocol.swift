@@ -41,6 +41,31 @@ public indirect enum JSONValue: Codable, Equatable, Sendable {
     public func decode<T: Decodable>(_ type: T.Type) throws -> T {
         try JSONDecoder().decode(type, from: JSONEncoder().encode(self))
     }
+
+    public var fields: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
+    public var text: String? { if case .string(let value) = self { value } else { nil } }
+    public var uuid: UUID? { text.flatMap(UUID.init(uuidString:)) }
+    public var int: Int? {
+        switch self { case .integer(let value): Int(exactly: value); case .unsigned(let value): Int(exactly: value); default: nil }
+    }
+    public var uint64: UInt64? {
+        switch self { case .integer(let value): UInt64(exactly: value); case .unsigned(let value): value; default: nil }
+    }
+    public var double: Double? {
+        switch self { case .number(let value): value; case .integer(let value): Double(value); case .unsigned(let value): Double(value); default: nil }
+    }
+    public func required(_ key: String) throws -> JSONValue {
+        guard let value = fields?[key], value != .null else {
+            throw AstraError("protocol.missingField", "Required metadata is missing \(key).")
+        }
+        return value
+    }
+    public func requiredUUID(_ key: String) throws -> UUID {
+        guard let value = fields?[key]?.uuid else {
+            throw AstraError("protocol.invalidIdentity", "The runtime did not provide a valid \(key).")
+        }
+        return value
+    }
 }
 
 public struct WireMessage: Codable, Equatable, Sendable {

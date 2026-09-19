@@ -2,6 +2,7 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 import queue
+import subprocess
 import threading
 import uuid
 
@@ -191,7 +192,7 @@ def test_collection_warmup_has_no_record_and_restores_all_stream_counters(native
         actor.close()
 
 
-def test_collection_episode_reset_preserves_random_stream_and_zeroes_only_recurrence(native_ring, checkpoint):
+def test_collection_episode_reset_preserves_stream_and_restarts_local_history(native_ring, checkpoint):
     producer, report = native_ring
     run_id = report["reference"]["runID"]
     actor = InferenceSession()
@@ -199,6 +200,8 @@ def test_collection_episode_reset_preserves_random_stream_and_zeroes_only_recurr
         actor.prepare({**_prepare(checkpoint, report, deterministic=False), "collection": True}, run_id=run_id)
         state = actor.reset({"confirmed": True, "episodeID": str(uuid.uuid4()), "contextIDs": []}, run_id=run_id)
         first_request = _step(report, state)
+        first_request["executedEvents"] = [{"sequence": 9, "eventNanos": first_request["cutoffNanos"],
+            "observedNanos": first_request["cutoffNanos"], "origin": "agent", "kind": "pointer", "x": -1919, "y": 1}]
         first = actor.step(first_request, run_id=run_id)
         reset_request = {"confirmed": True, "episodeID": str(uuid.uuid4()), "contextIDs": []}
         with pytest.raises(InferenceError, match="random stream"):
@@ -206,17 +209,124 @@ def test_collection_episode_reset_preserves_random_stream_and_zeroes_only_recurr
         assert actor._needs_reset
         state = actor.reset(reset_request, run_id=run_id)
         _acknowledge(producer, first["releasedFrames"][0]); second_report = _message(producer)
-        second = actor.step(_step(second_report, state, cutoff=first_request["cutoffNanos"] + 100_000_000), run_id=run_id)
+        second_request = _step(second_report, state, cutoff=first_request["cutoffNanos"] + 1)
+        second_request["executedEvents"] = [{"sequence": 0, "eventNanos": second_request["cutoffNanos"],
+            "observedNanos": second_request["cutoffNanos"], "origin": "agent", "kind": "pointer", "x": -1919, "y": 1}]
+        second = actor.step(second_request, run_id=run_id)
         record = second["collectionRecord"]
         assert record["episodeStep"] == 0 and record["environmentResets"] == 2 and record["recurrentReset"]
         assert not np.any(record["stateBefore"])
         assert record["sampler"]["drawIndex"] == 1
+        assert second["packet"]["sequence"] == 1 and record["elapsedSeconds"] == .1
         assert record["sampler"]["stateBefore"] == first["collectionRecord"]["sampler"]["stateAfter"]
         assert record["sampler"]["rngStreamID"] == first["collectionRecord"]["sampler"]["rngStreamID"]
         _acknowledge(producer, second["releasedFrames"][0]); assert _message(producer)["closed"]
         assert producer.wait(timeout=10) == 0
     finally:
         actor.close()
+
+
+def test_actor_resume_restores_verified_cursor_in_a_new_run_without_optimizer_or_gru_state(native_ring, ring_fixture_executable, checkpoint, tmp_path, monkeypatch):
+    producer, report = native_ring
+    actor = InferenceSession(); old_run = report['reference']['runID']
+    try:
+        actor.prepare({**_prepare(checkpoint, report, deterministic=False), 'collection': True}, run_id=old_run)
+        state = actor.reset({'confirmed': True, 'episodeID': str(uuid.uuid4()), 'contextIDs': []}, run_id=old_run)
+        actual = actor.step(_step(report, state), run_id=old_run)
+        record = actual['collectionRecord']
+        cursor = {'schemaVersion': 1, 'runID': old_run, 'rngStreamID': record['sampler']['rngStreamID'],
+            'drawIndex': record['sampler']['drawIndex'], 'rngState': record['sampler']['stateAfter'],
+            'actorResetGeneration': record['environmentResets']}
+        saved = tmp_path / str(uuid.uuid4())
+        save_checkpoint(saved, actor._checkpoint.policy, kind='reinforcement', step=1, metrics={'actorProgress': cursor},
+            training_state={'kind': 'reinforcement_external', 'schemaVersion': 1, 'actorProgress': cursor,
+                'learner': {'optimizerTensor': mx.arange(100)}, 'consumedRolloutIDs': [], 'requiresEnvironmentReset': True})
+        _acknowledge(producer, actual['releasedFrames'][0]); unused = _message(producer)
+        _acknowledge(producer, {name: unused['reference'][name] for name in ('version', 'runID', 'ringID', 'slot', 'leaseID', 'sequence')})
+        assert _message(producer)['closed']; assert producer.wait(timeout=10) == 0
+    finally: actor.close()
+    folder = tmp_path / 'resume-ring'; folder.mkdir()
+    source = subprocess.Popen([str(ring_fixture_executable), '--frame-ring', str(folder)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    resumed = InferenceSession()
+    try:
+        current = _message(source); new_run = current['reference']['runID']
+        assert new_run != old_run
+        original_load = mx.load
+        def no_optimizer_load(path, *args, **kwargs):
+            assert not str(path).endswith('training.safetensors'), 'Actor allocated optimizer tensors'
+            return original_load(path, *args, **kwargs)
+        monkeypatch.setattr(mx, 'load', no_optimizer_load)
+        preparation = _prepare(saved, current, deterministic=False); preparation.pop('seed')
+        ready = resumed.prepare({**preparation, 'collection': True, 'resumeActor': True}, run_id=new_run)
+        assert ready['resumedActor'] and ready['needsReset']
+        assert ready['nextPacketSequence'] == ready['nextDrawIndex'] == cursor['drawIndex'] + 1
+        assert ready['rngStreamID'] == cursor['rngStreamID']
+        assert ready['actorResetGeneration'] == cursor['actorResetGeneration']
+        reset = resumed.reset({'confirmed': True, 'episodeID': str(uuid.uuid4()), 'contextIDs': []}, run_id=new_run)
+        warm = resumed.warmup(_step(current, reset), run_id=new_run)
+        assert 'collectionRecord' not in warm
+        _acknowledge(source, warm['releasedFrames'][0]); current = _message(source)
+        actual = resumed.step(_step(current, reset), run_id=new_run)
+        followup = actual['collectionRecord']
+        assert actual['packet']['sequence'] == followup['sampler']['drawIndex'] == cursor['drawIndex'] + 1
+        assert followup['sampler']['stateBefore'] == cursor['rngState']
+        assert followup['environmentResets'] == cursor['actorResetGeneration'] + 1
+        assert followup['episodeStep'] == 0 and followup['recurrentReset'] and not np.any(followup['stateBefore'])
+        _acknowledge(source, actual['releasedFrames'][0]); assert _message(source)['closed']
+        assert source.wait(timeout=10) == 0
+    finally:
+        resumed.close()
+        if source.poll() is None: source.kill()
+        source.communicate(timeout=10)
+
+
+def test_actor_resume_rejects_seed_or_unverified_progress_before_ring_acquisition(native_ring, checkpoint, tmp_path):
+    _, report = native_ring; run = report['reference']['runID']; actor = InferenceSession()
+    with pytest.raises(InferenceError, match='saved random stream'):
+        actor.prepare({**_prepare(checkpoint, report, deterministic=False), 'collection': True, 'resumeActor': True}, run_id=run)
+    preparation = _prepare(checkpoint, report, deterministic=False); preparation.pop('seed')
+    with pytest.raises(ValueError, match='no saved external actor progress'):
+        actor.prepare({**preparation, 'collection': True, 'resumeActor': True}, run_id=run)
+    assert actor._reader is None
+    cursor = {'schemaVersion': 1, 'runID': run, 'rngStreamID': str(uuid.uuid4()), 'drawIndex': 3,
+              'rngState': [1, 2], 'actorResetGeneration': 1}
+    path = tmp_path / str(uuid.uuid4())
+    save_checkpoint(path, load_checkpoint(checkpoint).policy, kind='reinforcement', step=1,
+        metrics={'actorProgress': {**cursor, 'drawIndex': 2}},
+        training_state={'kind': 'reinforcement_external', 'schemaVersion': 1, 'actorProgress': cursor,
+            'learner': {}, 'consumedRolloutIDs': [], 'requiresEnvironmentReset': True})
+    preparation['checkpointPath'] = str(path)
+    with pytest.raises(ValueError, match='differs from its recorded metrics'):
+        actor.prepare({**preparation, 'collection': True, 'resumeActor': True}, run_id=run)
+    assert actor._reader is None
+
+
+def test_resumed_last_admissible_packet_stops_before_copy_or_rng_reuse(native_ring, checkpoint, tmp_path, monkeypatch):
+    producer, report = native_ring; run = report['reference']['runID']
+    cursor = {'schemaVersion': 1, 'runID': run, 'rngStreamID': str(uuid.uuid4()), 'drawIndex': 2**64 - 3,
+              'rngState': [81, 17], 'actorResetGeneration': 1}
+    path = tmp_path / str(uuid.uuid4())
+    save_checkpoint(path, load_checkpoint(checkpoint).policy, kind='reinforcement', step=1, metrics={'actorProgress': cursor},
+        training_state={'kind': 'reinforcement_external', 'schemaVersion': 1, 'actorProgress': cursor,
+            'learner': {}, 'consumedRolloutIDs': [], 'requiresEnvironmentReset': True})
+    actor = InferenceSession()
+    try:
+        preparation = _prepare(path, report, deterministic=False); preparation.pop('seed')
+        actor.prepare({**preparation, 'collection': True, 'resumeActor': True}, run_id=run)
+        state = actor.reset({'confirmed': True, 'episodeID': str(uuid.uuid4()), 'contextIDs': []}, run_id=run)
+        first_request = _step(report, state)
+        first = actor.step(first_request, run_id=run)
+        assert first['packet']['sequence'] == first['collectionRecord']['sampler']['drawIndex'] == 2**64 - 2
+        _acknowledge(producer, first['releasedFrames'][0]); latest = _message(producer)
+        key = np.asarray(actor._key).copy(); saved_state = actor._state_id
+        def unexpected_copy(*args, **kwargs):pytest.fail('Exhausted actor acquired another frame lease')
+        monkeypatch.setattr(actor._reader, 'copy_frame', unexpected_copy)
+        with pytest.raises(InferenceError, match='no packet sequence'):
+            actor.step(_step(latest, first, cutoff=first_request['cutoffNanos'] + 100_000_000), run_id=run)
+        np.testing.assert_array_equal(np.asarray(actor._key), key)
+        assert actor._state_id == saved_state and actor._sequence == actor._draw_index == 2**64 - 1
+    finally:actor.close()
 
 
 def test_warmup_preserves_actor_state_and_rng_but_consumes_its_frame_lease(native_ring, checkpoint):
@@ -626,5 +736,34 @@ def test_compiled_nonfinite_result_releases_frame_without_committing_actor_state
         result = actor.step(_step(next_report, state), run_id=run_id)
         assert np.isfinite(result['value']) and result['packet']['sequence'] == 0
         _acknowledge(producer, result['releasedFrames'][0]); assert _message(producer)['closed']
+    finally:
+        actor.close()
+
+
+@pytest.mark.parametrize('collecting', [False, True])
+def test_reset_administrative_counters_and_episode_warmup_preserve_real_progress(native_ring, checkpoint, collecting):
+    producer, report = native_ring
+    run = report['reference']['runID']; actor = InferenceSession()
+    try:
+        ready = actor.prepare({**_prepare(checkpoint, report, deterministic=not collecting), 'collection': collecting}, run_id=run)
+        assert ready['nextPacketSequence'] == ready['nextDrawIndex'] == ready['actorResetGeneration'] == 0
+        reset = actor.reset(dict(confirmed=True, episodeID=str(uuid.uuid4()), contextIDs=[]), run_id=run)
+        assert reset['nextPacketSequence'] == reset['nextDrawIndex'] == 0 and reset['actorResetGeneration'] == 1
+        assert 'actorProgress' not in reset
+        request = _step(report, reset)
+        first = actor.step(request, run_id=run)
+        _acknowledge(producer, first['releasedFrames'][0]); second = _message(producer)
+        reset = actor.reset(dict(confirmed=True, episodeID=str(uuid.uuid4()), contextIDs=[]), run_id=run)
+        assert reset['nextPacketSequence'] == reset['nextDrawIndex'] == 1 and reset['actorResetGeneration'] == 2
+        assert 'actorProgress' not in reset
+        key = np.asarray(actor._key).copy(); last_cutoff = actor._last_cutoff
+        warm = actor.warmup(_step(second, reset, cutoff=last_cutoff + 1), run_id=run)
+        assert warm['warmup'] and warm['packet']['sequence'] == 1 and 'collectionRecord' not in warm
+        assert actor._sequence == actor._draw_index == 1 and actor._episode_step == 0
+        assert actor._environment_resets == 2 and actor._state is None and actor._state_id == reset['stateID']
+        assert actor._last_cutoff == last_cutoff
+        np.testing.assert_array_equal(np.asarray(actor._key), key)
+        _acknowledge(producer, warm['releasedFrames'][0]); assert _message(producer)['closed']
+        assert producer.wait(timeout=10) == 0
     finally:
         actor.close()

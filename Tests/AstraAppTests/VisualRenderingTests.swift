@@ -57,6 +57,16 @@ import AstraCore
         .init(name: "Positive feedback", kind: .manualMarker, amount: 1)])
     rewards.success = .init(conditions: [.init(signalID: score.id, comparison: .atLeast, number: 100)])
     try await store.saveRewardProgram(rewards, for: agent.id); agent.rewardProgramID = rewards.id
+    var resetAgent = AgentDocument(name: "Authored environment reset")
+    var resetRewards = rewards; resetRewards.id = UUID(); resetRewards.name = "Return to a verified starting state"
+    resetRewards.ready = .init(conditions: [.init(signalID: score.id, comparison: .atMost, number: 0)])
+    resetRewards.resetPlan = .init(steps: [
+        .init(name: "Confirm the restart dialog", packet: ResetPacketPresets.keyPress(key: 36, modifiers: [55], holdMS: 80)),
+        .init(name: "Click the restart control", packet: ResetPacketPresets.click(surfaceID: "generated-render-fixture")),
+        .init(name: "Allow the environment to settle", pauseMS: 500),
+        .init(name: "Wait for score zero", condition: resetRewards.ready!, timeoutMS: 10_000)])
+    try await store.save(resetAgent); try await store.saveRewardProgram(resetRewards, for: resetAgent.id)
+    resetAgent.rewardProgramID = resetRewards.id
     let interruptedRoot = root.appendingPathComponent("InspectorOnly")
     let interrupted = try makeRenderRecording(root: interruptedRoot, environment: environment,
         issue: "The selected environment changed size while this demonstration was recording. Captured frames and input events were preserved. Review the final interval before including this recording in a training dataset.")
@@ -103,6 +113,12 @@ import AstraCore
                 ("reward-signals", AnyView(RewardEditor(agent: agent, model: model, referenceRecordingID: recording.id))),
                 ("reward-rules", AnyView(RewardEditor(agent: agent, model: model, initialPage: "Rewards"))),
                 ("reward-episode", AnyView(RewardEditor(agent: agent, model: model, initialPage: "Episode"))),
+                ("reset-episode", AnyView(RewardEditor(agent: resetAgent, model: model, initialPage: "Episode", referenceRecordingID: recording.id))),
+                ("reset-click", AnyView(ScrollView {
+                    ResetPlanEditor(plan: .constant(.init(steps: [.init(name: "Restart control", packet: ResetPacketPresets.click(surfaceID: "generated-render-fixture"))])),
+                        signals: resetRewards.signals, referenceSurface: SurfaceDescriptor(id: "generated-render-fixture",
+                            globalBounds: .init(x: 0, y: 0, width: 640, height: 360), pixelWidth: 640, pixelHeight: 360)).padding(24)
+                })),
                 ("reward-rehearse", AnyView(RewardEditor(agent: agent, model: model, initialPage: "Rehearse", referenceRecordingID: recording.id))),
             ]
             for (name, view) in variants where includes(name) {

@@ -162,6 +162,15 @@ struct RewardEditor: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Readiness establishes fresh reward baselines. Reset actions happen outside the policy episode, and all owned controls must be released first.").foregroundStyle(.secondary)
             Stepper("Episode time limit: \(program.maximumEpisodeMS / 1000) seconds", value: $program.maximumEpisodeMS, in: 1000...3_600_000, step: 1000)
+            if program.resetPlan != nil {
+                DisclosureGroup("Reference recording for pointer actions") { sourceChooser }
+            }
+            ResetPlanEditor(plan: $program.resetPlan, signals: program.signals, referenceSurface: preview.preview?.frame.surface)
+                .id(program.id)
+            if program.resetPlan != nil {
+                Text("Authored resets require a starting condition below. This editor saves the plan; it does not execute reset actions.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             predicateSection("Starting condition", value: $program.ready)
             predicateSection("Success", value: $program.success)
             predicateSection("Failure", value: $program.failure)
@@ -224,6 +233,7 @@ struct RewardEditor: View {
     private func isReferenced(_ id: UUID) -> Bool {
         program.rules.contains { $0.signalID == id || $0.predicate?.conditions.contains(where: { $0.signalID == id }) == true }
         || [program.ready, program.success, program.failure].compactMap({ $0 }).contains { $0.conditions.contains { $0.signalID == id } }
+        || program.resetPlan?.steps.contains { $0.condition?.conditions.contains { $0.signalID == id } == true } == true
     }
     private func save() {
         saving = true; issue = nil

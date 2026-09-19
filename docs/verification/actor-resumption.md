@@ -1,0 +1,17 @@
+# Actor progress and physical episode boundaries
+
+September 12, 2026. The source actor can resume a saved external-learning random stream. The complete native desktop orchestrator is still an integration gate.
+
+`inference.prepare` accepts optional `resumeActor: true` only with categorical collection and without a seed. It loads the selected checkpoint normally, then verifies its hashed `training.json` through a bounded, no-follow file descriptor. The external state wrapper must require a new environment reset. Its scalar actor-progress subtree must match the checkpoint's metrics mirror. Optimizer tensors are not loaded or allocated to retrieve this cursor.
+
+The actor restores the exact two-word random key, RNG stream identity, next draw/packet sequence and actor reset generation. The saved run UUID may be rebound to the newly prepared native run; no GRU state, input history, surface binding or old physical world is restored. The actor still requires an explicit confirmed reset before inference. Warmup owns/relinquishes real frame leases while restoring every stream counter and recurrent state.
+
+Collection schema1 requires `packet.sequence == collectionRecord.sampler.drawIndex`. Both advance once for each real policy result, including one later excluded from learning; warmup advances neither. `actorProgress.drawIndex` therefore names the last sampled packet as well as the last stream split. A fresh control helper can admit that persistent sequence through optional `ArmRequest.initialPacketSequence`. Omission retains sequence0 for ordinary runs and reset actions. A nonzero origin requires the helper's `initialPacketSequenceVersion:1` capability before arm; it does not permit rewriting packet UUIDs, command times or sequences.
+
+Successful actor resets clear episode-local event sequence, geometry, surfaces, recent-input features, GRU state and episode step. Global observation replay protection and monotonically increasing cutoffs remain. Only continuing recurrent episodes enforce the prior cutoff plus the policy period; the first observation after a confirmed reset uses nominal elapsed T and may occur sooner. Invalid resets do not revive old recurrence. Exhausted packet/draw/reset counters reject before acquiring another image or sampling.
+
+`.local/actor-resume-tests.log`: **35 source checks passed**, warnings treated as errors, in6.69s. These exercise an actual sampled cursor saved into an integrity-checked checkpoint and restored in a new native ring/run, prohibit optimizer-tensor loading, verify reset/warmup and exact next RNG/packet state, reject a seed or altered metrics mirror before ring acquisition, and stop a near-limit stream before copying or consuming another sample. A reset fixture continues event sequence9 with a fresh helper's sequence0 at old cutoff+1ns, with nominal elapsed T and preserved random stream.
+
+`.local/persistent-lease-tests.log`: **29 focused native checks passed** in1.519s, including nonzero packet origin, duplicate/stale packet rejection, counter exhaustion and decoding older requests without the optional field. Core/schema fixtures prove API behavior; real installed helper and continuous desktop episode checks remain required.
+
+The preceding frozen build passed offline actor, collector, separate PPO update and boundary-cancellation checks before these latest resumption changes. Fresh frozen resumption qualification and native orchestration remain separate gates; source passes do not imply them.

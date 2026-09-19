@@ -38,8 +38,13 @@ public struct ArmRequest: Codable, Hashable, Sendable {
     public var capabilities: ActionCapabilities
     public var packetCapacity: Int
     public var recovery: ControlRecoveryDescriptor?
-    public init(runID: UUID, scope: ControlScope, capabilities: ActionCapabilities, packetCapacity: Int = 16, recovery: ControlRecoveryDescriptor? = nil) {
+    /// A persistent collecting actor retains its packet counter across physical
+    /// episodes. Omission preserves the zero-based standalone/reset protocol.
+    public var initialPacketSequence: UInt64?
+    public init(runID: UUID, scope: ControlScope, capabilities: ActionCapabilities, packetCapacity: Int = 16,
+                recovery: ControlRecoveryDescriptor? = nil, initialPacketSequence: UInt64? = nil) {
         self.runID = runID; self.scope = scope; self.capabilities = capabilities; self.packetCapacity = packetCapacity; self.recovery = recovery
+        self.initialPacketSequence = initialPacketSequence
     }
 }
 
@@ -60,12 +65,13 @@ public struct ControlLease: Sendable {
         _ = try request.scope.validated()
         _ = try request.capabilities.validated()
         guard !request.capabilities.isEmpty, [16, 32, 64].contains(request.packetCapacity),
+              (request.initialPacketSequence ?? 0) < UInt64.max,
               !now.addingReportingOverflow(Self.durationNanos).overflow else {
             throw AstraError("control.configuration", "Select valid action capabilities before starting control.")
         }
         self.request = request
         expiresAtNanos = now + Self.durationNanos
-        nextSequence = 0
+        nextSequence = request.initialPacketSequence ?? 0
     }
 
     public mutating func heartbeat(runID: UUID, now: UInt64) throws {

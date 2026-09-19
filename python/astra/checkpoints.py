@@ -354,3 +354,46 @@ def load_checkpoint(directory: Path, *, include_training: bool = False) -> Loade
         _require_finite(tensors, "Checkpoint has nonfinite training state tensors")
         state = _unpack_state(_read_json(directory / "training.json"), tensors)
     return LoadedCheckpoint(manifest, policy, state)
+
+
+def load_checkpoint_actor_progress(directory: Path, manifest: dict) -> dict:
+    """Read an integrity-checked cursor without allocating optimizer tensors.
+
+    The caller has already loaded this policy with load_checkpoint. The cursor
+    comes from its hashed training artifact, not an arbitrary prepare payload or
+    the unverified display metrics alone. GRU state is never restored here.
+    """
+    from .actor_progress import validate_actor_progress
+    directory = Path(directory)
+    expected = manifest.get('artifacts', {}).get('training.json')
+    if manifest.get('kind') != 'reinforcement' or expected is None or str(uuid.UUID(directory.name)) != manifest.get('id'):
+        raise CheckpointError('This checkpoint has no saved external actor progress')
+    descriptor = os.open(directory / 'training.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or not 0 <= info.st_size <= MAXIMUM_JSON_BYTES:
+            raise CheckpointError('Invalid actor progress artifact extent')
+        data = source.read(MAXIMUM_JSON_BYTES + 1)
+    if len(data) != expected['bytes'] or hashlib.sha256(data).hexdigest() != expected['sha256']:
+        raise CheckpointError('Actor progress artifact integrity verification failed')
+    try:
+        def reject(_):raise ValueError('Nonfinite actor progress')
+        tree = json.loads(data, parse_constant=reject)
+        if type(tree) is not dict or set(tree) != {'dict'} or type(tree['dict']) is not dict:
+            raise ValueError('Invalid external training state tree')
+        fields = tree['dict']
+        required = {'kind', 'schemaVersion', 'learner', 'actorProgress', 'consumedRolloutIDs', 'requiresEnvironmentReset'}
+        if set(fields) != required:
+            raise ValueError('Unsupported external training state')
+        kind = _unpack_state(fields['kind'], {})
+        version = _unpack_state(fields['schemaVersion'], {})
+        reset = _unpack_state(fields['requiresEnvironmentReset'], {})
+        if kind != 'reinforcement_external' or type(version) is not int or version != 1 or reset is not True:
+            raise ValueError('Unsupported external training state')
+        progress = validate_actor_progress(_unpack_state(fields['actorProgress'], {}))
+        mirror = validate_actor_progress(manifest.get('metrics', {}).get('actorProgress'))
+        if progress != mirror:
+            raise ValueError('Checkpoint actor progress differs from its recorded metrics')
+        return progress
+    except (ValueError, TypeError, KeyError, RecursionError) as error:
+        raise CheckpointError(f'Invalid saved actor progress: {error}') from error

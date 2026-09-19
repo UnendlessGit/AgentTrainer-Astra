@@ -112,6 +112,8 @@ def main() -> None:
         str(helpers / "AstraCompute.app/Contents/MacOS/AstraCompute"), "--offline")
     run(sys.executable, str(ROOT / "scripts/check_inference.py"),
         str(helpers / "AstraCompute.app/Contents/MacOS/AstraCompute"), "--offline")
+    run(sys.executable, str(ROOT / "scripts/check_collector.py"),
+        str(helpers / "AstraCompute.app/Contents/MacOS/AstraCompute"), "--offline")
     run(sys.executable, str(ROOT / "scripts/check_control.py"),
         str(control / "Contents/MacOS/AstraControl"))
     if source_information()["sourceInputSHA256"] != source["sourceInputSHA256"]:

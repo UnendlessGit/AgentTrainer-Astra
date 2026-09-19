@@ -32,7 +32,7 @@ from astra.model.config import ModelConfig
 from astra.model.policy import AgentPolicy
 from astra.protocol import Message
 
-JOB_OPERATIONS = ("checkpoint.inspect", "checkpoint.create", "dataset.prepare", "train.behavioral", "evaluate.behavioral", "train.reinforcement")
+JOB_OPERATIONS = ("checkpoint.inspect", "checkpoint.create", "dataset.prepare", "train.behavioral", "evaluate.behavioral", "train.reinforcement", "train.reinforcement.external")
 TERMINAL = {"completed", "cancelled", "failed"}
 
 
@@ -162,6 +162,11 @@ def validate_request(request: Message) -> dict:
             for choice in selection.get("context_ids", []): _integer(choice, high=65535)
         if total_ranges > 100_000:
             raise JobError("job.invalidConfiguration", "Dataset selection exceeds its range budget")
+    elif request.kind == "train.reinforcement.external":
+        _object(value,("checkpointPath","rolloutPath","destination","resume","boundaryTimeoutSeconds"),
+                ("checkpointPath","rolloutPath","destination"))
+        _path(value["checkpointPath"]);_path(value["rolloutPath"]);_path(value["destination"],destination=True)
+        _boolean(value.get("resume",False));_integer(value.get("boundaryTimeoutSeconds",60),1,600)
     elif request.kind == "train.reinforcement":
         _object(value, ("checkpointPath", "environment", "training", "iterations", "destination", "resume", "contextIDs"),
                 ("checkpointPath", "environment", "training", "iterations", "destination"))
@@ -212,6 +217,8 @@ class _Job:
     metrics: dict = field(default_factory=dict)
     result: dict | None = None
     error: dict | None = None
+    external_boundary_path: str | None = None
+    external_boundary_event: threading.Event = field(default_factory=threading.Event)
 
     def snapshot(self):
         return copy.deepcopy({"jobID": self.identifier, "runID": self.request.run_id, "operation": self.request.kind,
@@ -258,6 +265,19 @@ class JobManager:
             if identifier not in self._jobs:
                 raise JobError("job.notFound", "Job is no longer in this worker's bounded status history")
             return self._jobs[identifier].snapshot()
+
+    def external_boundary(self,request):
+        _object(request.payload,("jobID","auditPath"),("jobID","auditPath"))
+        _path(request.payload["auditPath"])
+        with self._lock:
+            job=self._jobs.get(str(uuid.UUID(request.payload["jobID"])))
+            if job is None or job.request.kind!="train.reinforcement.external" or request.run_id is None or uuid.UUID(request.run_id)!=uuid.UUID(job.request.run_id):
+                raise JobError("job.boundaryMismatch","External boundary belongs to another job/run")
+            if job.status in TERMINAL or job.metrics.get("phase")!="waiting_for_actor_boundary" or job.external_boundary_path is not None:
+                raise JobError("job.boundaryState","The learner is not waiting for its first actor boundary proof")
+            job.external_boundary_path=request.payload["auditPath"]
+            self._send("ack",{"jobID":job.identifier,"status":"boundary_queued"},request=request)
+            job.external_boundary_event.set()
 
     def cancel(self, identifier: str, *, run_id: str | None = None):
         with self._lock:
@@ -372,6 +392,9 @@ class JobManager:
                                      pointer_mode=value["pointerMode"], split_seed=value.get("splitSeed", 0), cancelled=job.cancel.is_set)
             return {"datasetPath": value["destination"], "manifest": manifest, "provenance": "recorded_demonstrations"}
         loaded = load_checkpoint(Path(value["checkpointPath"]), include_training=value.get("resume", False))
+        if operation == "train.reinforcement.external":
+            from astra.learning.external_job import run_external_job
+            return run_external_job(self,job,loaded)
         if operation == "train.reinforcement":
             return self._reinforcement(job, loaded)
         if operation == "train.behavioral":

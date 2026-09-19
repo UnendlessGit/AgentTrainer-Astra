@@ -414,7 +414,7 @@ extension LearningStatus {
     }
 }
 
-private enum KeyNames {
+enum KeyNames {
     static func button(_ code: Int) -> String { code == 0 ? "Left mouse" : code == 1 ? "Right mouse" : code == 2 ? "Middle mouse" : "Mouse \(code + 1)" }
     static func name(_ code: Int) -> String {
         let names = [0:"A", 1:"S", 2:"D", 3:"F", 4:"H", 5:"G", 6:"Z", 7:"X", 8:"C", 9:"V", 11:"B", 12:"Q", 13:"W", 14:"E", 15:"R", 16:"Y", 17:"T",

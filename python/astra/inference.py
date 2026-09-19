@@ -18,7 +18,7 @@ import uuid
 import mlx.core as mx
 import numpy as np
 
-from astra.checkpoints import load_checkpoint
+from astra.checkpoints import load_checkpoint, load_checkpoint_actor_progress
 from astra.data.actions import decode_commands
 from astra.data.observations import make_observation
 from astra.data.preprocessing import MEAN, STD
@@ -302,35 +302,46 @@ class InferenceSession:
         self._assert_owner()
         if self._reader is not None:
             raise InferenceError("inference.active", "Close this actor run before preparing another stream")
-        _fields(payload, ("checkpointPath", "ring"), ("seed", "deterministic", "collection"))
+        _fields(payload, ("checkpointPath", "ring"), ("seed", "deterministic", "collection", "resumeActor"))
         _fields(payload["ring"], ("path", "ringID"))
         run_id = _uuid(run_id)
         ring_id = _uuid(payload["ring"]["ringID"])
         seed = _uint(payload.get("seed", 0))
         deterministic = payload.get("deterministic", True)
         collection = payload.get("collection", False)
-        if type(deterministic) is not bool or type(collection) is not bool:
+        resume = payload.get("resumeActor", False)
+        if type(deterministic) is not bool or type(collection) is not bool or type(resume) is not bool:
             raise InferenceError("inference.configuration", "Inference mode must be Boolean")
         if collection and deterministic:
             raise InferenceError("inference.collectionMode", "On-policy collection requires categorical sampling, not greedy actions")
+        if resume and (not collection or 'seed' in payload):
+            raise InferenceError("inference.resumeMode", "Actor resumption requires categorical collection and cannot replace its saved random stream with a seed")
         checkpoint = load_checkpoint(_path(payload["checkpointPath"]))
+        progress = load_checkpoint_actor_progress(_path(payload['checkpointPath']), checkpoint.manifest) if resume else None
+        if progress is not None and (progress['drawIndex'] >= 2**64 - 2 or progress['actorResetGeneration'] >= 2**64 - 1):
+            raise InferenceError('inference.counterExhausted', 'The saved actor stream has exhausted its sequence or reset counters')
         if checkpoint.policy.config.control_width != 178:
             raise InferenceError("inference.configuration", "This actor requires the version-one observed-control feature layout")
         reader = FrameRingReader(_path(payload["ring"]["path"]), run_id=run_id, ring_id=ring_id)
         try:
             checkpoint.policy.eval()
-            key = mx.random.key(seed)
+            key = mx.array(progress['rngState'], dtype=mx.uint32) if progress is not None else mx.random.key(seed)
         except BaseException:
             reader.close()
             raise
         self._reader, self._checkpoint, self._run_id, self._key = reader, checkpoint, run_id, key
         self._deterministic = deterministic
         self._collection = collection
-        self._rng_stream_id = str(uuid.uuid4())
+        self._rng_stream_id = str(uuid.UUID(progress['rngStreamID'])) if progress is not None else str(uuid.uuid4())
+        if progress is not None:
+            self._sequence = self._draw_index = progress['drawIndex'] + 1
+            self._environment_resets = progress['actorResetGeneration']
         self._execution = _PolicyExecution(checkpoint.policy, greedy=deterministic)
         return {**self._identity(), "model": checkpoint.manifest["model"], "actions": checkpoint.manifest["actions"],
                 "ringID": ring_id, "deterministic": deterministic, "collection": collection,
-                "collectionVersion": 1 if collection else None, "rngStreamID": self._rng_stream_id if collection else None}
+                "collectionVersion": 1 if collection else None, "rngStreamID": self._rng_stream_id if collection else None,
+                "resumedActor": resume, "nextPacketSequence": self._sequence, "nextDrawIndex": self._draw_index,
+                "actorResetGeneration": self._environment_resets}
 
     def _run(self, run_id):
         self._assert_owner()
@@ -345,6 +356,8 @@ class InferenceSession:
         episode_id = _uuid(payload["episodeID"])
         if episode_id == self._episode_id:
             raise InferenceError("inference.episode", "Each confirmed environment reset requires a new episode identity")
+        if self._environment_resets >= 2**64 - 1:
+            raise InferenceError('inference.counterExhausted', 'The actor reset counter is exhausted')
         # The coordinator says the environment has reset. If replacement
         # configuration/loading fails, old recurrent state must stay unusable
         # until a valid reset is committed, even though old weights are retained.
@@ -370,19 +383,21 @@ class InferenceSession:
         self._checkpoint, self._episode_id, self._contexts, self._key = checkpoint, episode_id, tuple(contexts), key
         self._state, self._state_id, self._needs_reset = None, str(uuid.uuid4()), False
         self._last_input_nanos = None
+        self._last_event_sequence = self._geometry_revision = self._surfaces = None
         self._episode_step = 0
         self._environment_resets += 1
-        return self._identity()
+        return {**self._identity(), "nextPacketSequence": self._sequence, "nextDrawIndex": self._draw_index,
+                "actorResetGeneration": self._environment_resets}
 
     def warmup(self, payload, *, run_id):
         """Exercise the exact observation/action path without advancing actor state.
 
         Frame leases really are ingested and consumed; they are never restored
-        or acknowledged twice. This operation is available only before a run's
-        first real decision, while the native coordinator has no armed controls.
+        or acknowledged twice. This operation is available only before an episode's
+        first real decision, while the native owner has no armed controls.
         """
         self._run(run_id)
-        already_started = (self._episode_step != 0 or self._state is not None) if self._collection else (self._sequence != 0 or self._last_cutoff is not None)
+        already_started = self._episode_step != 0 or self._state is not None
         if already_started:
             raise InferenceError("inference.warmupActive", "Warmup must finish before the first real actor decision")
         fields = ("_state", "_state_id", "_episode_id", "_key", "_last_cutoff", "_last_event_sequence",
@@ -413,10 +428,12 @@ class InferenceSession:
         if observation_id in self._observations or (self._last_cutoff is not None and cutoff <= self._last_cutoff):
             raise InferenceError("inference.staleObservation", "Observation identity/time has already been consumed")
         config = self._checkpoint.policy.config
-        if self._last_cutoff is not None and cutoff < self._last_cutoff + config.period_ms * 1_000_000:
+        if self._state is not None and self._last_cutoff is not None and cutoff < self._last_cutoff + config.period_ms * 1_000_000:
             raise InferenceError("inference.timing", "Decision intervals cannot overlap the immutable policy cadence")
         _uint(self._sequence)
         _uint(self._draw_index); _uint(self._episode_step); _uint(self._environment_resets)
+        if self._sequence >= 2**64 - 1 or self._draw_index >= 2**64 - 1:
+            raise InferenceError('inference.counterExhausted', 'The actor has no packet sequence available for native admission')
         if cutoff + (config.lead_ms + config.period_ms) * 1_000_000 > 2**64 - 1:
             raise InferenceError("inference.timing", "The action interval exceeds the monotonic clock range")
         if self._geometry_revision is not None and geometry < self._geometry_revision:

@@ -21,6 +21,14 @@ private actor InferenceHarness {
     var actorExitWaiting = false
     var guardianRecoveryWaiting = false
     var recoveryLedger: ControlRecoveryLedger?
+    var guardianProcess: Process?
+    var guardianInput: Pipe?
+    var controlArmed = false
+    var controlRun: UUID?
+    var admissionWaiting = false
+    var suspendedAdmission: (ActionPacket, UUID, CheckedContinuation<WireMessage, any Error>)?
+    var pendingControlPackets: [(ActionPacket, UUID)] = []
+    var oldControlCallbacks: [(UUID, ComputeProcess.EventHandler)] = []
     var ringPath: String?
     var references: [SharedFrameReference] = []
     var sequence: UInt64 = 0
@@ -62,17 +70,21 @@ private actor InferenceHarness {
     func stopCapture() { captureStopped = true }
     func start(_ role: String, events: @escaping ComputeProcess.EventHandler, failure: @escaping ComputeProcess.FailureHandler) -> WireMessage {
         requests.append(role + ".start")
-        if role == "control" { self.events = events }
-        else { self.failure = failure }
+        if role == "control" {
+            if let previous = self.events, let run = controlRun { oldControlCallbacks.append((run, previous)) }
+            self.events = events; controlExited = false
+        } else { self.failure = failure; actorExited = false }
         var payload: [String: JSONValue] = ["role": .string(mode == "wrongRuntime" && role == "actor" ? "compute" : role), "protocolVersion": .integer(1)]
+        if role == "control" { payload["initialPacketSequenceVersion"] = .integer(1) }
         if role == "control", mode == "protectedGuardianRecovery" { payload["recoveryVersion"] = .integer(1) }
         return WireMessage(kind: "hello", sequence: 0, payload: .object(payload))
     }
-    func ack(_ payload: JSONValue = .object([:]), run: UUID) -> WireMessage {
-        WireMessage(kind: "ack", sequence: 1, requestID: UUID(), runID: run, payload: payload)
+    func ack(_ payload: JSONValue = .object([:]), run: UUID, requestID: UUID = UUID()) -> WireMessage {
+        WireMessage(kind: "ack", sequence: 1, requestID: requestID, runID: run, payload: payload)
     }
     func request(_ role: String, _ kind: String, _ payload: JSONValue, _ run: UUID) async throws -> WireMessage {
         requests.append(kind); currentRun = run
+        let requestID = UUID()
         switch kind {
         case "inference.prepare":
             sequence = 0
@@ -139,10 +151,25 @@ private actor InferenceHarness {
             else { sequence += 1; stateID = nextState }
             return ack(.object(fields), run: run)
         case "arm":
+            controlRun = run
+            if ["armTakeoverEvent", "armEmergencyEvent", "armTakeoverError", "armEmergencyError"].contains(mode) {
+                let cause = mode.contains("Emergency") ? "emergencyStop" : "physicalTakeover"
+                if mode.hasSuffix("Event") {
+                    events?(WireMessage(kind: "control.stopped", sequence: 1, runID: run,
+                        payload: .object(["cause": .string(cause), "reason": .string("Pre-arm intervention.")])))
+                }
+                return WireMessage(kind: "error", sequence: 2, requestID: requestID, runID: run,
+                    payload: .object(["code": .string(mode.hasSuffix("Event") ? "control.cancelled" : "control." + cause),
+                                      "message": .string("Pre-arm intervention."), "recoverable": .bool(true)]))
+            }
             if mode == "protectedGuardianRecovery" {
                 let request = try payload.decode(ArmRequest.self)
                 let ledger = try ControlRecoveryLedger(open: #require(request.recovery))
-                guard ledger.registerExecutor(pid: getpid()), ledger.registerGuardian(pid: getpid(), now: MonotonicClock.now), ledger.arm() else {
+                let guardian = Process(), input = Pipe()
+                guardian.executableURL = URL(fileURLWithPath: "/bin/cat")
+                guardian.standardInput = input; guardian.standardOutput = FileHandle.nullDevice; guardian.standardError = FileHandle.nullDevice
+                try guardian.run(); guardianProcess = guardian; guardianInput = input
+                guard ledger.registerExecutor(pid: getpid()), ledger.registerGuardian(pid: guardian.processIdentifier, now: MonotonicClock.now), ledger.arm() else {
                     throw AstraError("fixture.recovery", "The virtual recovery interface did not arm.")
                 }
                 recoveryLedger = ledger
@@ -151,10 +178,18 @@ private actor InferenceHarness {
                 armWaiting = true
                 return try await withCheckedThrowingContinuation { suspendedArm = $0 }
             }
-            if let recoveryLedger {
-                return ack(.object(["armed": .bool(true), "recoveryLedgerID": .string(recoveryLedger.descriptor.ledgerID.uuidString), "guardianPID": .integer(Int64(getpid()))]), run: run)
+            controlArmed = true
+            if let recoveryLedger, let guardianProcess {
+                return ack(.object(["armed": .bool(true), "nextPacketSequence": .integer(0), "recoveryLedgerID": .string(recoveryLedger.descriptor.ledgerID.uuidString), "guardianPID": .integer(Int64(guardianProcess.processIdentifier))]), run: run, requestID: requestID)
             }
-            return ack(.object(["armed": .bool(true)]), run: run)
+            return ack(.object(["armed": .bool(true), "nextPacketSequence": .integer(0)]), run: run, requestID: requestID)
+        case "disarm":
+            controlArmed = false
+            if mode != "receiptOnShutdown" {
+                for (packet, id) in pendingControlPackets { try emitReceipt(packet, requestID: id, status: .cancelled) }
+                pendingControlPackets = []
+            }
+            return ack(.object(["stopped": .bool(true), "cleanupSettled": .bool(mode != "protectedGuardianRecovery")]), run: run, requestID: requestID)
         case "observation":
             let now = MonotonicClock.now
             var controls = ControlState(); controls.valid = true; controls.observedNanos = now
@@ -163,33 +198,68 @@ private actor InferenceHarness {
                        run: mode == "wrongControlRun" ? UUID() : run)
         case "execute":
             let packet = try payload.decode(ActionPacket.self)
+            if mode == "blockedAdmission" {
+                admissionWaiting = true
+                return try await withCheckedThrowingContinuation { suspendedAdmission = (packet, requestID, $0) }
+            }
             if let recoveryLedger {
                 guard recoveryLedger.beginPost(operation: .keyDown, keyCode: 0, button: nil) else { throw AstraError("fixture.recovery", "The virtual reservation was rejected.") }
                 recoveryLedger.endPost(operation: .keyDown, keyCode: 0, button: nil, success: true)
             }
-            var controls = ControlState(); controls.valid = true
-            let results = packet.commands.enumerated().map { index, command in
-                CommandResult(commandIndex: index, scheduledNanos: packet.executeAtNanos + UInt64(command.offsetMs) * 1_000_000,
-                              postedNanos: packet.executeAtNanos, status: .posted)
-            }
-            var receipt = ExecutionReceipt(packet: packet, status: .executed, observedNanos: packet.executeAtNanos + 100_000_000,
-                                            commandResults: mode == "partialReceipt" ? [] : results, resultingState: controls)
-            if mode == "wrongReceipt" { receipt.sequence += 1 }
-            events?(WireMessage(kind: "control.receipt", sequence: 1, runID: run, payload: .object(["receipt": try .encode(receipt)])))
-            if mode == "takeover" {
+            if mode == "delayedReceipt" || mode == "receiptOnShutdown" {
+                pendingControlPackets.append((packet, requestID))
+                try emitReceipt(packet, requestID: requestID, status: .admitted)
+            } else { try emitReceipt(packet, requestID: requestID, status: .executed) }
+            if mode == "takeover" || mode == "emergency" {
                 events?(WireMessage(kind: "control.stopped", sequence: 2, runID: run,
-                                    payload: .object(["cause": .string("physicalTakeover"), "reason": .string("Physical input took over.")])))
+                    payload: .object(["cause": .string(mode == "takeover" ? "physicalTakeover" : "emergencyStop"),
+                                      "reason": .string(mode == "takeover" ? "Physical input took over." : "Emergency stop pressed.")])))
             }
-            return ack(.object(["admitted": .bool(true)]), run: run)
+            return ack(.object(["admitted": .bool(true)]), run: run, requestID: requestID)
         default: return ack(run: run)
         }
     }
+    private func emitReceipt(_ packet: ActionPacket, requestID: UUID, status: ReceiptStatus) throws {
+        var controls = ControlState(); controls.valid = true
+        let results: [CommandResult] = status == .executed ? packet.commands.enumerated().map { index, command in
+            CommandResult(commandIndex: index, scheduledNanos: packet.executeAtNanos + UInt64(command.offsetMs) * 1_000_000,
+                          postedNanos: packet.executeAtNanos, status: .posted)
+        } : []
+        var receipt = ExecutionReceipt(packet: packet, status: status, observedNanos: packet.executeAtNanos + 100_000_000,
+            commandResults: mode == "partialReceipt" ? [] : results, resultingState: controls)
+        if mode == "wrongReceipt" { receipt.sequence += 1 }
+        events?(WireMessage(kind: "control.receipt", sequence: 1, requestID: requestID, runID: packet.runID,
+                            payload: .object(["receipt": try .encode(receipt)])))
+    }
+    func completePendingReceipts() throws {
+        for (packet, id) in pendingControlPackets { try emitReceipt(packet, requestID: id, status: .executed) }
+        pendingControlPackets = []
+    }
+    func emitOldControlFaults() {
+        for (run, callback) in oldControlCallbacks {
+            callback(WireMessage(kind: "control.stopped", sequence: 9, runID: run,
+                payload: .object(["cause": .string("fault"), "reason": .string("Old control callback escaped") ])))
+        }
+    }
+    func rejectSuspendedAdmission() throws {
+        guard let (packet, request, continuation) = suspendedAdmission else { return }
+        suspendedAdmission = nil
+        #expect(!controlArmed)
+        try emitReceipt(packet, requestID: request, status: .rejected)
+        continuation.resume(returning: WireMessage(kind: "error", sequence: 2, requestID: request, runID: packet.runID,
+            payload: .object(["code": .string("control.session"), "message": .string("The helper is disarmed."), "recoverable": .bool(true)])))
+    }
     func resumeArm() {
-        if let suspendedArm, let currentRun { self.suspendedArm = nil; suspendedArm.resume(returning: ack(.object(["armed": .bool(true)]), run: currentRun)) }
+        if let suspendedArm, let currentRun { self.suspendedArm = nil; controlArmed = true; suspendedArm.resume(returning: ack(.object(["armed": .bool(true), "nextPacketSequence": .integer(0)]), run: currentRun)) }
     }
     func resumeExit() { suspendedExit?.resume(); suspendedExit = nil }
-    func completeGuardianRecovery() {
+    func settleGuardianRecovery() {
         recoveryLedger?.releaseKey(0); recoveryLedger?.settleGuardian(now: MonotonicClock.now)
+    }
+    func exitGuardian() async {
+        try? guardianInput?.fileHandleForWriting.close()
+        while guardianProcess?.isRunning == true { try? await Task.sleep(for: .milliseconds(5)) }
+        guardianInput = nil; guardianProcess = nil
     }
     func shutdown(_ role: String) async -> Int32? {
         requests.append(role + ".shutdown")
@@ -201,6 +271,7 @@ private actor InferenceHarness {
             }
             actorExited = true
         } else {
+            if mode == "receiptOnShutdown" { try? completePendingReceipts() }
             if collecting, let currentRun {
                 events?(WireMessage(kind: "control.stopped", sequence: 3, runID: currentRun,
                                     payload: .object(["cause": .string("shutdown"), "reason": .string("Fixture finalized control") ])))
@@ -225,6 +296,7 @@ private final class CollectionSpy: @unchecked Sendable {
     var rejectObservations = false
     var failFinish = false
     var rejectShutdownEvidence = false
+    var rejectExecutedEvidence = false
     var events: [InferenceCollectionEvent] { lock.withLock { values } }
     var completed: Bool { lock.withLock { closed } }
     var lateEvent: Bool { lock.withLock { seenLateEvent } }
@@ -233,6 +305,10 @@ private final class CollectionSpy: @unchecked Sendable {
             try lock.withLock {
                 if closed { seenLateEvent = true }
                 if rejectObservations, case .observation = event { throw AstraError("collector.full", "Fixture collector capacity is full") }
+                if rejectExecutedEvidence, case .control(let message) = event,
+                   let payload = message.payload.fields?["receipt"], let receipt = try? payload.decode(ExecutionReceipt.self), receipt.status == .executed {
+                    throw AstraError("collector.full", "Fixture could not retain terminal execution evidence")
+                }
                 if rejectShutdownEvidence, case .control(let message) = event, message.kind == "control.stopped" {
                     throw AstraError("collector.closed", "Fixture collector could not retain final control evidence")
                 }
@@ -336,8 +412,23 @@ private final class CollectionSpy: @unchecked Sendable {
         await test.coordinator.stopAndWait()
         let result = try await LearningFiles.read(#require(test.coordinator.resultsURL))
         #expect(result.fields?["status"] == .string("failed"))
-        #expect(result.fields?["issue"]?.text?.contains("lost control evidence") == true)
+        #expect(result.fields?["issue"]?.text?.contains("Collection evidence is incomplete") == true)
         #expect(test.coordinator.cleanupConfirmed && spy.completed)
+    }
+
+    @Test func stoppingInFlightCollectionNeverClaimsVerifiedActorProgress() async throws {
+        let test = try await InferenceTestCase(mode: "blockedActor"), spy = CollectionSpy()
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: spy.sink())
+        try await test.wait { await test.harness.stepWaiting }
+        let stopping = Task { await test.coordinator.stopAndWait() }
+        try await test.wait { await test.harness.actorExitWaiting }
+        await test.harness.resumeExit(); await stopping.value
+        let result = try await LearningFiles.read(#require(test.coordinator.resultsURL))
+        #expect(result.fields?["status"] == .string("failed"))
+        #expect(result.fields?["issue"]?.text?.contains("random-stream progress is unverified") == true)
+        #expect(test.coordinator.cleanupConfirmed && spy.completed)
+        #expect(await test.harness.allClosed)
     }
 
     @Test func successfulRunWarmsWithoutControlAndReleasesResources() async throws {
@@ -424,11 +515,12 @@ private final class CollectionSpy: @unchecked Sendable {
         #expect(await !test.harness.requests.contains("execute"))
     }
 
-    @Test func physicalTakeoverIsAnInterventionRatherThanAnActorFailure() async throws {
-        let test = try await InferenceTestCase(mode: "takeover")
+    @Test(arguments: ["takeover", "emergency"])
+    func physicalTakeoverIsAnInterventionRatherThanAnActorFailure(mode: String) async throws {
+        let test = try await InferenceTestCase(mode: mode)
         try test.start(); try await test.wait { !test.coordinator.isBusy }
         #expect(test.coordinator.failure == nil)
-        #expect(test.coordinator.stopReason == "Physical input took over.")
+        #expect(test.coordinator.stopReason == (mode == "takeover" ? "Physical input took over." : "Emergency stop pressed."))
     }
 
     @Test func controlCrashDuringShutdownDoesNotClaimOwnedInputsWereReleased() async throws {
@@ -461,10 +553,103 @@ private final class CollectionSpy: @unchecked Sendable {
         try await test.wait { await test.harness.guardianRecoveryWaiting }
         #expect(test.coordinator.isBusy && !test.coordinator.cleanupConfirmed)
         #expect(test.coordinator.resultsURL == nil)
-        await test.harness.completeGuardianRecovery()
+        await test.harness.settleGuardianRecovery()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(test.coordinator.isBusy && !test.coordinator.cleanupConfirmed && test.coordinator.resultsURL == nil)
+        await test.harness.exitGuardian()
         await stop.value
         #expect(!test.coordinator.isBusy && test.coordinator.cleanupConfirmed && test.coordinator.cleanupRecoveredByGuardian)
         let result = try await LearningFiles.read(try #require(test.coordinator.resultsURL))
         #expect(result.fields?["cleanupRecoveredByGuardian"] == .bool(true))
     }
+    @Test func actorDecisionsContinueAfterAdmissionBeforeTerminalControlReceipts() async throws {
+        let test = try await InferenceTestCase(mode: "delayedReceipt")
+        try test.start(); try await test.wait { test.coordinator.decisions >= 2 }
+        #expect(test.coordinator.executedPackets == 0 && test.coordinator.isBusy)
+        try await test.harness.completePendingReceipts()
+        try await test.wait { test.coordinator.executedPackets >= 2 }
+        await test.coordinator.stopAndWait()
+        #expect(test.coordinator.failure == nil && test.coordinator.cleanupConfirmed)
+    }
+
+    @Test func manualCleanupAcknowledgementUnlocksFutureRunsWithoutRewritingTheOldProof() async throws {
+        let test = try await InferenceTestCase(mode: "controlCrashOnShutdown")
+        try test.start(); try await test.wait { test.coordinator.executedPackets >= 1 }
+        await test.coordinator.stopAndWait()
+        let original = try #require(test.coordinator.resultsURL)
+        #expect(throws: AstraError.self) { try test.start() }
+        #expect(test.coordinator.requiresManualControlCleanupAcknowledgement)
+        try test.coordinator.acknowledgeManualControlCleanup()
+        #expect(!test.coordinator.cleanupConfirmed && !test.coordinator.requiresManualControlCleanupAcknowledgement)
+        let summary = try await LearningFiles.read(original)
+        #expect(summary.fields?["cleanupConfirmed"] == .bool(false))
+        try test.start(); try await test.wait { test.coordinator.executedPackets >= 1 }
+        await test.coordinator.stopAndWait()
+        #expect(await test.harness.requests.filter { $0 == "control.start" }.count == 2)
+    }
+
+    @Test func previousControlCallbacksCannotStopTheNextRunOrReopenTheOldCollection() async throws {
+        let test = try await InferenceTestCase(mode: "success"), first = CollectionSpy(), second = CollectionSpy()
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: first.sink())
+        try await test.wait { test.coordinator.executedPackets >= 1 }
+        await test.coordinator.stopAndWait()
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: second.sink())
+        try await test.wait { test.coordinator.executedPackets >= 1 }
+        await test.harness.emitOldControlFaults()
+        try await test.wait { test.coordinator.executedPackets >= 2 }
+        #expect(test.coordinator.isBusy && test.coordinator.failure == nil && !first.lateEvent)
+        await test.coordinator.stopAndWait()
+        #expect(second.completed && !second.lateEvent && test.coordinator.failure == nil)
+    }
+
+    @Test func stoppingAnAlreadyForwardedPacketRetainsRealRejectionWithoutReportingAFault() async throws {
+        let test = try await InferenceTestCase(mode: "blockedAdmission"), spy = CollectionSpy()
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: spy.sink())
+        try await test.wait { await test.harness.admissionWaiting }
+        let stop = Task { await test.coordinator.stopAndWait() }
+        try await test.wait { await test.harness.requests.contains("disarm") }
+        try await test.harness.rejectSuspendedAdmission()
+        await stop.value
+        #expect(test.coordinator.failure == nil && test.coordinator.cleanupConfirmed && spy.completed)
+        #expect(spy.events.contains { event in
+            if case .control(let message) = event, let payload = message.payload.fields?["receipt"],
+               let receipt = try? payload.decode(ExecutionReceipt.self) { return receipt.status == .rejected }
+            return false
+        })
+    }
+
+    @Test(arguments: ["armTakeoverEvent", "armEmergencyEvent", "armTakeoverError", "armEmergencyError"])
+    func interventionDuringArmingRetainsRunIdentityAndDoesNotFailCollection(mode: String) async throws {
+        let test = try await InferenceTestCase(mode: mode), spy = CollectionSpy()
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: spy.sink())
+        try await test.wait { !test.coordinator.isBusy }
+        #expect(test.coordinator.failure == nil && test.coordinator.stopReason == "Pre-arm intervention.")
+        #expect(test.coordinator.cleanupConfirmed && spy.completed && !spy.lateEvent)
+        #expect(!(await test.harness.requests).contains("execute"))
+        if mode.hasSuffix("Event") {
+            #expect(spy.events.contains { event in
+                if case .control(let message) = event { return message.kind == "control.stopped" && message.runID == test.coordinator.runID }
+                return false
+            })
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func closingExecutionReceiptsCountEvenAfterStopOrAnAuditFailure(rejectAudit: Bool) async throws {
+        let test = try await InferenceTestCase(mode: "receiptOnShutdown"), spy = CollectionSpy()
+        spy.rejectExecutedEvidence = rejectAudit
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: spy.sink())
+        try await test.wait { test.coordinator.decisions >= 1 }
+        #expect(test.coordinator.executedPackets == 0)
+        await test.coordinator.stopAndWait()
+        #expect(test.coordinator.executedPackets >= 1 && test.coordinator.cleanupConfirmed && spy.completed)
+        #expect((test.coordinator.failure != nil) == rejectAudit)
+        let summary = try await LearningFiles.read(#require(test.coordinator.resultsURL))
+        #expect(summary.fields?["executedPackets"]?.int == test.coordinator.executedPackets)
+    }
+
 }

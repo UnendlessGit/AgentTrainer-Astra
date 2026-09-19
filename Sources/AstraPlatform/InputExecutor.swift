@@ -105,6 +105,7 @@ public final class InputExecutor: @unchecked Sendable {
     private var inFlightPacketID: UUID?
     private var arming = false
     private var armingRunID: UUID?
+    private var interruptionRunID: UUID?
     private var cleaning = 0
     private var lastEnd: UInt64 = 0
     private var interruption: String?
@@ -144,6 +145,7 @@ public final class InputExecutor: @unchecked Sendable {
         }
     }
     public var currentRunID: UUID? { lock.withLock { lease.request?.runID } }
+    public var nextPacketSequence: UInt64 { lock.withLock { lease.nextSequence } }
     /// Disarm invalidates admission immediately. Settlement additionally proves
     /// every possibly posted hold was released or transferred to a physical hold.
     public var cleanupSettled: Bool {
@@ -261,6 +263,7 @@ public final class InputExecutor: @unchecked Sendable {
             if let runID, lease.request?.runID != runID && armingRunID != runID { return nil }
             guard interruption == nil else { return nil }
             recovery?.stop()
+            interruptionRunID = lease.request?.runID ?? armingRunID
             interruption = reason; interruptionCause = cause; epoch &+= 1; return epoch
         }
         if let generation { stopQueue.async { [weak self] in self?.disarm(reason: reason, cause: cause, expectedGeneration: generation) } }
@@ -274,9 +277,9 @@ public final class InputExecutor: @unchecked Sendable {
             if let expectedGeneration, epoch != expectedGeneration { return nil }
             epoch &+= 1
             let finalReason = interruption ?? reason, finalCause = interruptionCause ?? cause
-            interruption = nil; interruptionCause = nil
-            let active = lease.request != nil || arming || driving
-            let runID = lease.request?.runID
+            let runID = lease.request?.runID ?? armingRunID ?? interruptionRunID
+            let active = lease.request != nil || arming || driving || interruptionRunID != nil
+            interruption = nil; interruptionCause = nil; interruptionRunID = nil
             lease.disarm(); scheduled.removeAll(); observed.valid = false
             recovery?.stop()
             let keys = ownedKeys, buttons = ownedButtons

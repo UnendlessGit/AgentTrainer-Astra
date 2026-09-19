@@ -133,6 +133,11 @@ def requests(stream, output_failed):
 
 
 def capabilities(role="compute") -> dict:
+    if role == "collector":
+        from astra.collector import COLLECTOR_OPERATIONS
+        return {"role":"collector","protocolVersion":1,"runtimeVersion":__version__,
+            "capabilities":["capabilities","ping","shutdown",*COLLECTOR_OPERATIONS],
+            "pythonVersion":platform.python_version(),"collectionVersion":1}
     if role == "actor":
         from astra.inference import INFERENCE_OPERATIONS
         # Liveness/control never enters the actor's MLX owner thread. Device
@@ -142,7 +147,7 @@ def capabilities(role="compute") -> dict:
                 "pythonVersion": platform.python_version()}
     return {
         "role": "compute", "protocolVersion": 1, "runtimeVersion": __version__,
-        "capabilities": ["capabilities", "ping", "shutdown", "diagnose", *JOB_OPERATIONS, "cancel", "job.status"],
+        "capabilities": ["capabilities", "ping", "shutdown", "diagnose", *JOB_OPERATIONS, "cancel", "job.status", "job.externalBoundary"],
         "pythonVersion": platform.python_version(), "metalAvailable": mx.metal.is_available(),
         "device": mx.device_info(),
     }
@@ -166,6 +171,9 @@ def serve(role="compute") -> int:
     if role == "actor":
         from astra.inference import INFERENCE_OPERATIONS, InferenceManager
         manager = InferenceManager(sender.send)
+    elif role == "collector":
+        from astra.collector import COLLECTOR_OPERATIONS, CollectorManager
+        manager = CollectorManager(sender.send)
     else:
         manager = JobManager(sender.send)
     exit_code = 0
@@ -183,11 +191,15 @@ def serve(role="compute") -> int:
                     if request.payload: raise JobError("job.invalidConfiguration", "This operation requires an empty payload")
                     if request.kind == "ping": sender.send("ack", {"alive": True, "busy": manager.busy}, request=request)
                     elif request.kind == "capabilities": sender.send("ack", capabilities(role), request=request)
-                    elif role == "actor": raise JobError("protocol.unsupportedOperation", "Diagnostics are available in the compute role")
+                    elif role != "compute": raise JobError("protocol.unsupportedOperation", "Diagnostics are available in the compute role")
                     elif manager.busy: raise JobError("job.busy", "Diagnostics require an idle compute role")
                     else: sender.send("ack", diagnose(), request=request)
                 elif role == "actor" and request.kind in INFERENCE_OPERATIONS:
                     manager.submit(request)
+                elif role == "collector" and request.kind in COLLECTOR_OPERATIONS:
+                    manager.submit(request)
+                elif role == "compute" and request.kind == "job.externalBoundary":
+                    manager.external_boundary(request)
                 elif role == "compute" and request.kind in JOB_OPERATIONS:
                     manager.submit(request)
                 elif role == "compute" and request.kind in ("cancel", "job.status"):
@@ -215,7 +227,7 @@ def serve(role="compute") -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="AgentTrainer Astra local compute worker")
     parser.add_argument("--diagnose", action="store_true")
-    parser.add_argument("--role", choices=("compute", "actor"), default="compute")
+    parser.add_argument("--role", choices=("compute", "actor", "collector"), default="compute")
     args = parser.parse_args()
     if args.diagnose:
         if args.role != "compute": parser.error("--diagnose requires the compute role")

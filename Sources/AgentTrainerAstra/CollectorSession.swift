@@ -50,6 +50,7 @@ final class CollectorSession: @unchecked Sendable {
     private let completion = AsyncCompletion()
     private let finishLock = NSLock()
     private var finishing = false
+    private var abandonmentReason: String?
 
     private init(runID: UUID, collectionID: UUID, journalURL: URL, ring: SharedFrameRing,
                  queue: CollectorQueue, state: CollectorState, runtime: CollectorRuntime) {
@@ -128,9 +129,24 @@ final class CollectorSession: @unchecked Sendable {
     func finish() async throws -> WireMessage {
         if finishLock.withLock({ if finishing { return false }; finishing = true; return true }) { queue.close() }
         await completion.wait()
+        if let reason = finishLock.withLock({ abandonmentReason }) {
+            throw AstraError("collector.abandoned", "The collection was abandoned without a resumable source boundary: \(reason)")
+        }
         if let fault = state.fault { throw fault }
         guard let result = state.result else { throw AstraError("collector.noResult", "The collector joined without a completed audit.") }
         return result
+    }
+
+    /// Join an empty or incomplete collection without inventing an episode end
+    /// or final packet sequence. The child may preserve a raw aborted package;
+    /// this method claims neither resumable progress nor physical cleanup.
+    func abandon(reason: String) async {
+        let shouldClose = finishLock.withLock { () -> Bool in
+            guard !finishing else { return false }
+            finishing = true; abandonmentReason = String(reason.prefix(2048)); return true
+        }
+        if shouldClose { queue.close() }
+        await completion.wait()
     }
 
     private func drain(journal: CollectorJournal) async {
@@ -144,13 +160,20 @@ final class CollectorSession: @unchecked Sendable {
                 // evidence. No subsequent wire request may hide a sequence gap.
                 if auditKind != "native.control", state.fault == nil {
                     let (kind, payload) = try materialize(input)
+                    if kind == "collector.abort" { state.beginOperatorAbort() }
                     let response = try await runtime.request(kind, payload, runID)
                     try validateQueued(response)
                     sequence += 1
                 }
             } catch { state.fail((error as? AstraError) ?? AstraError("collector.write", error.localizedDescription)) }
         }
-        if state.fault == nil {
+        if let reason = finishLock.withLock({ abandonmentReason }) {
+            do { try journal.append(kind: "native.abandon", payload: .object(["reason": .string(reason)]), sequence: sequence) }
+            catch { state.fail((error as? AstraError) ?? AstraError("collector.journal", error.localizedDescription)) }
+            // A raw aborted package may arrive during joined shutdown. It is
+            // never returned from finish as a completed/resumable collection.
+            state.beginFinish()
+        } else if state.fault == nil {
             do {
                 let payload: JSONValue = .object(["throughSequence": .unsigned(sequence - 1)])
                 try journal.append(kind: "collector.finish", payload: payload, sequence: sequence)
@@ -307,6 +330,7 @@ private final class CollectorState: @unchecked Sendable {
     private var storedFault: AstraError?
     private var storedResult: WireMessage?
     private var finishRequested = false
+    private var operatorAbortRequested = false
     private var leases: [UUID: Set<SharedFrameAcknowledgement>] = [:]
     private var waiting: CheckedContinuation<Void, any Error>?
     var fault: AstraError? { lock.withLock { storedFault } }
@@ -322,6 +346,7 @@ private final class CollectorState: @unchecked Sendable {
         }
     }
     func beginFinish() { lock.withLock { finishRequested = true } }
+    func beginOperatorAbort() { lock.withLock { operatorAbortRequested = true } }
     func fail(_ fault: AstraError) {
         let notify = lock.withLock { () -> (Bool, CheckedContinuation<Void, any Error>?) in
             guard storedFault == nil else { return (false, nil) }
@@ -348,8 +373,16 @@ private final class CollectorState: @unchecked Sendable {
                     leases[observation] = nil
                 }
             case "collector.fault":
-                fail(AstraError(event.payload.fields?["code"]?.text ?? "collector.rejected",
-                                event.payload.fields?["message"]?.text ?? "The collector rejected this experience."))
+                if event.payload.fields?["auditContinuable"] == .bool(true) {
+                    guard lock.withLock({ operatorAbortRequested }), event.payload.fields?["learningAborted"] == .bool(true) else {
+                        throw AstraError("collector.unsolicitedAbort", "The collector changed to a resumable audit without an operator abort request.")
+                    }
+                    // A requested cancellation can still validate final source
+                    // evidence. A protocol/storage fault cannot take this path.
+                } else {
+                    fail(AstraError(event.payload.fields?["code"]?.text ?? "collector.rejected",
+                                    event.payload.fields?["message"]?.text ?? "The collector rejected this experience."))
+                }
             case "collector.sealed", "collector.audited":
                 let target = try lock.withLock { () throws -> CheckedContinuation<Void, any Error>? in
                     guard finishRequested, storedResult == nil, leases.isEmpty else { throw AstraError("collector.earlyResult", "The collector completed before joined input/frame ownership or repeated its result.") }

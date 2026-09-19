@@ -38,6 +38,7 @@ struct InferenceDependencies: Sendable {
     /// Live control always uses the paired recovery protocol. Injected virtual
     /// runtimes have no physical input ownership and are tested independently.
     var protectsPhysicalInputs = false
+    var controlOwner = NativeControlOwner()
 
     static func live(bundle: Bundle) -> Self {
         let helpers = bundle.bundleURL.appendingPathComponent("Contents/Helpers")
@@ -66,7 +67,7 @@ struct InferenceDependencies: Sendable {
                 }
                 application.activate()
             }
-        }, protectsPhysicalInputs: true)
+        }, protectsPhysicalInputs: true, controlOwner: .shared)
     }
 }
 
@@ -141,9 +142,9 @@ struct InferencePolicyDetails: Sendable {
     }
 }
 
-/// One run owns capture, actor state, frame leases and the desktop helper. An
-/// independent heartbeat task runs while awaiting MLX, and Stop disarms before
-/// waiting for the actor. A missed action deadline is terminal, never retimed.
+/// One run owns capture, actor state, frame leases and a NativeControlSession.
+/// The session maintains control liveness independently of MLX. Stop disarms
+/// before waiting for the actor; missed action deadlines are never retimed.
 @MainActor @Observable final class InferenceCoordinator {
     private(set) var isBusy = false
     private(set) var isStopping = false
@@ -162,23 +163,23 @@ struct InferencePolicyDetails: Sendable {
     private(set) var resultsURL: URL?
     private(set) var cleanupConfirmed = false
     private(set) var cleanupRecoveredByGuardian = false
+    var requiresManualControlCleanupAcknowledgement: Bool { !isBusy && unconfirmedControlSessionID != nil }
     private let store: LibraryStore
     private let root: URL
     private let dependencies: InferenceDependencies
     private var work: Task<Void, Never>?
-    private var heartbeat: Task<Void, Never>?
     private var urgentStop: Task<Void, Never>?
     private var actor: InferenceRuntime?
-    private var control: InferenceRuntime?
+    private var control: NativeControlSession?
     private var capture: InferenceCapture?
     private var ring: SharedFrameRing?
     private var inbox: InferenceFrameInbox?
     private var stopRequested = false
-    private var controlAdmissionAttempted = false
-    private var controlRecovery: ControlRecoveryLedger?
-    private var pending: [UUID: ActionPacket] = [:]
+    private var userOrInterventionStop = false
+    private var unconfirmedControlSessionID: UUID?
     private var collectionSink: InferenceCollectionSink?
     private var collectionFault: InferenceCollectionFault?
+    private var collectionPredictionPending = false
 
     init(store: LibraryStore, root: URL, bundle: Bundle = .main, dependencies: InferenceDependencies? = nil) {
         self.store = store; self.root = root; self.dependencies = dependencies ?? .live(bundle: bundle)
@@ -187,20 +188,20 @@ struct InferencePolicyDetails: Sendable {
     func start(agent: AgentDocument, checkpoint: CheckpointDocument, source: CaptureSource, options: InferenceOptions,
                collection: InferenceCollectionSink? = nil) throws {
         guard !isBusy else { throw AstraError("inference.busy", "Stop the current agent before starting another run.") }
+        guard dependencies.controlOwner.priorCleanupJoined else { throw AstraError("inference.previousControl", "The previous control owner has not joined confirmed cleanup. Resolve its cleanup warning before starting another run.") }
         guard collection == nil || !options.deterministic else { throw AstraError("inference.collectionMode", "Reinforcement collection requires categorical policy sampling.") }
         guard options.seed >= 0, options.seed <= 1_000_000_000, options.contextIDs.count <= 32,
               options.contextIDs.allSatisfy({ $0 >= 0 && $0 < 65_536 }), [.window, .display].contains(source.kind) else {
             throw AstraError("inference.options", "Choose a supported environment and valid inference settings.")
         }
         let run = UUID()
-        isBusy = true; isStopping = false; activeAgentID = agent.id; runID = run; stopRequested = false
+        isBusy = true; isStopping = false; activeAgentID = agent.id; runID = run; stopRequested = false; userOrInterventionStop = false
         failure = nil; stopReason = nil; phase = "Opening the local policy…"; decisions = 0; executedPackets = 0
-        lastLatencyMS = nil; maximumLatencyMS = nil; warmupLatencyMS = []; policy = nil; resultsURL = nil; pending = [:]
-        controlAdmissionAttempted = false; cleanupConfirmed = false
-        cleanupRecoveredByGuardian = false
-        controlRecovery = nil
+        lastLatencyMS = nil; maximumLatencyMS = nil; warmupLatencyMS = []; policy = nil; resultsURL = nil
+        cleanupConfirmed = false; cleanupRecoveredByGuardian = false; unconfirmedControlSessionID = nil
         collectionSink = collection
         collectionFault = collection == nil ? nil : InferenceCollectionFault()
+        collectionPredictionPending = false
         work = Task { [weak self] in await self?.perform(agent: agent, checkpoint: checkpoint, source: source, options: options, run: run) }
     }
 
@@ -209,16 +210,25 @@ struct InferencePolicyDetails: Sendable {
         await work?.value
     }
 
+    /// Explicit user acknowledgement unlocks future control; it does not
+    /// rewrite the previous run's persisted or displayed cleanup evidence.
+    func acknowledgeManualControlCleanup() throws {
+        guard !isBusy, let id = unconfirmedControlSessionID else { throw AstraError("inference.cleanupWarning", "There is no completed control cleanup warning to acknowledge.") }
+        try dependencies.controlOwner.acknowledgeManualCleanup(sessionID: id)
+        unconfirmedControlSessionID = nil
+    }
+
     private func requestStop(reason: String? = nil) {
         guard isBusy, !stopRequested else { return }
         if let reason, failure == nil { failure = reason }
+        userOrInterventionStop = reason == nil
         stopRequested = true; isStopping = true; phase = "Stopping and releasing controls…"
-        heartbeat?.cancel(); work?.cancel()
+        control?.requestStop(); work?.cancel()
         inbox?.close()
-        if urgentStop == nil, let run = runID {
+        if urgentStop == nil {
             let control = self.control, actor = self.actor, capture = self.capture
             urgentStop = Task {
-                if let control { _ = try? await control.request("disarm", .object([:]), run, .seconds(2), false) }
+                if let control { _ = try? await control.disarm() }
                 // Shutdown interrupts a blocked actor request. Its completion
                 // joins process exit; the ring remains mapped until finish.
                 async let stoppedCapture: Void = capture?.stop() ?? ()
@@ -234,27 +244,11 @@ struct InferencePolicyDetails: Sendable {
         try Task.checkCancellation()
     }
 
-    private func makeRuntime(_ role: String, run: UUID) -> InferenceRuntime {
-        let sink = collectionSink, fault = collectionFault
-        return dependencies.runtime(role, { [weak self] message in
-            // Offer on the process I/O callback before dispatching UI updates.
-            // Shutdown joins that callback, so final receipts cannot overtake
-            // collector finalization or disappear behind stopRequested.
-            if role == "control", let sink {
-                do {
-                    guard message.runID == run else { throw AstraError("inference.collectionRun", "Control collection received a foreign run.") }
-                    try sink.offer(.control(message))
-                } catch {
-                    fault?.record(error)
-                    Task { @MainActor [weak self] in
-                        guard let self, runID == run, isBusy else { return }
-                        requestStop(reason: error.localizedDescription)
-                    }
-                }
-            }
+    private func makeActorRuntime(run: UUID) -> InferenceRuntime {
+        dependencies.runtime("actor", { [weak self] message in
             Task { @MainActor [weak self] in
                 guard let self, runID == run, isBusy, !stopRequested else { return }
-                receive(message)
+                requestStop(reason: "The actor returned an unexpected event: \(message.kind).")
             }
         }, { [weak self] error in
             Task { @MainActor [weak self] in
@@ -262,6 +256,37 @@ struct InferencePolicyDetails: Sendable {
                 requestStop(reason: error.localizedDescription)
             }
         })
+    }
+
+    private func makeControl(configuration: NativeControlConfiguration) -> NativeControlSession {
+        let dependencies = dependencies, sink = collectionSink, fault = collectionFault, run = configuration.runID
+        let factory = NativeControlRuntimeFactory(protectsPhysicalInputs: dependencies.protectsPhysicalInputs) { events, failure in
+            let runtime = dependencies.runtime("control", events, failure)
+            return NativeControlRuntime(start: runtime.start, request: { kind, payload, run, timeout in
+                try await runtime.request(kind, payload, run, timeout, true)
+            }, shutdown: runtime.shutdown)
+        }
+        return NativeControlSession(configuration: configuration, owner: dependencies.controlOwner, runtimeFactory: factory,
+            onEvent: { [weak self] event in
+                // Synchronous offer precedes UI dispatch. The session joins
+                // callbacks before collector finalization, including Stop.
+                do {
+                    if let sink {
+                        guard event.message.runID == run else { throw AstraError("inference.collectionRun", "Control collection received a foreign run.") }
+                        try sink.offer(.control(event.message))
+                    }
+                } catch { fault?.record(error); throw error }
+                Task { @MainActor [weak self] in
+                    guard let self, runID == run, control?.sessionID == event.sessionID, isBusy, !stopRequested else { return }
+                    receive(event.message)
+                }
+            }, onFailure: { [weak self] id, error in
+                Task { @MainActor [weak self] in
+                    guard let self, runID == run, control?.sessionID == id, isBusy, !stopRequested else { return }
+                    if Self.isIntervention(error) { stopReason = error.message; requestStop() }
+                    else { requestStop(reason: error.localizedDescription) }
+                }
+            })
     }
 
     private func perform(agent: AgentDocument, checkpoint: CheckpointDocument, source: CaptureSource, options: InferenceOptions, run: UUID) async {
@@ -291,8 +316,8 @@ struct InferencePolicyDetails: Sendable {
             }.value
             self.ring = ring
             try checkRunning()
-            let actor = makeRuntime("actor", run: run), control = makeRuntime("control", run: run)
-            self.actor = actor; self.control = control
+            let actor = makeActorRuntime(run: run)
+            self.actor = actor
             try validateHello(try await actor.start(), role: "actor"); try checkRunning()
             let checkpointPath = root.appendingPathComponent("Models").appendingPathComponent(checkpoint.id.uuidString.lowercased()).path
             var preparation: [String: JSONValue] = ["checkpointPath": .string(checkpointPath),
@@ -354,12 +379,6 @@ struct InferencePolicyDetails: Sendable {
             let episode = UUID()
             var previousState = try await reset(actor, run: run, episode: episode, contexts: options.contextIDs,
                                                 seed: collectionSink == nil ? options.seed : nil)
-            if dependencies.protectsPhysicalInputs {
-                controlRecovery = try await Task.detached {
-                    try ControlRecoveryLedger(createAt: directory.appendingPathComponent("control-recovery.astracontrol"), runID: run, capabilities: details.capabilities)
-                }.value
-            }
-            try validateHello(try await control.start(), role: "control"); try checkRunning()
             if dependencies.countdownSeconds > 0 {
                 for remaining in (1...dependencies.countdownSeconds).reversed() {
                     countdown = remaining; phase = "Agent starts in \(remaining)…"
@@ -374,33 +393,11 @@ struct InferencePolicyDetails: Sendable {
             let scope = ControlScope(surfaces: [initialSurface], applicationPID: source.applicationPID, windowID: source.windowID,
                                      wholeDesktop: false, stopOnPhysicalInput: true, geometryRevision: initialSurface.geometryRevision)
             try checkRunning()
-            controlAdmissionAttempted = true
-            let armed = try await control.request("arm", .encode(ArmRequest(runID: run, scope: scope, capabilities: details.capabilities,
-                                                                           packetCapacity: details.capacity, recovery: controlRecovery?.descriptor)), run, .seconds(20), false)
-            guard armed.kind == "ack", armed.runID == run, armed.payload.fields?["armed"] == .bool(true) else { throw AstraError("inference.arm", "The control helper did not arm the selected environment.") }
-            if let recovery = controlRecovery {
-                let snapshot = try recovery.snapshot()
-                guard armed.payload.fields?["recoveryLedgerID"]?.uuid == recovery.descriptor.ledgerID,
-                      armed.payload.fields?["guardianPID"]?.int == Int(snapshot.guardianPID), snapshot.guardianReady,
-                      snapshot.everArmed, snapshot.executorPID > 0 else {
-                    throw AstraError("inference.recoveryHandshake", "The control helper did not establish the requested independent cleanup protection.")
-                }
-            }
-            // Stop may arrive while arm is in flight. Disarm again after its
-            // response so an earlier stop request cannot leave a late arm live.
-            if stopRequested { _ = try? await control.request("disarm", .object([:]), run, .seconds(2), false); throw CancellationError() }
-            heartbeat = Task { [weak self] in
-                do {
-                    while !Task.isCancelled {
-                        let beat = try await control.request("heartbeat", .object([:]), run, .seconds(1), false)
-                        guard beat.kind == "ack", beat.runID == run else { throw AstraError("inference.heartbeat", "The control heartbeat changed run identity.") }
-                        try await Task.sleep(for: .milliseconds(100))
-                    }
-                } catch {
-                    guard !Task.isCancelled else { return }
-                    self?.requestStop(reason: "The desktop control heartbeat stopped: \(error.localizedDescription)")
-                }
-            }
+            let configuration = try NativeControlConfiguration(runID: run, scope: scope, capabilities: details.capabilities,
+                packetCapacity: details.capacity, recoveryDirectory: directory)
+            let control = makeControl(configuration: configuration); self.control = control
+            _ = try await control.start()
+            try checkRunning()
             phase = "Agent running · move the pointer or press a key to take over"
             var nextDecision = MonotonicClock.now
             var lastEventSequence: UInt64?
@@ -415,15 +412,10 @@ struct InferencePolicyDetails: Sendable {
                 guard image.metadata.surface == initialSurface else {
                     throw AstraError("inference.geometryChanged", "The environment changed size or position. Select the environment again before restarting.")
                 }
-                let observed = try await observation(control, run: run, after: lastEventSequence)
+                let observed = try await observation(control, after: lastEventSequence)
                 guard image.metadata.observedNanos <= observed.cutoffNanos, image.metadata.eventNanos <= image.metadata.observedNanos,
                       previousCutoff.map({ observed.cutoffNanos >= $0 + UInt64(details.periodMS) * 1_000_000 }) ?? true else {
                     throw AstraError("inference.causality", "Capture and input timestamps do not form a valid causal observation.")
-                }
-                for packet in pending.values {
-                    guard observed.cutoffNanos <= packet.executeAtNanos + UInt64(packet.durationMs) * 1_000_000 + 250_000_000 else {
-                        throw AstraError("inference.receiptTimeout", "The control helper did not finish an admitted packet in time.")
-                    }
                 }
                 let begin = MonotonicClock.now
                 let observationID = UUID()
@@ -443,8 +435,6 @@ struct InferencePolicyDetails: Sendable {
                 guard now < packet.executeAtNanos else {
                     throw AstraError("inference.deadline", "The local policy missed its \(details.leadMS) ms execution lead. Use a checkpoint trained with a longer lead, or stop other GPU work before restarting.")
                 }
-                guard pending.count < 32 else { throw AstraError("inference.receipts", "Too many action packets are awaiting execution receipts.") }
-                pending[packet.id] = packet
                 if let collectionSink {
                     let record = try result.payload.required("collectionRecord")
                     guard record.fields?["schemaVersion"] == .integer(1), record.fields?["checkpointID"]?.uuid == checkpoint.id,
@@ -466,9 +456,10 @@ struct InferencePolicyDetails: Sendable {
                         throw AstraError("inference.collectionIdentity", "The actor returned inconsistent collection evidence.")
                     }
                     try collectionSink.offer(.decision(result.payload))
+                    collectionPredictionPending = false
                 }
-                let accepted = try await control.request("execute", .encode(packet), run, .seconds(2), false)
-                guard accepted.kind == "ack", accepted.runID == run, accepted.payload.fields?["admitted"] == .bool(true) else { throw AstraError("inference.admission", "The control helper did not admit the action packet.") }
+                let submitted = try await control.submit(packet)
+                guard submitted.admitted else { throw AstraError("inference.admission", "The control helper did not admit the action packet.") }
                 decisions += 1; previousState = try result.payload.requiredUUID("stateID")
                 previousCutoff = observed.cutoffNanos; lastEventSequence = observed.lastSequence
                 let addition = observed.cutoffNanos.addingReportingOverflow(UInt64(details.periodMS) * 1_000_000)
@@ -476,10 +467,18 @@ struct InferencePolicyDetails: Sendable {
                 nextDecision = addition.partialValue
             }
         } catch is CancellationError { /* Stop already records any originating failure. */ }
-        catch { if !stopRequested { requestStop(reason: error.localizedDescription) } }
-        await finish(run: run)
+        catch {
+            if !stopRequested {
+                if let error = error as? AstraError, Self.isIntervention(error) { stopReason = error.message; requestStop() }
+                else { requestStop(reason: error.localizedDescription) }
+            }
+        }
+        await finish()
+        if collectionPredictionPending {
+            collectionFault?.record(AstraError("inference.unresolvedPrediction", "The actor ended before its in-flight sampled result could be fully retained. Its final random-stream progress is unverified."))
+        }
         if let message = collectionFault?.message {
-            failure = [failure, "Collection lost control evidence: \(message)"].compactMap { $0 }.joined(separator: "\n")
+            failure = [failure, "Collection evidence is incomplete: \(message)"].compactMap { $0 }.joined(separator: "\n")
         }
         var summary: JSONValue = .object(["runID": .string(run.uuidString.lowercased()), "status": .string(failure == nil ? "stopped" : "failed"),
             "decisions": .integer(Int64(decisions)), "executedPackets": .integer(Int64(executedPackets)),
@@ -561,6 +560,7 @@ struct InferencePolicyDetails: Sendable {
             try collectionSink.offer(.observation(.init(runID: run, actorInput: .object(input), frame: frame.metadata,
                 pixels: collectedPixels, coverage: frame.coverage)))
         }
+        if collecting { collectionPredictionPending = true }
         let response = try await actor.request(warmup ? "inference.warmup" : "inference.step", payload, run, .seconds(120), true)
         guard response.runID == run else { throw AstraError("inference.run", "The actor replied for another run.") }
         let released = try response.payload.required("releasedFrames").decode([SharedFrameAcknowledgement].self)
@@ -571,19 +571,10 @@ struct InferencePolicyDetails: Sendable {
         return response
     }
 
-    private struct ControlObservation: Decodable {
-        let controlState: ControlState
-        let executedEvents: [RawInputEvent]
-        let intervalCovered: Bool
-        let cutoffNanos: UInt64
-        let lastSequence: UInt64?
-    }
-    private func observation(_ control: InferenceRuntime, run: UUID, after: UInt64?) async throws -> ControlObservation {
+    private func observation(_ control: NativeControlSession, after: UInt64?) async throws -> AstraPlatform.ControlObservation {
         let deadline = MonotonicClock.now + 20_000_000
         while true {
-            let response = try await control.request("observation", .object(after.map { ["afterSequence": .unsigned($0)] } ?? [:]), run, .seconds(2), false)
-            guard response.kind == "ack", response.runID == run else { throw AstraError("inference.run", "The control observation belongs to another run.") }
-            let value = try response.payload.decode(ControlObservation.self)
+            let value = try await control.observation(afterSequence: after)
             guard value.intervalCovered, value.cutoffNanos <= MonotonicClock.now, value.controlState.observedNanos <= value.cutoffNanos, value.controlState.pointer.isFinite,
                   value.executedEvents.count <= 2048 else { throw AstraError("inference.inputCoverage", "Executed input history is unavailable or incomplete.") }
             var previous = after
@@ -605,9 +596,6 @@ struct InferencePolicyDetails: Sendable {
               message.payload.fields?["role"]?.text == role,
               message.payload.fields?["protocolVersion"]?.int == AstraVersion.protocolVersion else {
             throw AstraError("inference.runtime", "The local \(role) runtime reported an incompatible identity.")
-        }
-        if role == "control", dependencies.protectsPhysicalInputs, message.payload.fields?["recoveryVersion"] != .integer(1) {
-            throw AstraError("inference.recoveryVersion", "This control helper does not support the required independent cleanup protection. Rebuild or reinstall the complete application.")
         }
     }
 
@@ -645,22 +633,10 @@ struct InferencePolicyDetails: Sendable {
         case "control.receipt":
             do {
                 let receipt = try message.payload.required("receipt").decode(ExecutionReceipt.self)
-                guard let packet = pending[receipt.packetID], packet.runID == receipt.runID, packet.sequence == receipt.sequence,
-                      receipt.resultingState.pointer.isFinite else { throw AstraError("inference.receipt", "The control helper returned an unknown or inconsistent packet receipt.") }
                 if receipt.status == .admitted { return }
-                // Removing the identity also rejects duplicate terminal replies.
-                pending.removeValue(forKey: receipt.packetID)
-                guard receipt.status == .executed, receipt.commandResults.count == packet.commands.count,
-                      Set(receipt.commandResults.map(\.commandIndex)) == Set(packet.commands.indices),
-                      receipt.commandResults.allSatisfy({ result in
-                          guard packet.commands.indices.contains(result.commandIndex) else { return false }
-                          let scheduled = packet.executeAtNanos + UInt64(packet.commands[result.commandIndex].offsetMs) * 1_000_000
-                          return result.scheduledNanos == scheduled && (result.status == .posted || result.status == .noOp)
-                              && (result.status != .posted || result.postedNanos != nil)
-                              && (result.postedNanos.map { $0 >= scheduled && $0 <= receipt.observedNanos } ?? true)
-                      }) else {
-                    throw AstraError("inference.execution", "An action was late, cancelled or could not be posted.")
-                }
+                // Identity, command evidence and terminal uniqueness have
+                // already passed NativeControlSession before this callback.
+                guard receipt.status == .executed else { throw AstraError("inference.execution", "An action was late, cancelled or could not be posted.") }
                 executedPackets += 1
             } catch { requestStop(reason: error.localizedDescription) }
         default: requestStop(reason: "The control helper returned an unsupported event.")
@@ -672,56 +648,37 @@ struct InferencePolicyDetails: Sendable {
         if nanos > now { try await Task.sleep(for: .nanoseconds(Int64(min(nanos - now, UInt64(Int64.max))))) }
     }
 
-    private func finish(run: UUID) async {
+    private static func isIntervention(_ issue: AstraError) -> Bool {
+        ["control.physicalTakeover", "control.emergencyStop"].contains(issue.code)
+    }
+
+    private func finish() async {
         stopRequested = true; isStopping = true; countdown = nil
-        heartbeat?.cancel(); await heartbeat?.value; heartbeat = nil
+        control?.requestStop()
         await urgentStop?.value; urgentStop = nil
-        // Control teardown begins before capture/actor waits. Joined helper
-        // shutdown is the ownership boundary; all late results are ignored.
         if let control {
-            _ = try? await control.request("disarm", .object([:]), run, .seconds(2), false)
             phase = "Waiting for owned controls to release…"
-            let status = await control.shutdown()
-            if let recovery = controlRecovery {
-                cleanupConfirmed = await confirmRecoveryAfterExecutorExit(recovery)
-            } else { cleanupConfirmed = !controlAdmissionAttempted || status == 0 }
-        } else {
-            cleanupConfirmed = !controlAdmissionAttempted
-        }
+            let completion = await control.shutdown()
+            executedPackets = control.executedPacketCount
+            cleanupConfirmed = completion.cleanupConfirmed
+            cleanupRecoveredByGuardian = completion.recoveredByGuardian
+            if !completion.cleanupConfirmed { unconfirmedControlSessionID = completion.sessionID }
+            if let issue = completion.issue {
+                if Self.isIntervention(issue) { stopReason = stopReason ?? issue.message }
+                // An already-forwarded packet may receive the helper's real
+                // rejection after user Stop disarms it. Its raw evidence is
+                // retained; that expected race does not make Stop a failure.
+                else if failure == nil, !(userOrInterventionStop && issue.code == "control.rejected") { failure = issue.message }
+            }
+        } else { cleanupConfirmed = true }
         if !cleanupConfirmed {
             let message = "The control helper exited before input cleanup could be confirmed. Release any held controls manually before starting another run."
-            failure = [failure, message].compactMap { $0 }.joined(separator: "\n")
+            if failure?.contains("input cleanup could be confirmed") != true { failure = [failure, message].compactMap { $0 }.joined(separator: "\n") }
         }
         self.control = nil
         inbox?.close()
         await capture?.stop(); capture = nil; inbox = nil
         _ = await actor?.shutdown(); actor = nil
         ring?.closeAfterConsumerExit(); ring = nil
-        pending = [:]
-    }
-
-    private func confirmRecoveryAfterExecutorExit(_ ledger: ControlRecoveryLedger) async -> Bool {
-        while true {
-            do {
-                let snapshot = try ledger.snapshot()
-                if snapshot.cleanupConfirmed { cleanupRecoveredByGuardian = snapshot.recoveredByGuardian; return true }
-                // Native posting requires the sticky armed marker before any
-                // reservation. A command process dying before that point never
-                // gained input authority, even when the arm request was in flight.
-                if !snapshot.everArmed, snapshot.possibleKeys.isEmpty, snapshot.possibleButtons.isEmpty, snapshot.inFlight == 0 { return true }
-                guard ledger.matchingGuardianIsAlive(snapshot) else { return false }
-                phase = snapshot.errorCode == 0 ? "Recovering owned controls after the executor stopped…"
-                    : "Waiting for the cleanup guardian to release owned controls…"
-                try? await Task.sleep(for: .milliseconds(25))
-            } catch { return false }
-        }
-    }
-}
-
-extension JSONValue {
-    var uuid: UUID? { text.flatMap(UUID.init(uuidString:)) }
-    func requiredUUID(_ key: String) throws -> UUID {
-        guard let value = fields?[key]?.uuid else { throw AstraError("inference.identity", "The runtime did not provide a valid \(key).") }
-        return value
     }
 }

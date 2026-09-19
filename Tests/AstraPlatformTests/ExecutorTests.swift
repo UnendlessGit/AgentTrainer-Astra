@@ -380,7 +380,8 @@ private struct ExecutorFixture {
     #expect(f.backend.ownedKeys.isEmpty)
 }
 
-@Test func executorStoppedArmingCannotPublishALateLease() throws {
+@Test(arguments: [ControlStopCause.physicalTakeover, .emergencyStop])
+func executorStoppedArmingCannotPublishALateLease(cause: ControlStopCause) throws {
     let f = ExecutorFixture(); f.backend.blockPrepare = true
     let completed = DispatchSemaphore(value: 0)
     DispatchQueue.global().async {
@@ -389,12 +390,13 @@ private struct ExecutorFixture {
     }
     defer { f.backend.unblock.signal() }
     #expect(f.backend.entering.wait(timeout: .now() + 3) == .success)
-    f.executor.requestDisarm(runID: f.run, reason: "Physical takeover during prepare", cause: .physicalTakeover)
+    f.executor.requestDisarm(runID: f.run, reason: "Intervention during prepare", cause: cause)
     #expect(!f.executor.cleanupSettled && !f.executor.state().valid)
     f.backend.unblock.signal()
     #expect(completed.wait(timeout: .now() + 3) == .success)
     #expect(waitForControl { f.executor.cleanupSettled })
     #expect(f.executor.currentRunID == nil && f.backend.posted.isEmpty)
+    #expect(waitForControl { f.stops.all.contains { $0.0 == f.run && $0.1 == cause } })
 }
 
 @Test func executorRechecksHealthAfterArmingPreparationAndRejectsUnknownPhysicalState() throws {

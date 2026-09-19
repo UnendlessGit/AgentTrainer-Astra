@@ -44,6 +44,10 @@ private actor CollectorHarness {
             blocked = true
             await withCheckedContinuation { suspended = $0 }
         }
+        if kind == "collector.abort" || (kind == "collector.begin" && mode == "unsolicitedAbort") {
+            events?(WireMessage(kind: "collector.fault", sequence: 3, runID: run, payload: .object([
+                "collectionID": .string(collectionID!.uuidString), "auditContinuable": .bool(true), "learningAborted": .bool(true)])))
+        }
         if kind == "collector.actor" {
             let frames = try payload.required("observation").required("frames").decode([JSONValue].self)
             let reference = try frames[0].required("reference").decode(SharedFrameReference.self)
@@ -73,6 +77,23 @@ private actor CollectorHarness {
     }
     func releaseBlock() { suspended?.resume(); suspended = nil }
     func shutdown() { exited = true }
+}
+
+@Test func requestedCollectorAbortContinuesFinalEvidenceButUnsolicitedAbortFails() async throws {
+    for mode in ["normal", "unsolicitedAbort"] {
+        let harness = CollectorHarness(mode), (session, root) = try await collectorFixture(harness)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try session.offer(.request("collector.begin", .object([:])))
+        if mode == "normal" { try session.offer(.request("collector.abort", .object(["reason": .string("Operator stopped learning")]))) }
+        try session.offer(.request("collector.evidence", .object(["fixture": .string("final receipt")])))
+        try session.offer(.request("collector.end", .object([:])))
+        if mode == "normal" {
+            #expect(try await session.finish().kind == "collector.audited")
+            #expect(await harness.requests.map(\.0).contains("collector.evidence"))
+            #expect(await harness.requests.map(\.0).contains("collector.end"))
+        } else { await #expect(throws: AstraError.self) { try await session.finish() } }
+        #expect(await harness.exited)
+    }
 }
 
 @Test func collectorCancellationAfterPrepareAcknowledgementJoinsWithoutPublishingSession() async throws {
@@ -109,6 +130,17 @@ private func collectorObservation(run: UUID) throws -> InferenceCollectedObserva
     return .init(runID: run, actorInput: .object(["observationID": .string(UUID().uuidString), "episodeID": .string(UUID().uuidString),
         "cutoffNanos": .unsigned(cutoff), "geometryRevision": .unsigned(frame.surface.geometryRevision),
         "controlState": try .encode(controls), "executedEvents": .array([])]), frame: frame, pixels: Data(repeating: 19, count: 4096))
+}
+
+@Test func emptyCollectorAbandonmentJoinsWithoutInventingAnEndSequence() async throws {
+    let harness = CollectorHarness(), (session, root) = try await collectorFixture(harness)
+    defer { try? FileManager.default.removeItem(at: root) }
+    await session.abandon(reason: "Stopped before the first policy result")
+    #expect(await harness.exited)
+    #expect(await harness.requests.map(\.0) == ["collector.prepare"])
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("frames.astraring").path))
+    #expect(try String(contentsOf: session.journalURL, encoding: .utf8).contains("native.abandon"))
+    await #expect(throws: AstraError.self) { try await session.finish() }
 }
 
 @Test func collectorUsesIndependentLeasesAndExactClockAndJoinsBeforeRetiring() async throws {

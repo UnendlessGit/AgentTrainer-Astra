@@ -6,7 +6,7 @@ Astra is a new implementation. Original AgentTrainer is a source of product evid
 
 ## Development status
 
-Implementation is in progress. Native recording/recovery/review, behavioral and recurrent PPO training, checkpoint evaluation/resume, and local inference use one shared MLX visual/recurrent/action policy. Native training has been exercised through the assembled offline runtime; simple virtual pointing learns successfully, while the initial delayed-memory experiment remains near chance. General desktop RL, reward/reset authoring, broader learning experiments and installed capture/control qualification remain open. No completed application or release DMG is claimed. See the [implementation plan](docs/IMPLEMENTATION_PLAN.md), [verification](docs/verification/native-bundle-workflow.md) and [independent architecture](docs/architecture/0001-independent-baseline.md).
+Implementation is in progress. Native recording/recovery/review, behavioral and recurrent PPO training, checkpoint evaluation/resume, and local inference share an MLX visual/recurrent/action policy. Reward/reset authoring, protected control ownership, external rollout collection and checkpoint handoff are implemented. Full desktop orchestration and installed capture/control qualification remain open. Virtual pointing learns successfully; long-delay learning still needs improvement. No completed application or release DMG is claimed. See the [implementation plan](docs/IMPLEMENTATION_PLAN.md), [verification](docs/verification/native-bundle-workflow.md) and [independent architecture](docs/architecture/0001-independent-baseline.md).
 
 The intended release is a self-contained Apple Silicon application with a native macOS interface, MLX learning runtime, lossless recording, local inference, and an ad-hoc-signed personal-installation DMG. User recordings and checkpoints stay local.
 
@@ -15,6 +15,7 @@ The intended release is a self-contained Apple Silicon application with a native
 Requires Apple Silicon, Xcode with the macOS SDK, and `uv`. Build-time dependencies are downloaded into an isolated environment; the assembled compute helper includes its Python, MLX and Metal resources.
 
 ```sh
+uv python install 3.12.13
 uv sync --locked --group dev
 ./script/swift.sh test
 .venv/bin/python -m pytest

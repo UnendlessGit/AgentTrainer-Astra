@@ -24,7 +24,7 @@ public enum RewardAnalysisResult: Sendable {
     case interval(observationID: UUID, evaluation: RewardEvaluation)
 }
 
-/// One physical episode's bounded, ordered CPU analysis owner. Actor decisions
+/// One physical episode's bounded, ordered native analysis owner. Actor decisions
 /// never await Vision. Output offers must also be bounded and nonblocking. This
 /// type neither samples/posts actions nor invents manual-feedback coverage.
 public final class RewardAnalysisQueue: @unchecked Sendable {

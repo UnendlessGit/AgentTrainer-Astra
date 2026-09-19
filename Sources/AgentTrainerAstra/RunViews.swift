@@ -48,7 +48,8 @@ struct RunView: View {
                             if let checkpoint, let source { start(checkpoint, source, options) }
                         } label: { Label("Start Agent", systemImage: "play.fill") }
                             .buttonStyle(.borderedProminent)
-                            .disabled(busy || checkpoint == nil || source == nil || !validOptions || unavailableReason != nil)
+                            .disabled(busy || checkpoint == nil || source == nil || !validOptions || unavailableReason != nil
+                                      || coordinator?.requiresManualControlCleanupAcknowledgement == true)
                         if busy, let coordinator {
                             Button("Stop Agent", role: .destructive) { Task { await coordinator.stopAndWait() } }
                                 .disabled(coordinator.isStopping)
@@ -148,6 +149,8 @@ struct InferenceBanner: View {
 
 private struct InferenceStatus: View {
     let coordinator: InferenceCoordinator
+    @State private var cleanupIssue: String?
+    @State private var acknowledgedCleanupRun: UUID?
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
@@ -170,6 +173,18 @@ private struct InferenceStatus: View {
                         GridRow { Text("Checkpoint timing").foregroundStyle(.secondary); Text("\(policy.periodMS) ms cadence · \(policy.leadMS) ms lead").monospacedDigit() }
                     }
                 }.font(.callout)
+                if coordinator.requiresManualControlCleanupAcknowledgement {
+                    Button("I’ve released the held controls") {
+                        do {
+                            try coordinator.acknowledgeManualControlCleanup()
+                            acknowledgedCleanupRun = coordinator.runID; cleanupIssue = nil
+                        } catch { cleanupIssue = error.localizedDescription }
+                    }
+                    .help("Confirm only after releasing any held keys or mouse buttons. The previous run keeps its unconfirmed cleanup result.")
+                } else if acknowledgedCleanupRun == coordinator.runID, acknowledgedCleanupRun != nil {
+                    Text("Manual release acknowledged. You can start another run.").font(.callout).foregroundStyle(.secondary)
+                }
+                if let cleanupIssue { AttentionLabel(message: cleanupIssue) }
                 if let url = coordinator.resultsURL { ShareLink("Export Run Summary", item: url) }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
         } label: { Text("Run feedback").font(.headline) }

@@ -70,11 +70,12 @@ class AssemblyLimits:
     maximum_label_lag_seconds: float = 30
     maximum_cadence_delay_nanos: int = 500_000_000
     maximum_audit_bytes: int = 32 * 1024**2
+    maximum_journal_bytes: int = 256 * 1024**2
 
     def validate(self):
         for name, low, high in (('maximum_queue_bytes', 1024, 1024**3), ('maximum_queue_items', 1, 4096),
             ('maximum_unsealed_decisions', 1, 65536), ('maximum_cadence_delay_nanos', 0, 60_000_000_000),
-            ('maximum_audit_bytes', 1024, 1024**3)):
+            ('maximum_audit_bytes', 1024, 1024**3), ('maximum_journal_bytes', 1024, 1024**3)):
             integer(getattr(self, name), high, low)
         if type(self.maximum_label_lag_seconds) not in (int, float) or not math.isfinite(self.maximum_label_lag_seconds) or not 0 < self.maximum_label_lag_seconds <= 3600:
             raise EnvironmentError('Label lag must be a bounded positive duration')
@@ -157,7 +158,7 @@ class AsyncRolloutAssembler:
                  run_id: str, clock_id: str, policy_id: str, policy_signature: str,
                  actor_source_id: str, environment_source_id: str, audit_path: Path,
                  context_ids=(), limits: AssemblyLimits = AssemblyLimits(), scratch_directory: Path | None = None,
-                 on_fault=lambda _: None):
+                 on_fault=lambda _: None, audit_only=False, previous_actor_progress=None):
         self.spec, self.model, self.training, self.limits = spec.validate(), model.validate(), training.validate(), limits.validate()
         self.run_id, self.clock_id = uuid_key(run_id), uuid_key(clock_id)
         self.actor_source_id, self.environment_source_id = uuid_key(actor_source_id), uuid_key(environment_source_id)
@@ -175,6 +176,12 @@ class AsyncRolloutAssembler:
             raise EnvironmentError('Allocate a new audit file in an existing run directory')
         self._spool = FrameSpool(memory_bytes=training.maximum_rollout_bytes,
                                 disk_bytes=training.maximum_rollout_disk_bytes, directory=scratch_directory)
+        if type(audit_only) is not bool: raise EnvironmentError('Audit-only collection must be explicit')
+        self.audit_only = audit_only
+        if previous_actor_progress is not None:
+            from .rollout_artifacts import progress
+            progress(previous_actor_progress,self.run_id)
+        self._previous_actor_progress=previous_actor_progress
         self._on_fault = on_fault
         self._condition = threading.Condition()
         self._queue = queue.Queue(maxsize=limits.maximum_queue_items)
@@ -240,6 +247,30 @@ class AsyncRolloutAssembler:
         size = record.byte_count(self.limits.maximum_queue_bytes)
         self._submit('actor', None, size=size, prepare=record.owned)
 
+    def wire_byte_count(self,response,snapshot):
+        frames=snapshot.get('frames') if type(snapshot) is dict else None
+        if type(frames) is not list or not 1<=len(frames)<=self.spec.maximum_surfaces:
+            raise EnvironmentError('Invalid wire observation surface count')
+        pixels=sum(integer(frame['metadata']['byteCount'],self.spec.maximum_observation_bytes,1) for frame in frames)
+        if pixels>self.spec.maximum_observation_bytes or pixels>=self.limits.maximum_queue_bytes:
+            raise EnvironmentError('Wire frame copies exceed collector ingress capacity')
+        return pixels+_bounded_size([response,snapshot],self.limits.maximum_queue_bytes-pixels)
+
+    def submit_actor_wire(self,response,snapshot,*,source_id,resolve_frame,on_consumed):
+        if not same_id(source_id,self.actor_source_id):raise EnvironmentError('Unbound actor record producer')
+        self._submit('actor',None,size=self.wire_byte_count(response,snapshot),
+            prepare=lambda:ActorRecord.from_wire(response,snapshot,spec=self.spec,
+                resolve_frame=resolve_frame,on_consumed=on_consumed))
+
+    def submit_bootstrap_wire(self,*,episode_id,snapshot,value,policy_id,preceding_packet_id,source_id,resolve_frame,on_consumed):
+        if not same_id(source_id,self.actor_source_id) or not same_id(policy_id,self.policy_id):
+            raise EnvironmentError('Bootstrap did not come from the bound behavior actor')
+        if type(value) not in (int,float) or not math.isfinite(value):raise EnvironmentError('Bootstrap must have a finite value')
+        def prepare():
+            observed,events=SnapshotDecoder(self.spec,resolve_frame,on_consumed).decode(snapshot,episode=episode_id)
+            return uuid_key(episode_id),observed,float(value),uuid_key(preceding_packet_id),events
+        self._submit('bootstrap',None,size=self.wire_byte_count({},snapshot),prepare=prepare)
+
     def submit_evidence(self, message: Message, *, source_id):
         if not same_id(source_id, self.environment_source_id): raise EnvironmentError('Unbound label/receipt producer')
         message.validate()
@@ -263,8 +294,20 @@ class AsyncRolloutAssembler:
         self._submit('bootstrap', None, size=item.byte_count(self.limits.maximum_queue_bytes),
             prepare=lambda:(uuid_key(episode_id),item.owned().observation,float(value),uuid_key(preceding_packet_id),tuple(copy.deepcopy(executed_events))))
 
+    def abort_learning(self):
+        self._submit('abort_learning',None,wait=True)
+
     def finish_collection(self):
         self._submit('finish', None, wait=True)
+
+    def take_ready(self):
+        """Nonblocking one-time transfer for a collector process owner loop."""
+        with self._condition:
+            if self._failure is not None: raise self._failure
+            if self._sealed is None:return None
+            if self._transferred:raise EnvironmentError('A collection can be transferred only once')
+            self._transferred=True
+            return self._sealed
 
     def seal(self, *, cancelled=lambda: False, timeout_seconds=30) -> CollectedRollout:
         if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 3600:
@@ -304,6 +347,7 @@ class AsyncRolloutAssembler:
                     elif kind == 'evidence': self._evidence(value)
                     elif kind == 'end': self._end(*value)
                     elif kind == 'bootstrap': self._bootstrap(*value)
+                    elif kind == 'abort_learning':self.audit_only=True
                     elif kind == 'finish':
                         if self._active_episode is not None: raise EnvironmentError('Join episode stop before finishing actor collection')
                         self._finished_collection = True
@@ -409,12 +453,17 @@ class AsyncRolloutAssembler:
             if type(data) is not list or len(data)!=2: raise EnvironmentError('Actor RNG keys must contain two UInt32 words')
             keys.append(tuple(integer(v,2**32-1) for v in data))
         stream, draw = uuid_key(sampler['rngStreamID']), integer(sampler['drawIndex'])
+        if sequence!=draw:raise EnvironmentError('Collection schema 1 requires packet sequence to equal the actor RNG draw index')
         # Validate the declared key split on CPU. This does not sample an
         # action or consume global RNG state, and cannot block actor GPU work.
         import mlx.core as mx
         split=np.asarray(mx.random.split(mx.array(keys[0],dtype=mx.uint32),stream=mx.cpu))
         if tuple(split[0])!=keys[2] or tuple(split[1])!=keys[1]:
             raise EnvironmentError('Actor RNG evidence does not match its declared split')
+        if self._sampler is None and self._previous_actor_progress is not None:
+            prior=self._previous_actor_progress
+            if stream!=uuid_key(prior['rngStreamID']) or draw!=prior['drawIndex']+1 or keys[0]!=tuple(prior['rngState']) or generation<=prior['actorResetGeneration']:
+                raise EnvironmentError('Actor collection does not continue its bound prior progress after reset')
         if self._sampler is not None and (stream != self._sampler[0] or draw != self._sampler[1]+1 or keys[0] != self._sampler[2]):
             raise EnvironmentError('Actor RNG stream repeated, reseeded or skipped independently of learning')
         if keys[1] in self._sample_keys: raise EnvironmentError('An actor sampling key was reused')
@@ -431,11 +480,21 @@ class AsyncRolloutAssembler:
         if not observed.control_state['valid'] or cutoff-observed.control_state['observedNanos']>self.spec.maximum_frame_age_ms*1000000:
             raise EnvironmentError('Actor controls are unavailable or stale')
         observed=replace(observed,id=uuid_key(observed.id),episode_id=episode_id)
-        record=ObservationRecord.capture(observed, events=actor.events, elapsed_seconds=elapsed, reset=step==0,
-                                         last_input_nanos=episode.last_input_nanos, spool=self._spool)
+        if self.audit_only:
+            # Continuity is explicitly ineligible for learning. Retain timing,
+            # controls and exact actor/receipt evidence, without spooling visual
+            # tensors that no learner may consume. CPU lease validation still
+            # completed before this branch.
+            record=ObservationRecord((),observed.id,episode_id,cutoff,observed.geometry_revision,
+                json.dumps(observed.control_state,separators=(',',':')).encode(),
+                json.dumps(actor.events,separators=(',',':')).encode(),elapsed,step==0,episode.last_input_nanos)
+            self._spool.reserve_metadata(record.metadata_byte_count)
+        else:
+            record=ObservationRecord.capture(observed, events=actor.events, elapsed_seconds=elapsed, reset=step==0,
+                                             last_input_nanos=episode.last_input_nanos, spool=self._spool)
         context=DecisionContext(self.run_id,episode_id,self.policy_id,observed.id,packet['id'],step,cutoff,observed.geometry_revision)
         row=_ActorRow(record,value,DecisionEvidence(context,sequence,tuple(packet['commands'])),arrived)
-        self._spool.reserve_metadata(len(json.dumps([value,packet],allow_nan=False,separators=(',',':')).encode()))
+        self._spool.reserve_metadata(_bounded_size([value,packet],self.training.maximum_rollout_bytes)*3)
         episode.rows.append(row); self._rows[packet_id]=row; self._snapshots.add(uuid_key(observed.id))
         episode.geometry=geometry; episode.actor_generation=generation; episode.last_event_sequence=last_event
         times=[event['observedNanos'] for event in actor.events if event['origin']=='agent']
@@ -538,7 +597,7 @@ class AsyncRolloutAssembler:
         for episode in self._episodes.values():
             for index,row in enumerate(episode.rows):
                 evidence=row.evidence
-                suffix=episode.boundary is not None and row.record.cutoff_nanos>=episode.boundary
+                suffix=self.audit_only or (episode.boundary is not None and row.record.cutoff_nanos>=episode.boundary)
                 if not suffix and evidence.end is None:
                     expected_end=episode.rows[index+1].record.cutoff_nanos if index+1<len(episode.rows) else episode.boundary
                     if expected_end is not None and expected_end<=episode.watermark:
@@ -561,6 +620,8 @@ class AsyncRolloutAssembler:
                    for episode in self._episodes.values()):
                 raise EnvironmentError('Closed actor stream cannot account for pending evidence identities')
             return
+        if self.audit_only:
+            self._try_seal_audit();return
         decisions=[]; audit=[]
         for episode in self._episodes.values():
             if episode.closed_nanos is None or not episode.rows or episode.boundary is None: return
@@ -631,6 +692,25 @@ class AsyncRolloutAssembler:
             json.dumps(progress,sort_keys=True,separators=(',',':')).encode())
         with self._condition:
             self._sealed=rollout; self._condition.notify_all()
+
+    def _try_seal_audit(self):
+        for episode in self._episodes.values():
+            if episode.closed_nanos is None or not episode.rows or episode.rows[-1].evidence.sequence!=episode.last_actor_sequence:
+                return
+            if any(row.evidence.receipt is None for row in episode.rows):return
+        with self._condition:
+            if self._closed or not self._queue.empty() or self._ingress_items>int(self._processing):return
+            self._sealing=True
+        progress={'schemaVersion':1,'runID':self.run_id,'rngStreamID':self._sampler[0],
+            'drawIndex':self._sampler[1],'rngState':list(self._sampler[2]),'actorResetGeneration':self._sampler[3]}
+        report={'schemaVersion':1,'runID':self.run_id,'policyID':self.policy_id,'actorProgress':progress,
+            'auditOnly':True,'episodes':[{'episodeID':episode.id,'stoppedNanos':episode.closed_nanos,
+                'lastActorSequence':episode.last_actor_sequence,'decisions':len(episode.rows)} for episode in self._episodes.values()]}
+        import os
+        data=json.dumps(report,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+        with self.audit_path.open('xb') as target:target.write(data);target.flush();os.fsync(target.fileno())
+        self._spool.close()
+        with self._condition:self._sealed=report;self._condition.notify_all()
 
     def close(self):
         with self._condition:

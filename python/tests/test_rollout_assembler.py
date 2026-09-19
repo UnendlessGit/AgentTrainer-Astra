@@ -349,3 +349,40 @@ def test_policy_gate_never_readmits_a_consumed_rollout(completion):
     with pytest.raises(EnvironmentError,match='admitted twice'):
         gate.begin_learning(rollout_id=rollout,policy_id=policy)
     gate.begin_learning(rollout_id=str(uuid.uuid4()),policy_id=policy)
+
+
+def test_wire_lease_copy_is_reserved_before_the_resolver_can_allocate(tmp_path):
+    from astra.environments.observation_transport import ResolvedFrame
+    fixture=ActorFixture(empty=True);assembler=fixture.assembler(tmp_path);record=fixture.sample()
+    image=record.observation.frames[0];observed=record.observation
+    snapshot={'id':observed.id,'episodeID':observed.episode_id,'cutoffNanos':observed.cutoff_nanos,
+        'geometryRevision':observed.geometry_revision,'controlState':observed.control_state,'events':[],
+        'frames':[{'metadata':image.metadata,'reference':{},'coverageNanos':image.coverage_nanos,'coverageKind':'frame'}]}
+    response={'packet':record.packet,'collectionRecord':record.collection}
+    size=assembler.wire_byte_count(response,snapshot)
+    assembler.limits=replace(assembler.limits,maximum_queue_bytes=size+1)
+    entered,release=threading.Event(),threading.Event();copies=[];errors=[]
+    def resolver(*_):
+        copies.append(1);entered.set();assert release.wait(3)
+        return ResolvedFrame(image.pixels,{'owned':True})
+    def submit():
+        try:assembler.submit_actor_wire(response,snapshot,source_id=fixture.actor_source,resolve_frame=resolver,on_consumed=lambda *_:None)
+        except BaseException as error:errors.append(error)
+    thread=threading.Thread(target=submit);thread.start()
+    try:
+        assert entered.wait(3)
+        with pytest.raises(EnvironmentError,match='ingress byte budget'):
+            assembler.submit_actor_wire(response,snapshot,source_id=fixture.actor_source,resolve_frame=resolver,on_consumed=lambda *_:None)
+        assert len(copies)==1 and assembler._queue_bytes==size
+        release.set();thread.join(3);assert not errors and not thread.is_alive()
+    finally:release.set();thread.join(3);assembler.close()
+
+
+def test_collection_packet_sequence_must_equal_the_original_rng_draw_index(tmp_path):
+    fixture=ActorFixture(empty=True);assembler=fixture.assembler(tmp_path)
+    try:
+        record=fixture.sample();record.collection['sampler']['drawIndex']=7
+        assembler.submit_actor(record,source_id=fixture.actor_source)
+        with pytest.raises(EnvironmentError,match='packet sequence to equal'):
+            assembler.finish_collection()
+    finally:assembler.close()

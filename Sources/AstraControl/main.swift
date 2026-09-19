@@ -151,9 +151,9 @@ private actor ControlServer {
                     })
                 protection = pair
                 await monitor.stop()
+                let monitoring = MonitorFailure()
                 do {
                     try await pair.waitUntilReady()
-                    let monitoring = MonitorFailure()
                     try await monitor.start(onEvents: { events in
                         if request.scope.stopOnPhysicalInput, events.contains(where: { $0.origin == .physical }) {
                             monitoring.record(AstraError("control.physicalTakeover", "Physical input interrupted control arming or execution."))
@@ -161,7 +161,7 @@ private actor ControlServer {
                         }
                     }, onFault: { error in monitoring.record(error); executor.requestDisarm(runID: request.runID, reason: error.localizedDescription) },
                        onEmergency: {
-                           monitoring.record(AstraError("control.emergency", "Emergency stop interrupted control arming or execution."))
+                           monitoring.record(AstraError("control.emergencyStop", "Emergency stop interrupted control arming or execution."))
                            executor.requestDisarm(runID: request.runID, reason: "Emergency stop.", cause: .emergencyStop)
                        })
                     try monitoring.check()
@@ -175,9 +175,14 @@ private actor ControlServer {
                     if (try? journal.snapshot().cleanupConfirmed) == true {
                         await pair.finishAfterLocalSettlement(); protection = nil
                     }
+                    // A physical intervention may invalidate the executor's
+                    // arm before its stop event is delivered. Preserve the
+                    // monitor's original cause in the correlated arm reply.
+                    try monitoring.check()
                     throw error
                 }
                 payload = .object(["armed": .bool(true), "leaseNanos": .unsigned(ControlLease.durationNanos),
+                                   "nextPacketSequence": .unsigned(executor.nextPacketSequence),
                                    "recoveryLedgerID": .string(journal.descriptor.ledgerID.uuidString),
                                    "guardianPID": .integer(Int64(pair.guardianPID))])
             case "heartbeat":
@@ -252,6 +257,7 @@ private actor ControlServer {
         do {
             let server = try ControlServer(output: output)
             output.send("hello", .object(["role": .string("control"), "protocolVersion": .integer(1), "recoveryVersion": .integer(1),
+                "initialPacketSequenceVersion": .integer(1),
                 "capabilities": .array(["ping", "permissions", "arm", "heartbeat", "execute", "disarm", "observation", "state", "shutdown"].map(JSONValue.string))]))
             let sleep = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { @Sendable _ in
                 server.stopImmediately(reason: "The Mac is going to sleep.", cause: .sleep)

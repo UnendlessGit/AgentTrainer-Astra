@@ -762,18 +762,3 @@ enum LearningFiles {
         return try await withTaskCancellationHandler { try await operation.value } onCancel: { operation.cancel() }
     }
 }
-
-extension JSONValue {
-    var fields: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
-    var text: String? { if case .string(let value) = self { value } else { nil } }
-    var int: Int? {
-        switch self { case .integer(let value): Int(exactly: value); case .unsigned(let value): Int(exactly: value); default: nil }
-    }
-    var double: Double? {
-        switch self { case .number(let value): value; case .integer(let value): Double(value); case .unsigned(let value): Double(value); default: nil }
-    }
-    func required(_ key: String) throws -> JSONValue {
-        guard let value = fields?[key], value != .null else { throw AstraError("learning.metadata", "Learning metadata is missing \(key).") }
-        return value
-    }
-}

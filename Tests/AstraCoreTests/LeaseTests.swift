@@ -46,3 +46,25 @@ import Testing
         try over.append(Data(repeating: 120, count: AstraVersion.maximumMessageBytes))
     }
 }
+
+@Test func freshControlLeaseAdmitsPersistentActorSequenceWithoutRewritingPacket() throws {
+    let surface = SurfaceDescriptor(id: "target", globalBounds: .init(x: 0, y: 0, width: 100, height: 100), pixelWidth: 100, pixelHeight: 100)
+    let request = ArmRequest(runID: UUID(), scope: .init(surfaces: [surface]), capabilities: .init(keyCodes: [13]), initialPacketSequence: 917)
+    var lease = ControlLease(); try lease.arm(request, now: 1)
+    let packet = ActionPacket(runID: request.runID, sequence: 917, observationID: UUID(), geometryRevision: 0,
+                              executeAtNanos: 10_000, durationMs: 100, commands: [.init(offsetMs: 0, operation: .keyDown, keyCode: 13)])
+    var stale = packet; stale.sequence = 0
+    #expect(throws: AstraError.self) { try lease.admit(stale, now: 2) }
+    try lease.admit(packet, now: 2)
+    #expect(lease.nextSequence == 918)
+    #expect(packet.sequence == 917)
+    var exhausted = request; exhausted.initialPacketSequence = UInt64.max
+    lease.disarm()
+    #expect(throws: AstraError.self) { try lease.arm(exhausted, now: 3) }
+    var old = try JSONEncoder().encode(request)
+    var json = try #require(try JSONSerialization.jsonObject(with: old) as? [String: Any])
+    json.removeValue(forKey: "initialPacketSequence"); old = try JSONSerialization.data(withJSONObject: json)
+    let decoded = try JSONDecoder().decode(ArmRequest.self, from: old)
+    try lease.arm(decoded, now: 3)
+    #expect(lease.nextSequence == 0)
+}
