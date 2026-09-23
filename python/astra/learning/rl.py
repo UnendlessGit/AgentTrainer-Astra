@@ -225,6 +225,46 @@ class Rollout:
 
 
 @dataclass(frozen=True, slots=True)
+class CompleteEpisodeBatch:
+    """Explicit multi-clock composition of independently validated closed rollouts.
+
+    The first run identifies the learner's source binding only. Every original
+    transition retains its own run and monotonic clock domain through fragments.
+    """
+    fragments: tuple[Rollout, ...]
+    clock_ids: tuple[str, ...]
+
+    def __post_init__(self):
+        if type(self.fragments) is not tuple or not 1<=len(self.fragments)<=128 or len(self.clock_ids)!=len(self.fragments):
+            raise ValueError('Complete-episode batches require bounded, clock-bound fragments')
+        episodes=set();packets=set();observations=set();last_by_clock={}
+        policy=self.fragments[0].policy_id
+        for fragment,clock in zip(self.fragments,self.clock_ids,strict=True):
+            _identity(clock,'Fragment clock')
+            if type(fragment) is not Rollout or fragment.policy_id!=policy or not fragment.transitions[0].recurrent_reset:
+                raise ValueError('Each batch fragment requires the same behavior policy and a fresh episode')
+            local_episodes={row.episode_id for row in fragment.transitions}
+            if episodes & local_episodes:raise ValueError('An episode cannot span clock/run fragments')
+            episodes.update(local_episodes)
+            if clock in last_by_clock and fragment.transitions[0].decision_nanos<last_by_clock[clock]:
+                raise ValueError('Same-clock fragments moved backwards')
+            last_by_clock[clock]=fragment.transitions[-1].next_decision_nanos
+            for index,row in enumerate(fragment.transitions):
+                if row.packet_id in packets or row.observation_id in observations:
+                    raise ValueError('Batch behavior observations/actions must be unique')
+                packets.add(row.packet_id);observations.add(row.observation_id)
+                if (index+1==len(fragment.transitions) or fragment.transitions[index+1].episode_id!=row.episode_id) and row.outcome not in (Outcome.TERMINATED,Outcome.TRUNCATED):
+                    raise ValueError('Only complete semantic episodes can cross a fragment boundary')
+
+    @property
+    def transitions(self):return tuple(row for fragment in self.fragments for row in fragment.transitions)
+    @property
+    def run_id(self):return self.fragments[0].run_id
+    @property
+    def policy_id(self):return self.fragments[0].policy_id
+
+
+@dataclass(frozen=True, slots=True)
 class ReturnConfig:
     discount_half_life_seconds: float = 30.0
     lambda_per_reference: float = 0.95
@@ -266,7 +306,7 @@ def duration_aware_gae(rollout: Rollout, config: ReturnConfig = ReturnConfig()) 
     value or the next episode's advantage. A final continuing row naturally
     bootstraps a collection cutoff without inventing a terminal outcome.
     """
-    if not isinstance(rollout, Rollout) or not isinstance(config, ReturnConfig):
+    if not isinstance(rollout, (Rollout, CompleteEpisodeBatch)) or not isinstance(config, ReturnConfig):
         raise ValueError("GAE requires validated rollout and return configuration")
     items = rollout.transitions
     count = len(items)

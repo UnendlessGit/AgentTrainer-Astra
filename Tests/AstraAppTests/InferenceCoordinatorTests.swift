@@ -32,6 +32,12 @@ private actor InferenceHarness {
     var ringPath: String?
     var references: [SharedFrameReference] = []
     var sequence: UInt64 = 0
+    var resetGeneration: UInt64 = 0
+    var rng: [UInt32] = [0, 0]
+    var preparationSeed: UInt64?
+    var resetSeeds: [JSONValue] = []
+    var resetTimeouts: [Duration] = []
+    var sampledResponse: WireMessage?
     var stateID = UUID()
     var episodeID = UUID()
     let rngStreamID = UUID()
@@ -51,7 +57,7 @@ private actor InferenceHarness {
     nonisolated func dependencies() -> InferenceDependencies {
         .init(runtime: { role, events, failure in
             InferenceRuntime(start: { await self.start(role, events: events, failure: failure) },
-                             request: { kind, payload, run, _, _ in try await self.request(role, kind, payload, run) },
+                             request: { kind, payload, run, timeout, _ in try await self.request(role, kind, payload, run, timeout: timeout) },
                              shutdown: { await self.shutdown(role) })
         }, capture: { _ in
             InferenceCapture(start: { frames, health in await self.capture(frames, health: health) }, stop: { await self.stopCapture() })
@@ -82,12 +88,13 @@ private actor InferenceHarness {
     func ack(_ payload: JSONValue = .object([:]), run: UUID, requestID: UUID = UUID()) -> WireMessage {
         WireMessage(kind: "ack", sequence: 1, requestID: requestID, runID: run, payload: payload)
     }
-    func request(_ role: String, _ kind: String, _ payload: JSONValue, _ run: UUID) async throws -> WireMessage {
+    func request(_ role: String, _ kind: String, _ payload: JSONValue, _ run: UUID, timeout: Duration) async throws -> WireMessage {
         requests.append(kind); currentRun = run
         let requestID = UUID()
         switch kind {
         case "inference.prepare":
-            sequence = 0
+            sequence = 0; resetGeneration = 0; preparationSeed = payload.fields?["seed"]?.uint64
+            rng = [0, UInt32(preparationSeed ?? 0)]
             collecting = payload.fields?["collection"] == .bool(true)
             ringPath = payload.fields?["ring"]?.fields?["path"]?.text
             return ack(.object(["runID": .string(run.uuidString), "checkpointID": .string(checkpoint.id.uuidString),
@@ -97,12 +104,19 @@ private actor InferenceHarness {
                                    "packet_capacity": .integer(16), "context_sizes": .array([])]),
                 "actions": try .encode(ActionCapabilities(keyCodes: [0])),
                 "collection": .bool(collecting && mode != "oldCollection"), "collectionVersion": .integer(1),
-                "rngStreamID": .string(rngStreamID.uuidString), "deterministic": .bool(!collecting)]), run: run)
+                "rngStreamID": .string(rngStreamID.uuidString), "deterministic": payload.fields?["deterministic"] ?? .bool(false),
+                "needsReset": .bool(true), "resumedActor": .bool(false), "nextPacketSequence": .unsigned(sequence),
+                "nextDrawIndex": .unsigned(sequence), "actorResetGeneration": .unsigned(resetGeneration)]), run: run)
         case "inference.reset":
             if collecting, payload.fields?["seed"] != nil { throw AstraError("fixture.reseed", "Collecting resets cannot reseed") }
+            resetTimeouts.append(timeout)
+            if let seed = payload.fields?["seed"] { resetSeeds.append(seed) }
+            resetGeneration += 1
             episodeID = try payload.required("episodeID").decode(UUID.self); stateID = UUID()
             return ack(.object(["runID": .string(run.uuidString), "episodeID": .string(episodeID.uuidString),
-                               "stateID": .string(stateID.uuidString), "needsReset": .bool(false)]), run: run)
+                "checkpointID": .string(checkpoint.id.uuidString), "policySignature": .string(checkpoint.policySignature),
+                "stateID": .string(stateID.uuidString), "needsReset": .bool(false), "nextPacketSequence": .unsigned(sequence),
+                "nextDrawIndex": .unsigned(sequence), "actorResetGeneration": .unsigned(resetGeneration)]), run: run)
         case "inference.warmup", "inference.step":
             let warming = kind == "inference.warmup"
             let reference = try payload.required("frames").decode([SharedFrameReference].self)[0]
@@ -136,20 +150,37 @@ private actor InferenceHarness {
                 fields["releasedFrames"] = try .encode([wrong])
             }
             if collecting && !warming && mode != "missingCollection" {
-                fields["collectionRecord"] = .object([
-                    "schemaVersion": .integer(1), "checkpointID": .string(checkpoint.id.uuidString),
-                    "policySignature": .string(checkpoint.policySignature), "episodeID": .string(episodeID.uuidString),
-                    "observationID": payload.fields?["observationID"] ?? .null,
-                    "previousStateID": payload.fields?["previousStateID"] ?? .null, "nextStateID": fields["stateID"] ?? .null,
-                    "cutoffNanos": .unsigned(cutoff), "frameIDs": try .encode([reference.metadata.id]),
-                    "contextIDs": .array([]), "episodeStep": .unsigned(sequence), "recurrentReset": .bool(sequence == 0),
-                    "logProbability": fields["logProbability"] ?? .null, "value": fields["value"] ?? .null,
-                    "sampler": .object(["kind": .string("categorical"), "temperature": .integer(1), "mixture": .string("none"),
-                                         "rngStreamID": .string(rngStreamID.uuidString), "drawIndex": .unsigned(sequence)])])
+                let after = rng.map { $0 &+ 1 }
+                let sampler: [String: JSONValue] = ["kind": .string("categorical"), "temperature": .integer(1), "mixture": .string("none"),
+                    "rngStreamID": .string(rngStreamID.uuidString), "drawIndex": .unsigned(sequence), "version": .integer(1),
+                    "stateBefore": try .encode(rng), "stateAfter": try .encode(after), "sampleKey": try .encode([UInt32(17), 23])]
+                var record: [String: JSONValue] = ["schemaVersion": .integer(1),
+                    "checkpointID": .string(checkpoint.id.uuidString), "policySignature": .string(checkpoint.policySignature),
+                    "episodeID": .string(episodeID.uuidString), "sampler": .object(sampler)]
+                record["observationID"] = payload.fields?["observationID"]
+                record["previousStateID"] = payload.fields?["previousStateID"]
+                record["nextStateID"] = fields["stateID"]
+                record["cutoffNanos"] = .unsigned(cutoff)
+                record["frameIDs"] = try .encode([reference.metadata.id])
+                record["geometryRevision"] = try payload.required("geometryRevision")
+                record["environmentResets"] = .unsigned(resetGeneration)
+                record["controlCoverageNanos"] = payload.fields?["controlCoverageNanos"]
+                record["contextIDs"] = .array([])
+                record["episodeStep"] = .unsigned(sequence)
+                record["recurrentReset"] = .bool(sequence == 0)
+                record["logProbability"] = fields["logProbability"]
+                record["value"] = fields["value"]
+                fields["collectionRecord"] = .object(record)
+                rng = after
             }
             if warming { fields["warmup"] = .bool(true) }
             else { sequence += 1; stateID = nextState }
-            return ack(.object(fields), run: run)
+            let response = ack(.object(fields), run: run)
+            if mode == "sampledDuringStop", !warming {
+                sampledResponse = response; stepWaiting = true
+                return try await withCheckedThrowingContinuation { suspendedStep = $0 }
+            }
+            return response
         case "arm":
             controlRun = run
             if ["armTakeoverEvent", "armEmergencyEvent", "armTakeoverError", "armEmergencyError"].contains(mode) {
@@ -264,7 +295,9 @@ private actor InferenceHarness {
     func shutdown(_ role: String) async -> Int32? {
         requests.append(role + ".shutdown")
         if role == "actor" {
-            suspendedStep?.resume(throwing: AstraError("compute.closed", "Fixture actor stopped.")); suspendedStep = nil
+            if let sampledResponse { suspendedStep?.resume(returning: sampledResponse) }
+            else { suspendedStep?.resume(throwing: AstraError("compute.closed", "Fixture actor stopped.")) }
+            suspendedStep = nil
             if mode == "blockedActor", !actorExited {
                 actorExitWaiting = true
                 await withCheckedContinuation { suspendedExit = $0 }
@@ -329,6 +362,7 @@ private final class CollectionSpy: @unchecked Sendable {
     let checkpoint: CheckpointDocument
     let harness: InferenceHarness
     let coordinator: InferenceCoordinator
+    let controlOwner: NativeControlOwner
     let source = CaptureSource(id: "display:1", name: "Fixture display", kind: .display, displayID: 1,
                                bounds: .init(x: 0, y: 0, width: 100, height: 100), pixelWidth: 32, pixelHeight: 32)
     init(mode: String) async throws {
@@ -341,6 +375,7 @@ private final class CollectionSpy: @unchecked Sendable {
         harness = InferenceHarness(mode: mode, checkpoint: checkpoint)
         var dependencies = harness.dependencies()
         dependencies.protectsPhysicalInputs = mode == "protectedGuardianRecovery" || mode == "oldControlProtection"
+        controlOwner = dependencies.controlOwner
         coordinator = InferenceCoordinator(store: store, root: root, dependencies: dependencies)
     }
     deinit { try? FileManager.default.removeItem(at: root) }
@@ -431,12 +466,27 @@ private final class CollectionSpy: @unchecked Sendable {
         #expect(await test.harness.allClosed)
     }
 
+    @Test func stopAfterSamplingRequiresTheSinkToHaveRetainedTheResult() async throws {
+        let test = try await InferenceTestCase(mode: "sampledDuringStop"), spy = CollectionSpy()
+        var options = InferenceOptions(); options.deterministic = false
+        try test.coordinator.start(agent: test.agent, checkpoint: test.checkpoint, source: test.source, options: options, collection: spy.sink())
+        try await test.wait { await test.harness.stepWaiting }
+        await test.coordinator.stopAndWait()
+        #expect(test.coordinator.producedPackets == 1 && test.coordinator.decisions == 0 && test.coordinator.executedPackets == 0)
+        #expect(test.coordinator.failure?.contains("random-stream progress is unverified") == true)
+        #expect(!spy.events.contains { if case .decision = $0 { true } else { false } })
+        #expect(test.coordinator.cleanupConfirmed && spy.completed && !spy.lateEvent)
+    }
+
     @Test func successfulRunWarmsWithoutControlAndReleasesResources() async throws {
         let test = try await InferenceTestCase(mode: "success")
         try test.start(); try await test.wait { test.coordinator.executedPackets >= 2 }
         await test.coordinator.stopAndWait()
         #expect(test.coordinator.failure == nil && !test.coordinator.isBusy && test.coordinator.cleanupConfirmed)
         #expect(test.coordinator.warmupLatencyMS.count == 3)
+        #expect(await test.harness.preparationSeed == 0)
+        #expect(await test.harness.resetSeeds.isEmpty)
+        #expect(await test.harness.resetTimeouts == [.seconds(20), .seconds(20)])
         let requests = await test.harness.requests
         #expect(requests.filter { $0 == "inference.prepare" }.count == 1)
         #expect(requests.filter { $0 == "inference.warmup" }.count == 3)
@@ -650,6 +700,24 @@ private final class CollectionSpy: @unchecked Sendable {
         #expect((test.coordinator.failure != nil) == rejectAudit)
         let summary = try await LearningFiles.read(#require(test.coordinator.resultsURL))
         #expect(summary.fields?["executedPackets"]?.int == test.coordinator.executedPackets)
+    }
+
+    @Test func currentCleanupAcknowledgementPersistsExactHistoryWithoutUpgradingTheRunProof() async throws {
+        let test = try await InferenceTestCase(mode: "controlCrashOnShutdown")
+        try test.start(); try await test.wait { test.coordinator.executedPackets >= 1 }
+        await test.coordinator.stopAndWait()
+        let report = try #require(test.coordinator.resultsURL), original = try Data(contentsOf: report)
+        let store = try LibraryStore(root: test.root)
+        let model = WorkspaceModel(inferenceCoordinator: test.coordinator, historyStore: store, historyRoot: test.root,
+            controlOwner: test.controlOwner, desktopLeaseURL: test.root.appendingPathComponent("history-control.lock"))
+        try await model.acknowledgeInferenceCleanup()
+        #expect(!test.coordinator.cleanupConfirmed && !test.coordinator.requiresManualControlCleanupAcknowledgement)
+        let unchanged = try Data(contentsOf: report)
+        #expect(test.controlOwner.priorCleanupJoined && unchanged == original)
+        let reopened = try LibraryStore(root: test.root)
+        try await reopened.inspectPriorInferenceRuns()
+        #expect(try await reopened.snapshot().issues.compactMap(\.controlHistory).isEmpty)
+        #expect(await model.prepareForTermination())
     }
 
 }

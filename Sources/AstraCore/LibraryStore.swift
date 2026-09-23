@@ -65,6 +65,12 @@ public struct LibraryIssue: Identifiable, Sendable {
     public let id: String
     public let collection: String
     public let message: String
+    public let controlHistory: ControlHistoryReview?
+    public let blocksLiveControl: Bool
+    public init(id: String, collection: String, message: String, controlHistory: ControlHistoryReview? = nil, blocksLiveControl: Bool = false) {
+        self.id = id; self.collection = collection; self.message = message
+        self.controlHistory = controlHistory; self.blocksLiveControl = blocksLiveControl
+    }
 }
 public struct LibrarySnapshot: Sendable {
     public var agents: [AgentDocument]
@@ -75,6 +81,8 @@ public struct LibrarySnapshot: Sendable {
     public var issues: [LibraryIssue]
     public var rewardPrograms: [RewardProgram] = []
     public var recordingSelections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
+    public var evaluations: [EvaluationDocument] = []
+    public var pendingFeedback: [PendingFeedbackDocument] = []
 }
 
 public enum DocumentNames {
@@ -121,7 +129,10 @@ public actor LibraryStore {
             try database.execute("CREATE TABLE IF NOT EXISTS learning_runs (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS agent_checkpoints (agent_id TEXT NOT NULL REFERENCES agents(id), checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id), PRIMARY KEY(agent_id,checkpoint_id))")
+            try database.execute("CREATE TABLE IF NOT EXISTS control_history_acknowledgements (location TEXT NOT NULL, directory_name TEXT NOT NULL, run_id TEXT NOT NULL, fingerprint TEXT NOT NULL, operator_acknowledged_at REAL NOT NULL, PRIMARY KEY(location,directory_name,fingerprint))")
+            try database.execute("CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS reward_programs (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
+            try database.execute("CREATE TABLE IF NOT EXISTS pending_feedback (id TEXT PRIMARY KEY, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
         }
         for folder in ["Recordings", "Models", "Datasets", "Jobs", "Caches", "Logs"] {
             try FileManager.default.createDirectory(at: self.root.appendingPathComponent(folder), withIntermediateDirectories: true)
@@ -154,6 +165,14 @@ public actor LibraryStore {
             do { return try value.validated() }
             catch { issues.append(.init(id: value.id.uuidString, collection: "reward_programs", message: error.localizedDescription)); return nil }
         }
+        let evaluations: [EvaluationDocument] = try documents(table: "evaluations", issues: &issues).compactMap { (value: EvaluationDocument) -> EvaluationDocument? in
+            do { return try value.validated() }
+            catch { issues.append(.init(id: value.id.uuidString, collection: "evaluations", message: error.localizedDescription)); return nil }
+        }
+        let pendingFeedback: [PendingFeedbackDocument] = try documents(table: "pending_feedback", maximumBytes: PendingFeedbackDocument.maximumBytes, issues: &issues).compactMap { (value: PendingFeedbackDocument) -> PendingFeedbackDocument? in
+            do { return try value.validated() }
+            catch { issues.append(.init(id: value.id.uuidString, collection: "pending_feedback", message: error.localizedDescription)); return nil }
+        }
         var selections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
         let recordingsByID = Dictionary(uniqueKeysWithValues: recordings.map { ($0.id, $0) })
         for agent in agents {
@@ -171,7 +190,26 @@ public actor LibraryStore {
                 }
             }
         }
-        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues, rewardPrograms: rewards, recordingSelections: selections)
+        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues, rewardPrograms: rewards, recordingSelections: selections, evaluations: evaluations, pendingFeedback: pendingFeedback)
+    }
+
+    public func savePendingFeedback(_ document: PendingFeedbackDocument) throws {
+        let value = try document.validated()
+        try database.transaction {
+            if let row = try database.query("SELECT CASE WHEN typeof(document)='blob' AND length(document)<=? THEN document END AS document FROM pending_feedback WHERE id=?", [
+                .integer(Int64(PendingFeedbackDocument.maximumBytes)), .text(value.id.uuidString)
+            ]).first {
+                guard let bytes = row["document"]?.data else {
+                    throw AstraError("feedback.pending", "The existing feedback catalog entry is invalid or exceeds its size limit.")
+                }
+                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+                let previous = try decoder.decode(PendingFeedbackDocument.self, from: bytes).validated()
+                try value.validateUpdate(from: previous)
+            }
+            try database.execute("INSERT INTO pending_feedback(id,document,created) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET document=excluded.document", [
+                .text(value.id.uuidString), .blob(try encode(value)), .real(value.createdAt.timeIntervalSince1970)
+            ])
+        }
     }
 
     public func saveRewardProgram(_ document: RewardProgram, for agentID: UUID) throws {
@@ -193,6 +231,28 @@ public actor LibraryStore {
             }
             agent.rewardProgramID = value.id; agent.modifiedAt = Date()
             try save(agent)
+        }
+    }
+
+    /// A running attempt may be finalized once; published metrics/provenance remain immutable.
+    public func saveEvaluation(_ document: EvaluationDocument) throws {
+        let value = try document.validated()
+        let encoded = try encode(value)
+        try database.transaction {
+            if let bytes = try database.query("SELECT document FROM evaluations WHERE id=?", [.text(value.id.uuidString)]).first?["document"]?.data {
+                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+                let previous = try decoder.decode(EvaluationDocument.self, from: bytes).validated()
+                guard previous.comparisonID == value.comparisonID, previous.agentID == value.agentID,
+                      previous.checkpointID == value.checkpointID, previous.checkpointName == value.checkpointName,
+                      previous.checkpointPolicySignature == value.checkpointPolicySignature,
+                      previous.protocolDefinition == value.protocolDefinition,
+                      abs(previous.createdAt.timeIntervalSince(value.createdAt)) < 0.001,
+                      previous.status == .running || bytes == encoded else {
+                    throw AstraError("evaluation.immutable", "A saved evaluation result or protocol cannot be overwritten.")
+                }
+            }
+            try database.execute("INSERT INTO evaluations(id,document,created) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET document=excluded.document", [
+                .text(value.id.uuidString), .blob(encoded), .real(value.createdAt.timeIntervalSince1970)])
         }
     }
 
@@ -241,57 +301,63 @@ public actor LibraryStore {
             run.issue = "The previous compute session ended before this run was finalized. Any published checkpoint is preserved."
             try saveLearningRun(run)
         }
+        let evaluations: [EvaluationDocument] = try documents(table: "evaluations", issues: &issues)
+        for var evaluation in evaluations where evaluation.status == .running {
+            evaluation.status = .interrupted; evaluation.finishedAt = Date()
+            evaluation.issue = "The previous compute session ended before this evaluation finished. No partial score was published."
+            try saveEvaluation(evaluation)
+        }
     }
 
-    /// Restore persisted control-cleanup warnings after acquiring the library
-    /// lease. This is evidence presentation, not an assertion of OS key state.
+    /// Call with the library lease held and outside an active control workflow.
+    /// Operator review is separate from the immutable native cleanup evidence.
     public func inspectPriorInferenceRuns() throws {
         inferenceIssues = []
-        do { try inspectInferenceHistory() }
-        catch {
-            inferenceIssues.append(.init(id: "inference.history", collection: "runs",
-                                        message: "Previous control cleanup could not be checked. " + error.localizedDescription))
+        for location in [ControlHistoryLocation.inference, .desktop] {
+            do {
+                for name in try ControlHistoryReader.names(root: root, location: location) {
+                    try Task.checkCancellation()
+                    guard UUID(uuidString: name) != nil else { continue }
+                    do {
+                        guard let review = try ControlHistoryReader.review(root: root, location: location, directoryName: name),
+                              try !historyAcknowledged(review) else { continue }
+                        inferenceIssues.append(.init(id: review.id, collection: "runs", message: review.message,
+                            controlHistory: review, blocksLiveControl: true))
+                    } catch is CancellationError { throw CancellationError() }
+                    catch {
+                        inferenceIssues.append(.init(id: location.rawValue + "." + name + ".history", collection: "runs",
+                            message: error.localizedDescription, blocksLiveControl: true))
+                    }
+                }
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                inferenceIssues.append(.init(id: location.rawValue + ".history", collection: "runs",
+                    message: "Previous control cleanup could not be checked. " + error.localizedDescription, blocksLiveControl: true))
+            }
         }
     }
 
-    private func inspectInferenceHistory() throws {
-        let folder = root.appendingPathComponent("Runs", isDirectory: true)
-        guard FileManager.default.fileExists(atPath: folder.path) else { return }
-        let values = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        guard values.isDirectory == true, values.isSymbolicLink != true else {
-            throw AstraError("inference.history", "The local run history must be a regular directory.")
+    public func controlHistoryReview(location: ControlHistoryLocation, runID: UUID) throws -> ControlHistoryReview? {
+        try ControlHistoryReader.review(root: root, location: location, directoryName: runID.uuidString.lowercased())
+    }
+
+    /// The caller must have joined its current workflows and hold an exclusive
+    /// desktop-control lease throughout this operation. This records only the
+    /// user's manual-release acknowledgement, never a successful native release.
+    public func acknowledgeControlHistory(_ expected: ControlHistoryReview) throws {
+        guard let current = try ControlHistoryReader.review(root: root, location: expected.location, directoryName: expected.directoryName),
+              current.runID == expected.runID, current.fingerprint == expected.fingerprint else {
+            throw AstraError("history.changed", "This run history changed since it was shown. Refresh and review the current cleanup warning.")
         }
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
-        let runs = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys)
-        guard runs.count <= 4096 else {
-            inferenceIssues = [.init(id: "inference.historyLimit", collection: "runs", message: "Run history is too large to check automatically. Review prior run results before starting live control.")]
-            return
-        }
-        for run in runs {
-            guard let identifier = UUID(uuidString: run.lastPathComponent) else { continue }
-            let values = try run.resourceValues(forKeys: Set(keys))
-            guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
-            let result = run.appendingPathComponent("results.json")
-            var message: String?
-            if !FileManager.default.fileExists(atPath: result.path) {
-                message = "A previous agent run was interrupted before its cleanup result was saved. Verify that no controls remain held before starting live control."
-            } else {
-                do {
-                    let properties = try result.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-                    guard properties.isRegularFile == true, properties.isSymbolicLink != true, (properties.fileSize ?? .max) <= 262_144 else {
-                        throw AstraError("inference.history", "A previous run result is missing, linked or oversized.")
-                    }
-                    let value = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: result))
-                    guard case .object(let fields) = value, case .string(let runID) = fields["runID"], UUID(uuidString: runID) == identifier else {
-                        throw AstraError("inference.history", "A previous run result has an inconsistent identity.")
-                    }
-                    if fields["cleanupConfirmed"] != .bool(true) {
-                        message = "A previous control helper ended without confirmed cleanup. Release any remaining held controls manually before starting another run."
-                    }
-                } catch { message = error.localizedDescription }
-            }
-            if let message { inferenceIssues.append(.init(id: identifier.uuidString + ".controlCleanup", collection: "runs", message: message)) }
-        }
+        try Task.checkCancellation()
+        try database.execute("INSERT INTO control_history_acknowledgements(location,directory_name,run_id,fingerprint,operator_acknowledged_at) VALUES(?,?,?,?,?) ON CONFLICT(location,directory_name,fingerprint) DO NOTHING", [
+            .text(current.location.rawValue), .text(current.directoryName), .text(current.runID.uuidString.lowercased()),
+            .text(current.fingerprint), .real(Date().timeIntervalSince1970)])
+        inferenceIssues.removeAll { $0.controlHistory?.id == current.id }
+    }
+    private func historyAcknowledged(_ review: ControlHistoryReview) throws -> Bool {
+        try !database.query("SELECT run_id FROM control_history_acknowledgements WHERE location=? AND directory_name=? AND fingerprint=? AND run_id=?", [
+            .text(review.location.rawValue), .text(review.directoryName), .text(review.fingerprint), .text(review.runID.uuidString.lowercased())]).isEmpty
     }
 
     public func save(_ document: AgentDocument) throws {
@@ -443,9 +509,10 @@ public actor LibraryStore {
 
     public func checkpoint() throws { try database.checkpoint() }
 
-    private func documents<T: Decodable & Identifiable>(table: String, includeArchived: Bool = false, issues: inout [LibraryIssue]) throws -> [T] where T.ID == UUID {
+    private func documents<T: Decodable & Identifiable>(table: String, includeArchived: Bool = false, maximumBytes: Int? = nil, issues: inout [LibraryIssue]) throws -> [T] where T.ID == UUID {
         // Table is selected exclusively by private call sites above.
-        let rows = try database.query("SELECT id,document FROM \(table) \(includeArchived ? "" : "WHERE archived=0") ORDER BY created DESC,id ASC")
+        let projection = maximumBytes == nil ? "document" : "CASE WHEN typeof(document)='blob' AND length(document)<=? THEN document END AS document"
+        let rows = try database.query("SELECT id,\(projection) FROM \(table) \(includeArchived ? "" : "WHERE archived=0") ORDER BY created DESC,id ASC", maximumBytes.map { [.integer(Int64($0))] } ?? [])
         var identities: Set<UUID> = []
         return rows.compactMap { row in
             do {

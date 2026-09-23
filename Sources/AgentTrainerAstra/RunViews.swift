@@ -16,6 +16,7 @@ struct RunView: View {
     let refreshSources: () -> Void
     let selectCheckpoint: (UUID?) -> Void
     let start: (CheckpointDocument, CaptureSource, InferenceOptions) -> Void
+    var acknowledgeCleanup: (() async throws -> Void)? = nil
 
     @State private var checkpointID: UUID?
     @State private var sourceID: String?
@@ -58,7 +59,7 @@ struct RunView: View {
                     Text("Move the pointer or press a key to take over. Control–Option–Command–Escape is the emergency stop. Astra releases the controls when the run ends.")
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
-                if let coordinator, !coordinator.phase.isEmpty { InferenceStatus(coordinator: coordinator) }
+                if let coordinator, !coordinator.phase.isEmpty { InferenceStatus(coordinator: coordinator, acknowledgeCleanup: acknowledgeCleanup) }
             }.padding(.trailing, 8).padding(.bottom, 20)
                 .frame(maxWidth: 850, alignment: .leading).frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -149,6 +150,8 @@ struct InferenceBanner: View {
 
 private struct InferenceStatus: View {
     let coordinator: InferenceCoordinator
+    let acknowledgeCleanup: (() async throws -> Void)?
+    @State private var acknowledging = false
     @State private var cleanupIssue: String?
     @State private var acknowledgedCleanupRun: UUID?
     var body: some View {
@@ -175,11 +178,18 @@ private struct InferenceStatus: View {
                 }.font(.callout)
                 if coordinator.requiresManualControlCleanupAcknowledgement {
                     Button("I’ve released the held controls") {
-                        do {
-                            try coordinator.acknowledgeManualControlCleanup()
-                            acknowledgedCleanupRun = coordinator.runID; cleanupIssue = nil
-                        } catch { cleanupIssue = error.localizedDescription }
+                        guard let acknowledgeCleanup, !acknowledging else { return }
+                        acknowledging = true
+                        let expectedRun = coordinator.runID
+                        Task {
+                            defer { acknowledging = false }
+                            do {
+                                try await acknowledgeCleanup()
+                                acknowledgedCleanupRun = expectedRun; cleanupIssue = nil
+                            } catch { if coordinator.runID == expectedRun { cleanupIssue = error.localizedDescription } }
+                        }
                     }
+                    .disabled(acknowledging || acknowledgeCleanup == nil)
                     .help("Confirm only after releasing any held keys or mouse buttons. The previous run keeps its unconfirmed cleanup result.")
                 } else if acknowledgedCleanupRun == coordinator.runID, acknowledgedCleanupRun != nil {
                     Text("Manual release acknowledged. You can start another run.").font(.callout).foregroundStyle(.secondary)

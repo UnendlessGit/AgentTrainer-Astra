@@ -112,6 +112,9 @@ private actor PolicyActorHarness {
                     "contextIDs": .array([]), "episodeStep": .unsigned(episodeStep), "recurrentReset": .bool(episodeStep == 0),
                     "environmentResets": .unsigned(generation), "logProbability": .number(-0.5), "value": .number(1),
                     "sampler": .object(sampler)])
+                if let coverage = payload.fields?["controlCoverageNanos"], var record = fields["collectionRecord"]?.fields {
+                    record["controlCoverageNanos"] = coverage; fields["collectionRecord"] = .object(record)
+                }
                 rng = after
             }
             if !warm { next += 1; episodeStep += 1; state = newState; lastPacket = packet }
@@ -172,6 +175,15 @@ private func actorEventually(_ condition: @escaping @Sendable () async -> Bool) 
         guard ContinuousClock.now < limit else { throw AstraError("fixture.timeout", "Actor fixture did not reach its boundary.") }
         try await Task.sleep(for: .milliseconds(1))
     }
+}
+
+private final class OwnedObservationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: PolicyActorOwnedObservation?
+    private var copies = 0
+    func copied() { lock.withLock { copies += 1 } }
+    func offer(_ value: PolicyActorOwnedObservation) { lock.withLock { stored = value } }
+    var snapshot: (PolicyActorOwnedObservation?, Int) { lock.withLock { (stored, copies) } }
 }
 
 @Suite struct PolicyActorSessionTests {
@@ -346,6 +358,171 @@ func collectionRejectsIneligibleHistoryBeforeSampling(kind: String) async throws
         _ = try await fixture.session.beginPrediction(fixture.snapshot(cutoff: 1_100_000_000)).value()
         Issue.record("An exhausted packet counter was reused")
     } catch let error as AstraError { #expect(error.code == "inference.counterExhausted") }
+    await fixture.session.shutdown()
+}
+
+
+@Test func actorControlCoverageCarriesSilentStateWithoutRetimestamping() async throws {
+    let fixture = try PolicyActorFixture(); defer { fixture.remove() }
+    try await fixture.prepare()
+    let original = try fixture.snapshot()
+    var controls = original.controls
+    controls.controlState.observedNanos -= 300_000_000
+    controls.controlCoverageNanos = controls.cutoffNanos
+    let snapshot = PolicyActorSnapshot(frame: original.frames[0], controls: controls)
+    let result = try await fixture.session.beginPrediction(snapshot).value()
+    #expect(result.observation.actorInput.fields?["controlCoverageNanos"]?.uint64 == controls.cutoffNanos)
+    #expect(result.response.payload.fields?["collectionRecord"]?.fields?["controlCoverageNanos"]?.uint64 == controls.cutoffNanos)
+    #expect(result.observation.actorInput.fields?["controlState"]?.fields?["observedNanos"]?.uint64 == controls.controlState.observedNanos)
+    await fixture.session.shutdown()
+}
+
+@Test(arguments: ["missing", "future", "backward", "invalid"])
+func actorControlCoverageRejectsUntrustedStateBeforeAcquiringPixels(mode: String) async throws {
+    let fixture = try PolicyActorFixture(); defer { fixture.remove() }
+    try await fixture.prepare()
+    let original = try fixture.snapshot()
+    var controls = original.controls
+    controls.controlState.observedNanos -= 300_000_000
+    if mode != "missing" { controls.controlCoverageNanos = controls.cutoffNanos + (mode == "future" ? 1 : 0) }
+    if mode == "backward" { controls.controlCoverageNanos = controls.cutoffNanos - 1 }
+    if mode == "invalid" { controls.controlState.valid = false }
+    let frame = InferenceImage(metadata: original.frames[0].metadata, pixels: {
+        Issue.record("Untrusted control coverage acquired source pixels")
+        return Data(repeating: 0, count: 4096)
+    })
+    let count = await fixture.harness.requests.count
+    await #expect(throws: (any Error).self) {
+        try await fixture.session.beginPrediction(PolicyActorSnapshot(frame: frame, controls: controls)).value()
+    }
+    #expect(await fixture.harness.requests.count == count)
+    #expect(await fixture.session.state.sampledProgressKnown)
+    await fixture.session.shutdown()
+}
+
+@Test func actorPermitsInitialPhysicalResetBeforePredictionAndExcludesPausedOrStoppedReset() async throws {
+    let fixture = try PolicyActorFixture(); defer { fixture.remove() }
+    _ = try await fixture.session.prepare(checkpoint: fixture.checkpoint, collection: true)
+    let prepared = try #require(await fixture.session.binding)
+    #expect(prepared.canReset && !prepared.isAvailable && prepared.state.episodeID == nil)
+    _ = try await fixture.session.reset(confirmedEpisodeID: UUID(), contextIDs: [])
+    let pause = try await fixture.session.acquireLearningPause()
+    #expect(await fixture.session.binding?.canReset == false)
+    try await fixture.session.releaseLearningPause(pause)
+    #expect(await fixture.session.binding?.canReset == true)
+    await fixture.session.requestStop()
+    #expect(await fixture.session.binding?.canReset == false)
+    await fixture.session.shutdown()
+}
+
+@Test func actorBindingAndObservationHookRetainOneExactOwnedCopy() async throws {
+    let fixture = try PolicyActorFixture(mode: "blocked"); defer { fixture.remove() }
+    #expect(await fixture.session.binding == nil)
+    try await fixture.prepare()
+    let binding = try #require(await fixture.session.binding)
+    let runID = await fixture.session.runID
+    #expect(binding.runID == runID && binding.checkpoint.matchesIdentity(of: fixture.checkpoint.document))
+    #expect(binding.isAvailable)
+    #expect(binding.collecting && binding.policy.periodMS == 100 && binding.state.episodeStep == 0)
+    let input = try fixture.snapshot(), probe = OwnedObservationProbe()
+    var controls = input.controls; controls.controlCoverageNanos = controls.cutoffNanos
+    let frame = InferenceImage(metadata: input.frames[0].metadata, pixels: {
+        probe.copied(); return try input.frames[0].pixels()
+    })
+    let ticket = try await fixture.session.beginPrediction(.init(observationID: input.observationID, frame: frame, controls: controls),
+                                                           onObservation: { probe.offer($0) })
+    try await actorEventually { await fixture.harness.blocked }
+    let before = probe.snapshot
+    #expect(before.1 == 1)
+    let observed = try #require(before.0)
+    #expect(observed.frames[0].metadata.codec == "raw")
+    #expect(observed.actorInput.fields?["controlCoverageNanos"]?.uint64 == controls.cutoffNanos)
+    #expect(observed.actorInput.fields?["frames"] == nil)
+    await fixture.harness.releaseStep()
+    let result = try await ticket.value()
+    #expect(observed.actorInput == result.observation.actorInput)
+    #expect(observed.frames[0].pixels == result.observation.frames[0].pixels)
+    #expect(probe.snapshot.1 == 1)
+    await fixture.session.shutdown()
+}
+
+@Test func observationHookFailureReleasesUnsentLeasesWithoutConsumingADraw() async throws {
+    let fixture = try PolicyActorFixture(); defer { fixture.remove() }
+    try await fixture.prepare()
+    let count = await fixture.harness.requests.count
+    await #expect(throws: (any Error).self) {
+        try await fixture.session.beginPrediction(fixture.snapshot(), onObservation: { _ in
+            throw AstraError("fixture.full", "The evidence queue cannot accept these pixels.")
+        }).value()
+    }
+    #expect(await fixture.harness.requests.count == count)
+    let state = await fixture.session.state
+    #expect(state.sampledProgressKnown && state.nextPacketSequence == 0 && state.actorProgress == nil)
+    // The first slot is now writer-owned again; no worker saw its reference.
+    let file = try FileHandle(forReadingFrom: fixture.ringURL)
+    try file.seek(toOffset: UInt64(SharedFrameRing.headerBytes))
+    let slotState = try #require(try file.read(upToCount: 4))
+    try file.close()
+    #expect(slotState == Data(repeating: 0, count: 4))
+    await fixture.session.shutdown()
+}
+
+@Test func learningPauseExcludesEveryComputeOperationUntilMatchingRelease() async throws {
+    let fixture = try PolicyActorFixture(); defer { fixture.remove() }
+    try await fixture.prepare()
+    let result = try await fixture.session.beginPrediction(fixture.snapshot()).value()
+    let pause = try await fixture.session.acquireLearningPause()
+    let runID = await fixture.session.runID
+    #expect(pause.binding.runID == runID && pause.binding.state.actorProgress == result.actorProgress)
+    #expect(await fixture.session.binding?.isAvailable == false)
+    let count = await fixture.harness.requests.count
+    try await fixture.session.validateLearningPause(pause)
+    await #expect(throws: (any Error).self) { try await fixture.session.acquireLearningPause() }
+    await #expect(throws: (any Error).self) { try await fixture.session.reset(confirmedEpisodeID: UUID(), contextIDs: []) }
+    await #expect(throws: (any Error).self) { try await fixture.session.warmup(fixture.snapshot(cutoff: 1_100_000_000)) }
+    await #expect(throws: (any Error).self) { try await fixture.session.beginPrediction(fixture.snapshot(cutoff: 1_100_000_000)) }
+    await #expect(throws: (any Error).self) { try await fixture.session.prepare(checkpoint: fixture.checkpoint, collection: true) }
+    #expect(await fixture.harness.requests.count == count)
+    #expect(await fixture.session.state == pause.binding.state)
+    try await fixture.session.releaseLearningPause(pause)
+    let next = try await fixture.session.acquireLearningPause()
+    await #expect(throws: (any Error).self) { try await fixture.session.releaseLearningPause(pause) }
+    try await fixture.session.validateLearningPause(next)
+    try await fixture.session.releaseLearningPause(next)
+    #expect(await fixture.session.binding?.isAvailable == true)
+    _ = try await fixture.session.reset(confirmedEpisodeID: UUID(), contextIDs: [])
+    await fixture.session.shutdown()
+}
+
+@Test func learningPauseRejectsForeignOwnersAndCannotReopenAfterStop() async throws {
+    let first = try PolicyActorFixture(), second = try PolicyActorFixture()
+    defer { first.remove(); second.remove() }
+    try await first.prepare(); try await second.prepare()
+    let pause = try await first.session.acquireLearningPause()
+    #expect(pause.binding.state.actorProgress == nil) // An idle hold is not a learning sample.
+    await #expect(throws: (any Error).self) { try await second.session.validateLearningPause(pause) }
+    await #expect(throws: (any Error).self) { try await second.session.releaseLearningPause(pause) }
+    try await first.session.validateLearningPause(pause)
+    await first.session.shutdown()
+    await #expect(throws: (any Error).self) { try await first.session.validateLearningPause(pause) }
+    await #expect(throws: (any Error).self) { try await first.session.releaseLearningPause(pause) }
+    await #expect(throws: (any Error).self) { try await first.session.beginPrediction(first.snapshot()) }
+    #expect(await first.session.state.joined)
+    await second.session.shutdown()
+}
+
+@Test func learningPauseCannotBeAcquiredDuringAnUnresolvedPrediction() async throws {
+    let fixture = try PolicyActorFixture(mode: "blocked"); defer { fixture.remove() }
+    try await fixture.prepare()
+    let ticket = try await fixture.session.beginPrediction(fixture.snapshot())
+    try await actorEventually { await fixture.harness.blocked }
+    await #expect(throws: (any Error).self) { try await fixture.session.acquireLearningPause() }
+    #expect(!(await fixture.session.state.sampledProgressKnown))
+    await fixture.harness.releaseStep(); _ = try await ticket.value()
+    let pause = try await fixture.session.acquireLearningPause()
+    try await fixture.session.validateLearningPause(pause)
+    await fixture.session.requestStop()
+    await #expect(throws: (any Error).self) { try await fixture.session.releaseLearningPause(pause) }
     await fixture.session.shutdown()
 }
 

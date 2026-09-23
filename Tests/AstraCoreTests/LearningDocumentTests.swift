@@ -12,7 +12,7 @@ import Testing
     try await store.inspectPriorInferenceRuns()
     let snapshot = try await store.snapshot()
     #expect(snapshot.agents == [agent])
-    #expect(snapshot.issues.contains { $0.id == "inference.history" && $0.message.contains("could not be checked") })
+    #expect(snapshot.issues.contains { $0.id == "Runs.history" && $0.message.contains("could not be checked") })
 }
 
 @Test func unconfirmedInputCleanupRemainsVisibleAfterWorkspaceReopen() async throws {
@@ -23,11 +23,11 @@ import Testing
     let run = root.appendingPathComponent("Runs/\(id.uuidString.lowercased())")
     try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
     try await store.inspectPriorInferenceRuns()
-    #expect(try await store.snapshot().issues.contains { $0.collection == "runs" && $0.message.contains("interrupted") })
+    #expect(try await store.snapshot().issues.contains { $0.controlHistory?.runID == id && $0.blocksLiveControl })
     let result: JSONValue = .object(["runID": .string(id.uuidString), "cleanupConfirmed": .bool(false)])
     try JSONEncoder().encode(result).write(to: run.appendingPathComponent("results.json"))
     try await store.inspectPriorInferenceRuns()
-    #expect(try await store.snapshot().issues.contains { $0.collection == "runs" && $0.message.contains("without confirmed") })
+    #expect(try await store.snapshot().issues.contains { $0.controlHistory?.runID == id && $0.blocksLiveControl })
     let settled: JSONValue = .object(["runID": .string(id.uuidString), "cleanupConfirmed": .bool(true)])
     try JSONEncoder().encode(settled).write(to: run.appendingPathComponent("results.json"))
     try await store.inspectPriorInferenceRuns()

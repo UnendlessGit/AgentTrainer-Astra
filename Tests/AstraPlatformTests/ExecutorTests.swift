@@ -478,3 +478,55 @@ func executorStoppedArmingCannotPublishALateLease(cause: ControlStopCause) throw
     f.executor.disarm()
     #expect(f.backend.posted.last?.operation == .buttonUp && f.backend.posted.last?.location == Point2D(x: 20, y: 20))
 }
+
+
+@Test func executorControlCoveragePreservesSilentStateAgeAndStopsAtHealthLoss() throws {
+    let fixture = ExecutorFixture(); try fixture.executor.arm(fixture.arm)
+    let first = try fixture.executor.observation()
+    #expect(first.controlCoverageNanos == first.cutoffNanos)
+    fixture.clock.advance(ms: 300)
+    try fixture.executor.heartbeat(runID: fixture.run)
+    let silent = try fixture.executor.observation()
+    #expect(silent.controlState == first.controlState)
+    #expect(silent.controlCoverageNanos == silent.cutoffNanos && silent.cutoffNanos > first.cutoffNanos)
+    try silent.validateControlCoverage()
+    var legacy = silent; legacy.controlCoverageNanos = nil
+    #expect(throws: AstraError.self) { try legacy.validateControlCoverage() }
+    fixture.backend.setHealthy(false)
+    let failed = try fixture.executor.observation()
+    #expect(failed.controlCoverageNanos == nil && !failed.controlState.valid)
+    #expect(failed.controlState.observedNanos == first.controlState.observedNanos)
+    fixture.backend.setHealthy(true)
+    #expect(try fixture.executor.observation().controlCoverageNanos == nil)
+    #expect(waitForControl { fixture.executor.cleanupSettled })
+}
+
+@Test func executorControlCoverageNeverCertifiesExpiredOrIncompleteHistory() throws {
+    let expired = ExecutorFixture(); try expired.executor.arm(expired.arm)
+    expired.clock.advance(ms: 500)
+    let observation = try expired.executor.observation()
+    #expect(observation.controlCoverageNanos == nil && !observation.controlState.valid)
+    #expect(waitForControl { expired.executor.cleanupSettled })
+    let gap = ExecutorFixture(historyCapacity: 1); try gap.executor.arm(gap.arm)
+    try gap.executor.execute(gap.packet([TimedCommand(offsetMs: 0, operation: .keyDown, keyCode: 0),
+                                        TimedCommand(offsetMs: 1, operation: .keyRepeat, keyCode: 0)]))
+    gap.executor.service(); gap.clock.advance(ms: 1); gap.executor.service()
+    let incomplete = try gap.executor.observation()
+    #expect(!incomplete.intervalCovered && incomplete.controlCoverageNanos == nil)
+}
+
+@Test func controlCoverageRejectsShiftedProofAndDecodesLegacySnapshots() throws {
+    var state = ControlState(); state.valid = true; state.observedNanos = 1
+    let legacy = try JSONValue.object(["controlState": try .encode(state), "executedEvents": .array([]),
+        "intervalCovered": .bool(true), "cutoffNanos": .integer(300_000_001)]).decode(ControlObservation.self)
+    #expect(legacy.controlCoverageNanos == nil)
+    #expect(throws: AstraError.self) { try legacy.validateControlCoverage() }
+    for shifted: UInt64 in [300_000_000, 300_000_002] {
+        var invalid = legacy; invalid.controlCoverageNanos = shifted
+        #expect(throws: AstraError.self) { try invalid.validateControlCoverage() }
+    }
+    var covered = legacy; covered.controlCoverageNanos = covered.cutoffNanos
+    try covered.validateControlCoverage()
+    covered.intervalCovered = false
+    #expect(throws: AstraError.self) { try covered.validateControlCoverage() }
+}

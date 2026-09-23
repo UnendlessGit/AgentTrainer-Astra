@@ -65,7 +65,10 @@ private struct StatusMenu: View {
         if model.isRecording || model.recordingStarting {
             Button("Stop Recording") { Task { await model.stopRecording() } }.disabled(model.recordingStopping)
         }
-        if let learning = model.learning, learning.isBusy {
+        if let desktop = model.desktopLearning, desktop.isBusy {
+            Text(desktop.phase)
+            Button("Stop Desktop Learning") { desktop.requestStop() }.disabled(desktop.isStopping)
+        } else if let learning = model.learning, learning.isBusy {
             Text(learning.phase)
             Button("Stop Learning") { Task { await learning.requestStop() } }.disabled(learning.isStopping)
         }
@@ -113,7 +116,8 @@ struct WorkspaceView: View {
             } else {
                 VStack(spacing: 0) {
                     if model.isRecording || model.recordingStarting { RecordingBanner(model: model) }
-                    if let learning = model.learning, learning.isBusy { LearningBanner(learning: learning) }
+                    if let desktop = model.desktopLearning, desktop.isBusy { DesktopLearningBanner(host: desktop) }
+                    else if let learning = model.learning, learning.isBusy { LearningBanner(learning: learning) }
                     if let inference = model.inference, inference.isBusy { InferenceBanner(coordinator: inference) }
                     if !model.issues.isEmpty { recoveryBanner }
                     switch model.destination {
@@ -142,6 +146,13 @@ struct WorkspaceView: View {
             RecordingInspector(recording: recording, directory: model.supportRoot.appendingPathComponent("Recordings")
                 .appendingPathComponent(recording.id.uuidString + ".astrarecord"), workspace: model, agentID: model.recordingInspectionAgentID)
         }
+        .sheet(item: Binding(get: { model.desktopLearning?.reviewPresentation }, set: { value in
+            if value == nil { model.desktopLearning?.cancelFeedbackReview() }
+        })) { review in
+            FeedbackReviewView(model: review.model) { review.finish($0) }
+                .frame(idealWidth: 960, idealHeight: 760)
+                .onDisappear { Task { await review.cancelAndJoin() } }
+        }
         .alert("Workspace needs attention", isPresented: Binding(
             get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } }
         )) { Button("OK") { model.errorMessage = nil } } message: { Text(model.errorMessage ?? "") }
@@ -155,18 +166,40 @@ struct WorkspaceView: View {
     }
 
     private var recoveryBanner: some View {
-        HStack(alignment: .top) {
+        let review = model.pendingControlHistory.first
+        return HStack(alignment: .top, spacing: 12) {
             Image(systemName: "exclamationmark.triangle")
-            VStack(alignment: .leading, spacing: 3) {
-                Text("\(model.issues.count) workspace items need attention").fontWeight(.medium)
-                Text(model.issues.first?.message ?? "")
+            VStack(alignment: .leading, spacing: 5) {
+                Text(review == nil ? "\(model.issues.count) workspace items need attention" : "Review previous control cleanup")
+                    .fontWeight(.medium)
+                if let review { Text(review.title).font(.caption).foregroundStyle(.secondary) }
+                Text(review?.message ?? model.issues.first?.message ?? "")
                     .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                HStack {
+                    if let review {
+                        Button("I’ve released the held controls") {
+                            Task {
+                                do { try await model.acknowledgeControlHistory(review) }
+                                catch { model.errorMessage = error.localizedDescription }
+                            }
+                        }
+                        .disabled(model.historyReviewUnavailableReason(review) != nil)
+                        .help(model.historyReviewUnavailableReason(review) ?? "Acknowledge this exact history without changing its native cleanup result.")
+                    }
+                    Button("Refresh History") { Task { await model.refreshControlHistory() } }
+                        .disabled(model.isRunningAgent || model.isLearning || model.isRecording)
+                    if model.controlHistoryBusy { ProgressView().controlSize(.small) }
+                }
+                if model.pendingControlHistory.count > 1 {
+                    Text("\(model.pendingControlHistory.count - 1) other control histories also need review.").font(.caption).foregroundStyle(.secondary)
+                }
             }
-            Spacer()
+            Spacer(minLength: 8)
         }
         .padding(12).background(.yellow.opacity(0.12))
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
+
 }
 
 private struct AgentWorkspace: View {
@@ -227,7 +260,8 @@ private struct AgentWorkspace: View {
                             selectedCheckpointID: agent.selectedCheckpointID,
                             refreshSources: { Task { await model.refreshPermissionsAndSources() } },
                             selectCheckpoint: { id in Task { await model.selectCheckpoint(id, agentID: agent.id) } },
-                            start: { checkpoint, source, options in model.startInference(agent: agent, checkpoint: checkpoint, source: source, options: options) })
+                            start: { checkpoint, source, options in model.startInference(agent: agent, checkpoint: checkpoint, source: source, options: options) },
+                            acknowledgeCleanup: { try await model.acknowledgeInferenceCleanup() })
                         .task(id: agent.selectedCheckpointID) { await model.inspectCheckpointContexts(agent.selectedCheckpointID, agentID: agent.id) }
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)

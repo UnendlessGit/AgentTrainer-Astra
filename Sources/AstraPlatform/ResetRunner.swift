@@ -160,7 +160,7 @@ public final class ResetRunner: @unchecked Sendable {
         guard let state = lock.withLock({ active }), state.context.resetID == resetID else { return false }
         return state.cancel()
     }
-    public func run(context: ResetContext, program: RewardProgram) async throws -> ResetResult {
+    public func run(context: ResetContext, program: RewardProgram, cancellation: ResetCancellation? = nil) async throws -> ResetResult {
         let program = try program.validated()
         let evaluator = try RewardEvaluator(program: program)
         if let plan = program.resetPlan {
@@ -173,6 +173,12 @@ public final class ResetRunner: @unchecked Sendable {
         try lock.withLock {
             guard active == nil else { throw AstraError("reset.busy", "A reset is already running or joining cleanup.") }
             active = state
+        }
+        do { try cancellation?.attach(resetID: context.resetID, cancellation: { _ = state.cancel() }) }
+        catch {
+            state.finish()
+            lock.withLock { if active === state { active = nil } }
+            throw error
         }
         let watchdog = Task { [now] in
             while !Task.isCancelled {
@@ -188,6 +194,7 @@ public final class ResetRunner: @unchecked Sendable {
             await perform(context: context, program: program, evaluator: evaluator, state: state)
         } onCancel: { _ = state.cancel() }
         state.finish(); watchdog.cancel(); await watchdog.value
+        cancellation?.detach()
         lock.withLock { if active === state { active = nil } }
         return result
     }

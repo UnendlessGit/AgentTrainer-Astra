@@ -21,9 +21,12 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private(set) var recordings: [RecordingManifest] = []
     private(set) var learningRuns: [LearningRunDocument] = []
     private(set) var checkpoints: [CheckpointDocument] = []
+    private(set) var evaluations: [EvaluationDocument] = []
     private(set) var rewardPrograms: [RewardProgram] = []
     private(set) var learning: LearningCoordinator?
     private(set) var inference: InferenceCoordinator?
+    private(set) var desktopLearning: DesktopLearningHost?
+    private(set) var pendingFeedback: [PendingFeedbackDocument] = []
     private(set) var refreshingSources = false
     private(set) var sourceIssue: String?
     private(set) var checkpointContextSizes: [Int] = []
@@ -46,6 +49,13 @@ enum AgentSection: String, CaseIterable, Identifiable {
     var errorMessage: String?
     var showingNewAgent = false
     private var store: LibraryStore?
+    private let historyRoot: URL?
+    private let controlOwner: NativeControlOwner
+    private let desktopLeaseURL: URL
+    private(set) var controlHistoryBusy = false
+    private var controlStartupWork: Task<Void, Never>?
+    private var controlStartupGeneration: UUID?
+    private let controlPreflightInspection: @Sendable (LibraryStore) async throws -> Void
     private var libraryLease: LibraryLease?
     private var started = false
     private var acknowledgedUnconfirmedControlRun: UUID?
@@ -56,8 +66,17 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private(set) var recordingSelections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
     private(set) var checkpointLinks: [UUID: Set<UUID>] = [:]
 
-    init(inferenceCoordinator: InferenceCoordinator? = nil) {
-        self.inference = inferenceCoordinator
+    init(inferenceCoordinator: InferenceCoordinator? = nil, historyStore: LibraryStore? = nil, historyRoot: URL? = nil,
+         controlOwner: NativeControlOwner = .shared, desktopLeaseURL: URL = DesktopControlLock.standardURL,
+         controlPreflightInspection: @escaping @Sendable (LibraryStore) async throws -> Void = WorkspaceModel.inspectControlHistory) {
+        self.inference = inferenceCoordinator; store = historyStore; self.historyRoot = historyRoot
+        self.controlOwner = controlOwner; self.desktopLeaseURL = desktopLeaseURL
+        self.controlPreflightInspection = controlPreflightInspection
+        if historyStore != nil { started = true; loading = false }
+    }
+
+    nonisolated static func inspectControlHistory(_ store: LibraryStore) async throws {
+        try await store.inspectPriorInferenceRuns()
     }
 
     var selectedAgent: AgentDocument? {
@@ -66,6 +85,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     var supportRoot: URL {
+        if let historyRoot { return historyRoot }
         if let path = ProcessInfo.processInfo.environment["ASTRA_WORKSPACE_ROOT"], !path.isEmpty {
             return URL(fileURLWithPath: path, isDirectory: true)
         }
@@ -88,6 +108,12 @@ enum AgentSection: String, CaseIterable, Identifiable {
                 catch { self?.errorMessage = error.localizedDescription }
             }
             inference = InferenceCoordinator(store: opened.1, root: root)
+            if let learning {
+                desktopLearning = DesktopLearningHost(store: opened.1, root: root, learner: learning) { [weak self] in
+                    do { try await self?.refresh() }
+                    catch { self?.errorMessage = error.localizedDescription }
+                }
+            }
             _ = try await store?.recoverInterruptedRecordings()
             try await store?.markAbandonedLearningRunsInterrupted()
             try await store?.inspectPriorInferenceRuns()
@@ -233,11 +259,15 @@ enum AgentSection: String, CaseIterable, Identifiable {
 
     var isRecording: Bool { recorder != nil }
 
-    var isLearning: Bool { learning?.isBusy == true }
-    var isRunningAgent: Bool { inference?.isBusy == true }
+    var isLearning: Bool { learning?.isBusy == true || desktopLearning?.isBusy == true }
+    var isRunningAgent: Bool { inference?.isBusy == true || desktopLearning?.isBusy == true || controlHistoryBusy }
+    var pendingControlHistory: [ControlHistoryReview] { issues.compactMap(\.controlHistory) }
+    var controlHistoryBlockReason: String? { issues.first(where: \.blocksLiveControl)?.message }
 
     var inferenceUnavailableReason: String? {
         if isClosing { return "The workspace is closing." }
+        if controlHistoryBusy { return "Checking previous control cleanup…" }
+        if let controlHistoryBlockReason { return controlHistoryBlockReason }
         if isRecording || recordingStarting || recordingStopping { return "Finish recording before running an agent." }
         if isLearning { return "Finish learning before starting live control." }
         return nil
@@ -247,7 +277,9 @@ enum AgentSection: String, CaseIterable, Identifiable {
         do {
             guard inferenceUnavailableReason == nil else { throw AstraError("inference.busy", inferenceUnavailableReason!) }
             guard let inference else { throw AstraError("inference.workspace", "The workspace is still opening.") }
-            try inference.start(agent: agent, checkpoint: checkpoint, source: source, options: options)
+            try startAfterHistoryReview {
+                try inference.start(agent: agent, checkpoint: checkpoint, source: source, options: options)
+            }
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -285,10 +317,41 @@ enum AgentSection: String, CaseIterable, Identifiable {
         catch { errorMessage = error.localizedDescription }
     }
 
+    func evaluateCheckpoints(_ checkpoints: [CheckpointDocument], agentID: UUID, datasetCheckpoint: CheckpointDocument, split: String) {
+        do {
+            guard !isClosing, !isRunningAgent else { throw AstraError("learning.closing", "Stop live control before starting evaluation.") }
+            guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
+            try learning.evaluate(checkpoints: checkpoints, agentID: agentID, datasetCheckpoint: datasetCheckpoint, split: split)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
     func startReinforcementTraining(agent: AgentDocument, options: ReinforcementOptions) throws {
         guard !isClosing, !isRunningAgent else { throw AstraError("learning.closing", "Stop live control before starting learning.") }
         guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
         try learning.startReinforcement(agent: agent, options: options)
+    }
+
+    func startDesktopTraining(agent: AgentDocument, source: CaptureSource, program: RewardProgram, options: DesktopLearningOptions) throws {
+        guard !isClosing, !isRunningAgent, !isLearning, !isRecording, !recordingStarting, !recordingStopping, !saving else {
+            throw AstraError("desktop.busy", "Finish recording, learning and live control before starting desktop training.")
+        }
+        guard let desktopLearning else { throw AstraError("desktop.workspace", "The workspace is still opening.") }
+        if let controlHistoryBlockReason { throw AstraError("history.reviewRequired", controlHistoryBlockReason) }
+        try startAfterHistoryReview {
+            try desktopLearning.start(agent: agent, source: source, program: program, options: options)
+        }
+    }
+
+    func reopenFeedback(_ document: PendingFeedbackDocument, source: CaptureSource? = nil) throws {
+        guard !isClosing, !isRunningAgent, !isLearning, !isRecording, !saving,
+              let desktopLearning, let agent = agents.first(where: { $0.id == document.agentID }),
+              let saved = pendingFeedback.first(where: { $0.id == document.id }), saved == document else {
+            throw AstraError("feedback.workspace", "Finish the current workflow and choose the latest saved feedback item.")
+        }
+        try startAfterHistoryReview {
+            if let source { try desktopLearning.continueFeedback(saved, agent: agent, source: source) }
+            else { try desktopLearning.resumeFeedback(saved, agent: agent) }
+        }
     }
 
     func selectCheckpoint(_ id: UUID?, agentID: UUID) async {
@@ -303,25 +366,36 @@ enum AgentSection: String, CaseIterable, Identifiable {
         } catch { errorMessage = error.localizedDescription }
     }
 
-    func stopLearningAndWait() async { await learning?.stopAndWait() }
+    func stopLearningAndWait() async {
+        if desktopLearning?.isBusy == true { await desktopLearning?.stopAndWait() }
+        else { await learning?.stopAndWait() }
+    }
 
     @discardableResult
     func prepareForTermination() async -> Bool {
         isClosing = true
+        let starting = controlStartupWork; starting?.cancel()
         // Both owners receive stop promptly. The application exits only after
         // capture is sealed and learning has published its terminal checkpoint.
         async let recording: Void = stopRecording()
         async let learning: Void = stopLearningAndWait()
         async let inferenceStop: Void = inference?.stopAndWait() ?? ()
         _ = await (recording, learning, inferenceStop)
-        while recordingStarting || recordingStopping || saving {
+        await starting?.value
+        while recordingStarting || recordingStopping || saving || controlHistoryBusy {
             try? await Task.sleep(for: .milliseconds(50))
         }
-        if let inference, let run = inference.runID, !inference.cleanupConfirmed,
+        if let inference, let run = inference.runID, inference.requiresManualControlCleanupAcknowledgement,
            acknowledgedUnconfirmedControlRun != run {
             acknowledgedUnconfirmedControlRun = run
             isClosing = false
             errorMessage = "The control helper exited before input cleanup could be confirmed. Release any held controls manually. Quit again when you are ready to close Astra."
+            return false
+        }
+        if let warning = desktopLearning?.cleanupWarning, acknowledgedUnconfirmedControlRun != warning.sessionID {
+            acknowledgedUnconfirmedControlRun = warning.sessionID
+            isClosing = false
+            errorMessage = "Desktop control cleanup could not be confirmed. Release any held controls manually. Quit again when you are ready to close Astra."
             return false
         }
         return true
@@ -366,11 +440,133 @@ enum AgentSection: String, CaseIterable, Identifiable {
         return selection.ranges == nil ? "All usable · \(seconds) s" : "\(ranges.count) \(ranges.count == 1 ? "interval" : "intervals") · \(seconds) s"
     }
 
+    func refreshControlHistory() async {
+        guard !controlHistoryBusy else { return }
+        do {
+            try requireIdleForHistory(allowClosing: false)
+            guard let store else { throw AstraError("history.workspace", "The workspace is still opening.") }
+            controlHistoryBusy = true
+            defer { controlHistoryBusy = false }
+            try await store.inspectPriorInferenceRuns(); try await refresh()
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func historyReviewUnavailableReason(_ review: ControlHistoryReview) -> String? {
+        if controlHistoryBusy { return "Another cleanup review is still finishing." }
+        do { try requireIdleForHistory(allowClosing: false); _ = try cleanupRoute(review); return nil }
+        catch { return error.localizedDescription }
+    }
+
+    func acknowledgeControlHistory(_ review: ControlHistoryReview) async throws {
+        try await acknowledgeHistory(location: review.location, runID: review.runID, expected: review)
+    }
+    func acknowledgeInferenceCleanup() async throws {
+        guard let inference, inference.requiresManualControlCleanupAcknowledgement, let run = inference.runID else {
+            throw AstraError("history.currentRun", "There is no completed agent cleanup warning to acknowledge.")
+        }
+        try await acknowledgeHistory(location: .inference, runID: run, expected: nil)
+    }
+    func acknowledgeDesktopCleanup() async throws {
+        guard let desktopLearning, !desktopLearning.isBusy, desktopLearning.cleanupWarning != nil,
+              let run = desktopLearning.completedReportRunID else {
+            throw AstraError("history.currentRun", "There is no completed desktop cleanup warning to acknowledge.")
+        }
+        try await acknowledgeHistory(location: .desktop, runID: run, expected: nil)
+    }
+
+    private enum CleanupRoute { case history, inference(UUID), desktop(UUID) }
+    private func cleanupRoute(_ review: ControlHistoryReview) throws -> CleanupRoute {
+        if let warning = controlOwner.pendingManualCleanup {
+            if review.location == .inference, warning.runID == review.runID,
+               inference?.runID == review.runID, inference?.requiresManualControlCleanupAcknowledgement == true {
+                return .inference(warning.sessionID)
+            }
+            if review.location == .desktop, desktopLearning?.completedReportRunID == review.runID,
+               desktopLearning?.cleanupWarning?.sessionID == warning.sessionID {
+                return .desktop(warning.sessionID)
+            }
+            throw AstraError("history.currentOwner", "Resolve the current run’s cleanup warning before acknowledging other history.")
+        }
+        guard controlOwner.priorCleanupJoined else {
+            throw AstraError("history.activeOwner", "A current control owner is still running or joining cleanup.")
+        }
+        return .history
+    }
+    private func requireIdleForHistory(allowClosing: Bool) throws {
+        guard allowClosing || !isClosing, inference?.isBusy != true, desktopLearning?.isBusy != true,
+              learning?.isBusy != true, !isRecording, !recordingStarting, !recordingStopping, !saving else {
+            throw AstraError("history.activeWorkflow", "Finish current recording, learning and control work before reviewing previous cleanup.")
+        }
+    }
+    private func acknowledgeHistory(location: ControlHistoryLocation, runID: UUID, expected: ControlHistoryReview?) async throws {
+        guard !controlHistoryBusy, let store else { throw AstraError("history.busy", "Wait for the workspace or current cleanup review to finish.") }
+        try requireIdleForHistory(allowClosing: false)
+        controlHistoryBusy = true
+        defer { controlHistoryBusy = false }
+        // A surviving orphaned helper/guardian holds this same flock even when
+        // its old app has gone. History never authorizes stopping that owner.
+        let lease = try DesktopControlLock(url: desktopLeaseURL)
+        defer { withExtendedLifetime(lease) {} }
+        let review: ControlHistoryReview
+        if let expected { review = expected }
+        else {
+            guard let current = try await store.controlHistoryReview(location: location, runID: runID) else {
+                throw AstraError("history.changed", "This report no longer contains the cleanup warning that was shown.")
+            }
+            review = current
+        }
+        let route = try cleanupRoute(review)
+        do { try await store.acknowledgeControlHistory(review) }
+        catch {
+            try? await store.inspectPriorInferenceRuns(); try? await refresh()
+            throw error
+        }
+        // The global lease remains held through both the durable operator
+        // record and the matching in-memory acknowledgement.
+        try requireIdleForHistory(allowClosing: true)
+        switch route {
+        case .history:
+            guard controlOwner.priorCleanupJoined else { throw AstraError("history.activeOwner", "Control ownership changed while this history was reviewed.") }
+        case .inference(let session):
+            guard controlOwner.pendingManualCleanup?.sessionID == session else { throw AstraError("history.changedOwner", "The current cleanup warning changed.") }
+            try inference?.acknowledgeManualControlCleanup()
+        case .desktop(let session):
+            guard controlOwner.pendingManualCleanup?.sessionID == session else { throw AstraError("history.changedOwner", "The current cleanup warning changed.") }
+            try desktopLearning?.acknowledgeManualCleanup()
+        }
+        try await refresh()
+    }
+
+    /// Recheck disk history immediately before each new live workflow. This
+    /// keeps a replaced/new report from inheriting a previously cached consent.
+    private func startAfterHistoryReview(_ start: @escaping @MainActor () throws -> Void) throws {
+        guard !controlHistoryBusy, let store else { throw AstraError("history.busy", "Wait for the workspace or current cleanup review to finish.") }
+        try requireIdleForHistory(allowClosing: false)
+        controlHistoryBusy = true
+        let generation = UUID(); controlStartupGeneration = generation
+        controlStartupWork = Task {
+            defer {
+                if controlStartupGeneration == generation { controlHistoryBusy = false; controlStartupWork = nil; controlStartupGeneration = nil }
+            }
+            do {
+                try await controlPreflightInspection(store); try await refresh()
+                try Task.checkCancellation(); try requireIdleForHistory(allowClosing: false)
+                guard controlStartupGeneration == generation else { throw CancellationError() }
+                guard controlHistoryBlockReason == nil else {
+                    throw AstraError("history.reviewRequired", "Review the previous control-cleanup warning before starting live control.")
+                }
+                try start()
+            } catch is CancellationError { }
+            catch { errorMessage = error.localizedDescription }
+        }
+    }
+
     private func refresh() async throws {
         guard let store else { return }
         let snapshot = try await store.snapshot()
         agents = snapshot.agents; environments = snapshot.environments; recordings = snapshot.recordings; issues = snapshot.issues
-        learningRuns = snapshot.learningRuns; checkpoints = snapshot.checkpoints
+        learningRuns = snapshot.learningRuns; checkpoints = snapshot.checkpoints; evaluations = snapshot.evaluations
+        pendingFeedback = snapshot.pendingFeedback
         rewardPrograms = snapshot.rewardPrograms
         recordingSelections = snapshot.recordingSelections
         var links: [UUID: Set<UUID>] = [:]

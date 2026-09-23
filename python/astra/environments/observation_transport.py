@@ -5,7 +5,7 @@ import copy
 import numpy as np
 from astra.recordings import validate_frame, validate_event
 from .interface import (EnvironmentError, EnvironmentObservation, SurfaceObservation, integer, identifier,
-                        fields, uuid_key, same_id, owned_bgra)
+                        fields, uuid_key, same_id, owned_bgra, control_observation)
 
 
 def json_geometry(surface):
@@ -52,7 +52,7 @@ class SnapshotDecoder:
         self._last_event_sequence=None
 
     def decode(self, value, *, episode, expected_cutoff=None):
-        fields(value, ('id', 'episodeID', 'cutoffNanos', 'geometryRevision', 'frames', 'controlState', 'events'))
+        fields(value, ('id', 'episodeID', 'cutoffNanos', 'geometryRevision', 'frames', 'controlState', 'events'), ('controlCoverageNanos',))
         obs_id = identifier(value['id'])
         cutoff = integer(value['cutoffNanos'])
         if expected_cutoff is not None and cutoff != expected_cutoff:
@@ -61,6 +61,22 @@ class SnapshotDecoder:
             raise EnvironmentError('Observation identity is stale or belongs to another episode')
         if type(value['frames']) is not list or not 1 <= len(value['frames']) <= self.spec.maximum_surfaces:
             raise EnvironmentError('Observation exceeds its declared surface capacity')
+        # State authority and input causality are checked before any lease copy.
+        control_coverage=value.get('controlCoverageNanos')
+        control_observation(value['controlState'],cutoff,control_coverage,maximum_age_ms=self.spec.maximum_frame_age_ms)
+        last_event_sequence=self._last_event_sequence
+        if type(value['events']) is not list or len(value['events']) > 4096:
+            raise EnvironmentError('Executed-input history exceeds its bounded window')
+        events = []
+        for raw in value['events']:
+            event = copy.deepcopy(validate_event(raw, maximum_timestamp=2**64 - 1))
+            if event['eventNanos'] > event['observedNanos'] or max(event['eventNanos'], event['observedNanos']) > cutoff or (
+                last_event_sequence is not None and event['sequence'] <= last_event_sequence):
+                raise EnvironmentError('Executed-input history is future, duplicated or out of order')
+            if event['origin'] in ('physical', 'boundary') or event['kind'] == 'gap':
+                raise EnvironmentError('External intervention or an input-history gap invalidates the rollout')
+            last_event_sequence = event['sequence']
+            events.append(event)
         prepared, acknowledgements = [], []
         byte_count = 0
         for frame in value['frames']:
@@ -85,30 +101,15 @@ class SnapshotDecoder:
             owned = owned_bgra(resolved.pixels)
             prepared.append(SurfaceObservation(owned, metadata, coverage, frame['coverageKind']))
             acknowledgements.append(copy.deepcopy(resolved.acknowledgement))
-            # Every successful ownership transfer is released even if another
-            # surface or later control metadata invalidates this observation.
+            # Every successful ownership transfer is released even if a later
+            # surface fails. Control authority/history were checked above.
             self._on_consumed(obs_id, [acknowledgements[-1]])
         observation = EnvironmentObservation(obs_id, episode, cutoff, integer(value['geometryRevision']),
-            tuple(prepared), copy.deepcopy(value['controlState'])).validate(self.spec)
-        if not observation.control_state['valid']:
-            raise EnvironmentError('Authoritative controls are unavailable for this observation')
-        if cutoff - observation.control_state['observedNanos'] > self.spec.maximum_frame_age_ms * 1000000:
-            raise EnvironmentError('Authoritative controls are stale at this observation cutoff')
+            tuple(prepared), copy.deepcopy(value['controlState']),control_coverage).validate(self.spec)
         geometry = (observation.geometry_revision, tuple(json_geometry(frame.metadata['surface']) for frame in prepared))
         if self._geometry is not None and geometry != self._geometry:
             raise EnvironmentError('Surface roles or geometry changed without a confirmed reset')
         self._geometry = geometry
-        if type(value['events']) is not list or len(value['events']) > 4096:
-            raise EnvironmentError('Executed-input history exceeds its bounded window')
-        events = []
-        for raw in value['events']:
-            event = copy.deepcopy(validate_event(raw, maximum_timestamp=2**64 - 1))
-            if event['eventNanos'] > event['observedNanos'] or max(event['eventNanos'], event['observedNanos']) > cutoff or (
-                self._last_event_sequence is not None and event['sequence'] <= self._last_event_sequence):
-                raise EnvironmentError('Executed-input history is future, duplicated or out of order')
-            if event['origin'] in ('physical', 'boundary') or event['kind'] == 'gap':
-                raise EnvironmentError('External intervention or an input-history gap invalidates the rollout')
-            self._last_event_sequence = event['sequence']
-            events.append(event)
+        self._last_event_sequence=last_event_sequence
         self._observations.add(uuid_key(obs_id))
         return observation, tuple(events)

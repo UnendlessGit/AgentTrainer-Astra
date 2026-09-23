@@ -52,6 +52,20 @@ def controls(value, cutoff):
     return value
 
 
+
+def control_observation(value, cutoff, coverage_nanos=None, *, maximum_age_ms=250, interval_covered=True):
+    """Validate authority without changing state/event times or model features."""
+    controls(value, cutoff)
+    if value['valid'] is not True or interval_covered is not True:
+        raise EnvironmentError('Authoritative controls or their input history are unavailable')
+    if coverage_nanos is not None:
+        if integer(coverage_nanos) != cutoff or coverage_nanos < value['observedNanos']:
+            raise EnvironmentError('Control coverage must certify this exact observation cutoff')
+    elif cutoff-value['observedNanos'] > maximum_age_ms*1000000:
+        raise EnvironmentError('Authoritative controls are stale without current coverage')
+    return value
+
+
 def owned_bgra(pixels):
     """Reuse proven immutable byte backing; detach other producer storage."""
     base = pixels
@@ -157,6 +171,7 @@ class EnvironmentObservation:
     geometry_revision: int
     frames: tuple[SurfaceObservation, ...]
     control_state: dict
+    control_coverage_nanos: int | None = None
 
     def validate(self, spec: EnvironmentSpec):
         identifier(self.id); identifier(self.episode_id); integer(self.cutoff_nanos); integer(self.geometry_revision)
@@ -168,7 +183,8 @@ class EnvironmentObservation:
             raise EnvironmentError('Observation surface roles must be unique')
         if sum(frame.pixels.nbytes for frame in self.frames) > spec.maximum_observation_bytes:
             raise EnvironmentError('Observation exceeds its declared byte capacity')
-        controls(self.control_state, self.cutoff_nanos)
+        control_observation(self.control_state,self.cutoff_nanos,self.control_coverage_nanos,
+                            maximum_age_ms=spec.maximum_frame_age_ms)
         return self
 
 

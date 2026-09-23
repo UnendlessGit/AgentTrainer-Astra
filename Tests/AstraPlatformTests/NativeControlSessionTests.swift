@@ -339,3 +339,23 @@ func controlWait(_ condition: () -> Bool) async throws {
     await #expect(throws: AstraError.self) { try await session.start() }
     #expect(fixture.startCount == 1)
 }
+
+@Test func nativeControlAtomicDispatchRetainsARealRejectionWhenStopWinsAfterTheCallerChecks() async throws {
+    let fixture = ControlRuntimeFixture(), owner = NativeControlOwner()
+    let config = try controlConfiguration(root: FileManager.default.temporaryDirectory)
+    let session = NativeControlSession(configuration: config, owner: owner, runtimeFactory: fixture.factory)
+    _ = try await session.start()
+    try session.checkHealth() // Caller selected live dispatch from this state.
+    let packet = controlPacket(config)
+    session.requestStop() // Deterministic stop before packet reservation.
+    let submitted = try await session.submitPreservingStoppedPacket(packet)
+    #expect(!submitted.admitted && submitted.reply.kind == "error")
+    #expect(try await submitted.terminalReceipt().status == .rejected)
+    #expect(fixture.sentPackets == [packet.id])
+    await #expect(throws: AstraError.self) { try await session.submitPreservingStoppedPacket(packet) }
+    var foreign = controlPacket(config, sequence: 1); foreign.runID = UUID()
+    await #expect(throws: AstraError.self) { try await session.submitPreservingStoppedPacket(foreign) }
+    #expect(fixture.sentPackets == [packet.id])
+    #expect(await session.shutdown().cleanupConfirmed)
+    await #expect(throws: AstraError.self) { try await session.submitPreservingStoppedPacket(controlPacket(config, sequence: 1)) }
+}

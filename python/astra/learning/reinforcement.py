@@ -125,6 +125,7 @@ class ObservationRecord:
     elapsed_seconds: float
     reset: bool
     last_input_nanos: int | None = None
+    control_coverage_nanos: int | None = None
 
     @classmethod
     def capture(cls, observation: EnvironmentObservation, *, events=(), elapsed_seconds: float, reset: bool,
@@ -132,7 +133,8 @@ class ObservationRecord:
         images = tuple(ObservationImage(spool.append(frame.pixels) if spool is not None else _frozen_array(frame.pixels),
                                         _json(frame.metadata)) for frame in observation.frames)
         record = cls(images, observation.id, observation.episode_id, observation.cutoff_nanos, observation.geometry_revision,
-                     _json(observation.control_state), _json(events), elapsed_seconds, reset, last_input_nanos)
+                     _json(observation.control_state), _json(events), elapsed_seconds, reset, last_input_nanos,
+                     observation.control_coverage_nanos)
         if spool is not None:
             spool.reserve_metadata(record.metadata_byte_count)
         return record
@@ -175,6 +177,8 @@ class CollectedDecision:
     bootstrap_observation: ObservationRecord | None
     outcome_detail: str | None = None
     commands_json: bytes | None = None
+    endpoint_observation: ObservationRecord | None = None
+    retrospective_json: bytes | None = None
 
     def packet(self):
         return PacketBatch(**{name: mx.array(values, dtype=mx.int32)[None]

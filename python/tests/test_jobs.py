@@ -587,3 +587,31 @@ def test_reinforcement_jobs_save_actual_complete_episode_counts_and_retire_spool
                 and row['payload'].get('phase') == 'finishing_episode']
     assert progress and any(row['rollout_decisions'] > row['rollout_target'] for row in progress)
     assert all(row.get('audit_tail_decisions', 0) == 0 for row in result['iterationMetrics'])
+
+
+
+def test_bounded_output_preserves_required_actor_boundary_under_metric_replacement_and_reclamation():
+    stream=PausedOutput();sender=BoundedSender(stream,maximum_messages=2,maximum_bytes=4096)
+    request=Message('train.reinforcement.external',0,{},request_id=str(uuid.uuid4()),run_id=str(uuid.uuid4()))
+    try:
+        sender.send('ack',{'jobID':'fixture'},request=request)
+        assert stream.entered.wait(2)
+        sender.send('job.progress',{'phase':'waiting_for_actor_boundary','jobID':'fixture'},request=request)
+        for value in range(50):sender.send('job.progress',{'phase':'updating','value':value},request=request)
+        sender.send('job.completed',{'jobID':'fixture'},request=request)
+        stream.release.set();assert sender.close()
+        messages=[Message.decode(line+b'\n') for line in stream.getvalue().splitlines()]
+        assert [value.kind for value in messages]==['ack','job.progress','job.completed']
+        assert messages[1].payload['phase']=='waiting_for_actor_boundary'
+        assert [value.sequence for value in messages]==[0,1,2]
+    finally:stream.release.set();sender.close()
+
+
+def test_undeliverable_actor_boundary_fails_channel_instead_of_silently_dropping_handshake():
+    stream=PausedOutput();sender=BoundedSender(stream,maximum_messages=1)
+    try:
+        sender.send('ack',{});assert stream.entered.wait(2)
+        sender.send('ack',{})
+        with pytest.raises(OutputOverflow):sender.send('job.progress',{'phase':'waiting_for_actor_boundary'})
+        assert sender.failed.is_set()
+    finally:stream.release.set();sender.close()

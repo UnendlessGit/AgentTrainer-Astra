@@ -41,6 +41,9 @@ public final class NativeControlOwner: @unchecked Sendable {
     private var unconfirmed: NativeControlCompletion?
     public init() {}
     public var priorCleanupJoined: Bool { lock.withLock { owner == nil && unconfirmed == nil } }
+    /// Immutable evidence from a joined, unconfirmed helper. Reading this never
+    /// acknowledges the warning or changes the historical cleanup result.
+    public var pendingManualCleanup: NativeControlCompletion? { lock.withLock { unconfirmed } }
     fileprivate func acquire(_ id: UUID) throws {
         try lock.withLock {
             guard owner == nil, unconfirmed == nil else { throw AstraError("control.previousOwner", "The previous control owner has not joined confirmed cleanup.") }
@@ -275,17 +278,27 @@ public final class NativeControlSession: @unchecked Sendable {
         }
         lock.withLock { heartbeat = task }
     }
-    public func submit(_ packet: ActionPacket) async throws -> NativeControlSubmission { try await submit(packet, late: false) }
-    public func rejectLatePacket(_ packet: ActionPacket) async throws -> NativeControlSubmission { try await submit(packet, late: true) }
-    private func submit(_ packet: ActionPacket, late: Bool) async throws -> NativeControlSubmission {
+    private enum SubmissionMode: Equatable { case liveOnly, lateOnly, preservingStop }
+    public func submit(_ packet: ActionPacket) async throws -> NativeControlSubmission { try await submit(packet, mode: .liveOnly) }
+    public func rejectLatePacket(_ packet: ActionPacket) async throws -> NativeControlSubmission { try await submit(packet, mode: .lateOnly) }
+    /// One reservation decides whether this never-submitted produced packet
+    /// enters live admission or obtains a real rejection after disarm. Never
+    /// retry this API after an uncertain transport outcome.
+    public func submitPreservingStoppedPacket(_ packet: ActionPacket) async throws -> NativeControlSubmission {
+        try await submit(packet, mode: .preservingStop)
+    }
+    private func submit(_ packet: ActionPacket, mode: SubmissionMode) async throws -> NativeControlSubmission {
         _ = try packet.validated(capabilities: configuration.capabilities, surfaces: configuration.scope.surfaces, capacity: configuration.packetCapacity)
         let promise = NativeReceiptPromise()
         let task = try lock.withLock { () throws -> Task<NativeControlSubmission, any Error> in
+            let late = mode == .lateOnly || (mode == .preservingStop && stopped)
             guard !closing, runtime != nil, packet.runID == configuration.runID, pending.count < 32,
-                  pending[packet.id] == nil, !recentSet.contains(packet.id), late ? stopped : (armed && !stopped && packet.sequence == nextSequence) else {
+                  pending[packet.id] == nil, !recentSet.contains(packet.id),
+                  mode == .lateOnly || packet.sequence == nextSequence,
+                  late ? stopped : (armed && !stopped) else {
                 throw AstraError("control.admission", "The packet is stale, duplicated, out of order or belongs to closed control admission.")
             }
-            if !late { guard nextSequence < UInt64.max else { throw AstraError("control.sequence", "The control sequence is exhausted.") }; nextSequence += 1 }
+            if mode != .lateOnly { guard nextSequence < UInt64.max else { throw AstraError("control.sequence", "The control sequence is exhausted.") }; nextSequence += 1 }
             pending[packet.id] = Pending(packet: packet, promise: promise)
             recent.append(packet.id); recentSet.insert(packet.id)
             if recent.count > 2048 { recentSet.remove(recent.removeFirst()) }

@@ -13,6 +13,9 @@ mode = '__MODE__'
 sequence = 0
 lock = threading.Lock()
 cancel = threading.Event()
+boundary = threading.Event()
+waiting_sent = threading.Event()
+active_request = active_job = None
 thread = None
 def send(kind, payload, request=None):
     global sequence
@@ -45,7 +48,34 @@ def perform(request, job):
         manifest=json.loads((pathlib.Path(value['path'])/'manifest.json').read_text())
         result=dict(manifest=manifest,parameterCount=10,integrityVerified=True)
     elif op=='evaluate.behavioral':
-        result=dict(evaluation=dict(available=True,split=value['split'],decisions=2,meanNLL=.75))
+        checkpoint=json.loads((pathlib.Path(value['checkpointPath'])/'manifest.json').read_text())
+        score=dict(available=False,split=value['split'],reason='No independent sessions in this split') if mode=='evaluationUnavailable' else dict(available=True,split=value['split'],decisions=2,meanNLL=.75)
+        result=dict(evaluation=score,checkpointID=checkpoint['id'],provenance='practice_oracle',
+                    datasetID=str(uuid.uuid5(uuid.NAMESPACE_URL,json.dumps(value['dataset'],sort_keys=True))))
+    elif op in ('train.reinforcement.external','checkpoint.externalBoundary'):
+        preserving=op=='checkpoint.externalBoundary'
+        package=json.loads((pathlib.Path(value['auditPath' if preserving else 'rolloutPath'])/'manifest.json').read_text())
+        metric=dict(iteration=1,elapsed_seconds=1.5,mean_reward=.25,mean_value_loss=.3,mean_policy_loss=-.1,
+                    maximum_sampled_kl=.001,clip_fraction=.05,optimizer_updates=1,decisions=2,peak_memory_bytes=1024)
+        if not preserving:
+            send('job.progress',dict(jobID=job,phase='updating',sourceKind='external_rollout',**metric),request)
+            if mode=='externalWaitCancel':cancel.wait(10)
+            send('job.progress',dict(jobID=job,phase='waiting_for_actor_boundary',sourceKind='external_rollout',**metric),request)
+            waiting_sent.set()
+            if not boundary.wait(5):
+                send('job.failed',dict(jobID=job,error=dict(message='No fixture boundary')),request);return
+        initial=json.loads((pathlib.Path(value['checkpointPath'])/'manifest.json').read_text())
+        manifest=artifact(value['destination'],'reinforcement',initial['model'],initial['actions'])
+        progress=package['actorProgress']
+        if mode=='externalWrongProgress':progress={**progress,'drawIndex':progress['drawIndex']+1}
+        manifest.update(parentID=initial['id'],metrics=dict(iteration=0 if preserving else 1,optimizer_updates=0 if preserving or cancel.is_set() else 1))
+        (pathlib.Path(value['destination'])/'manifest.json').write_text(json.dumps(manifest))
+        result=dict(manifest=manifest,checkpointPath=value['destination'],checkpointPublished=True,
+            parameterCount=10,cancelled=cancel.is_set(),sourceKind='external_rollout',provenance='external_rollout',
+            resumable=True,requiresEnvironmentReset=True,actorProgress=progress,
+            boundaryCollectionID=package['id'],metrics=None if preserving or cancel.is_set() else metric)
+        if preserving:result['boundaryOnly']=True
+        else:result['rolloutID']=package['rolloutID']
     else:
         if mode=='waitBeforeTraining':
             send('job.progress',dict(jobID=job,phase='preparing'),request)
@@ -87,7 +117,17 @@ for line in sys.stdin:
         break
     if kind=='cancel':
         cancel.set();send('ack',dict(status='cancelling'),request);continue
+    if kind=='job.externalBoundary':
+        assert request['runID']==active_request['runID'] and request['payload']['jobID']==active_job
+        assert request['payload']['auditPath']==active_request['payload']['rolloutPath']
+        send('ack',dict(jobID=str(uuid.uuid4()) if mode=='externalWrongAck' else active_job,status='boundary_queued'),request)
+        boundary.set();continue
     job=str(uuid.uuid4())
+    active_request,active_job=request,job
+    if mode=='externalEarlyBoundary' and kind=='train.reinforcement.external':
+        thread=threading.Thread(target=perform,args=(request,job));thread.start()
+        assert waiting_sent.wait(5)
+        send('ack',dict(jobID=job,status='queued'),request);continue
     if mode=='earlyEverything' or (mode=='earlyTerminal' and not kind.startswith('train.')):
         perform(request,job);send('ack',dict(jobID=job,status='queued'),request)
     else:
@@ -130,6 +170,41 @@ private final class Fixture {
     }
 }
 
+@MainActor private func makeExternalBatch(fixture: Fixture, store: LibraryStore, agent: AgentDocument) async throws -> DesktopLearningBatch {
+    let identity = DesktopEvidenceIdentity(runID: UUID(), clockID: UUID(), environmentID: UUID(), actorSourceID: UUID(), environmentSourceID: UUID())
+    let checkpoint = CheckpointDocument(id: UUID(), agentID: agent.id, runID: nil, name: "Behavior fixture", kind: "behavioral",
+        trainingStep: 1, policySignature: String(repeating: "a", count: 64), parameterCount: 10)
+    try await store.saveCheckpoint(checkpoint)
+    let source = fixture.root.appendingPathComponent("Models/\(checkpoint.id.uuidString.lowercased())")
+    try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+    try JSONEncoder().encode(JSONValue.object(["id": .string(checkpoint.id.uuidString.lowercased()), "model": .object([:]), "actions": .object([:])]))
+        .write(to: source.appendingPathComponent("manifest.json"))
+    let id = UUID(), episode = UUID(), destination = fixture.root.appendingPathComponent("Rollouts/\(id.uuidString.lowercased())")
+    let progress: JSONValue = .object(["schemaVersion": .integer(1), "runID": .string(identity.runID.uuidString.lowercased()),
+        "rngStreamID": .string(UUID().uuidString.lowercased()), "drawIndex": .integer(1),
+        "rngState": .array([.integer(10), .integer(20)]), "actorResetGeneration": .integer(1)])
+    let binding: JSONValue = .object(["runID": .string(identity.runID.uuidString.lowercased()),
+        "clockID": .string(identity.clockID.uuidString.lowercased()), "actorSourceID": .string(identity.actorSourceID.uuidString.lowercased()),
+        "environmentSourceID": .string(identity.environmentSourceID.uuidString.lowercased()),
+        "policyID": .string(checkpoint.id.uuidString.lowercased()), "policySignature": .string(checkpoint.policySignature),
+        "purpose": .string("learning"), "model": .object([:]), "training": .object([:]), "environment": .object([:]), "contextIDs": .array([])])
+    let manifest: JSONValue = .object(["schemaVersion": .integer(1), "id": .string(id.uuidString.lowercased()),
+        "rolloutID": .string(UUID().uuidString.lowercased()), "status": .string("sealed"), "controlClosureKnown": .bool(true),
+        "actorProgress": progress, "decisions": .integer(2), "binding": binding,
+        "actorSampling": .array([.string("categorical"), .integer(1), .string("none"), .integer(1)])])
+    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+    try JSONEncoder().encode(manifest).write(to: destination.appendingPathComponent("manifest.json"))
+    let result = WireMessage(kind: "collector.sealed", sequence: 0, runID: identity.runID, payload: .object([
+        "collectionID": .string(id.uuidString.lowercased()), "path": .string(destination.path), "manifest": manifest,
+        "actorProgress": progress, "learningEligible": .bool(true), "controlClosureKnown": .bool(true)]))
+    let join = DesktopEpisodeJoin(runID: identity.runID, episodeID: episode, generationID: UUID(), actorJoined: true,
+        controlJoined: true, manualProducerJoined: true, predictionResolved: true, cleanupConfirmed: true,
+        stoppedNanos: 100, lastProducedSequence: 1, stop: .semanticBoundary(100))
+    let state = PolicyActorState(nextPacketSequence: 2, nextDrawIndex: 2, actorResetGeneration: 1, episodeStep: 2,
+        episodeID: episode, stateID: UUID(), actorProgress: progress, sampledProgressKnown: true, stopped: false, joined: false)
+    return try DesktopLearningBatch(identity: identity, checkpoint: checkpoint, destination: destination, result: result, joins: [join], actorState: state)
+}
+
 @MainActor private func waitUntil(_ condition: () -> Bool) async throws {
     let limit = ContinuousClock.now.advanced(by: .seconds(10))
     while !condition() {
@@ -139,6 +214,115 @@ private final class Fixture {
 }
 
 @Suite(.serialized) @MainActor struct LearningCoordinatorTests {
+    @Test func stoppedActorBoundaryPublishesWithoutLaunchingAnUpdate() async throws {
+        let fixture = try Fixture("externalNormal"), store = try LibraryStore(root: fixture.root)
+        let agent = AgentDocument(name: "Stopped collection"); try await store.save(agent)
+        let batch = try await makeExternalBatch(fixture: fixture, store: store, agent: agent)
+        let coordinator = LearningCoordinator(store: store, root: fixture.root, bundle: fixture.bundle, changed: {})
+        let result = try await coordinator.preserveExternalBoundary(agent: agent, boundary: batch.boundary, resume: false, validateBoundary: {})
+        let checkpoint = try #require(result.checkpoint)
+        #expect(result.actorProgress == batch.actorProgress && checkpoint.trainingStep == batch.checkpoint.trainingStep)
+        #expect(try fixture.operations() == ["checkpoint.externalBoundary", "shutdown"])
+        #expect(coordinator.activeRun?.updates == 0 && coordinator.reinforcementMetrics.isEmpty)
+        #expect(coordinator.phase == "Desktop checkpoint saved · ready for a fresh reset")
+        let configuration = try await LearningFiles.read(fixture.root.appendingPathComponent("Jobs/\(result.runID.uuidString.lowercased())/configuration.json"))
+        #expect(configuration.fields?["operation"] == .string("checkpoint.externalBoundary"))
+        #expect(configuration.fields?["rolloutID"] == .null)
+    }
+
+    @Test func desktopPolicyPreparationCreatesAndInspectsWithoutClaimingTraining() async throws {
+        let fixture = try Fixture("earlyEverything"), store = try LibraryStore(root: fixture.root)
+        let agent = AgentDocument(name: "Fresh desktop policy"); try await store.save(agent)
+        let coordinator = LearningCoordinator(store: store, root: fixture.root, bundle: fixture.bundle, changed: {})
+        let actions = ActionCapabilities(keyCodes: [13])
+        let first = try await coordinator.prepareDesktopPolicy(agent: agent, checkpoint: nil,
+            model: BehaviorOptions().model, actions: actions, seed: 17)
+        #expect(first.checkpoint.document.kind == "initial" && first.checkpoint.document.runID == nil)
+        #expect(first.checkpoint.document.parameterCount == 10 && !coordinator.isBusy)
+        #expect(first.manifest.fields?["actions"]?.fields?["scrollUnitsPerPoint"]?.int == 8)
+        let second = try await coordinator.prepareDesktopPolicy(agent: agent, checkpoint: first.checkpoint.document,
+            model: .object([:]), actions: .init(), seed: -1)
+        #expect(second.checkpoint.document.matchesIdentity(of: first.checkpoint.document))
+        #expect(second.manifest == first.manifest)
+        #expect(try await store.snapshot().learningRuns.isEmpty)
+        #expect(try await store.snapshot().checkpoints.count == 1)
+        #expect(try fixture.operations() == ["checkpoint.create", "shutdown", "checkpoint.inspect", "shutdown"])
+    }
+
+    @Test func cancelledDesktopPolicyInspectionDoesNotStartAnActorOrAnotherModel() async throws {
+        let fixture = try Fixture("inspectCancelled"), store = try LibraryStore(root: fixture.root)
+        let agent = AgentDocument(name: "Cancelled preparation"); try await store.save(agent)
+        let coordinator = LearningCoordinator(store: store, root: fixture.root, bundle: fixture.bundle, changed: {})
+        let actions = ActionCapabilities(keyCodes: [13])
+        let first = try await coordinator.prepareDesktopPolicy(agent: agent, checkpoint: nil,
+            model: BehaviorOptions().model, actions: actions, seed: 0)
+        await #expect(throws: CancellationError.self) {
+            try await coordinator.prepareDesktopPolicy(agent: agent, checkpoint: first.checkpoint.document,
+                model: .object([:]), actions: actions, seed: 0)
+        }
+        #expect(coordinator.failure == nil && !coordinator.isBusy)
+        #expect(try await store.snapshot().checkpoints.count == 1)
+        #expect(try fixture.operations().suffix(2) == ["checkpoint.inspect", "shutdown"])
+    }
+
+    @Test(arguments: ["externalNormal", "externalEarlyBoundary", "externalWaitCancel"])
+    func externalUpdatePublishesOnlyAfterItsCorrelatedBoundary(mode: String) async throws {
+        let fixture = try Fixture(mode), store = try LibraryStore(root: fixture.root)
+        let agent = AgentDocument(name: "Desktop fixture"); try await store.save(agent)
+        let batch = try await makeExternalBatch(fixture: fixture, store: store, agent: agent)
+        let coordinator = LearningCoordinator(store: store, root: fixture.root, bundle: fixture.bundle, changed: {})
+        let operation = Task { try await coordinator.updateExternal(agent: agent, batch: batch, resume: false, validateBoundary: {}) }
+        if mode == "externalWaitCancel" {
+            try await waitUntil { coordinator.phase == "Updating the learner…" }
+            await coordinator.stopAndWait()
+        }
+        let result = try await operation.value
+        #expect(!coordinator.isBusy && coordinator.failure == nil)
+        #expect(result.cancelled == (mode == "externalWaitCancel"))
+        let checkpoint = try #require(result.checkpoint)
+        #expect(checkpoint.kind == "reinforcement" && checkpoint.runID == result.runID)
+        #expect(result.actorProgress == batch.actorProgress)
+        #expect(try await store.snapshot().agents.first?.selectedCheckpointID == checkpoint.id)
+        let requests = try String(contentsOf: fixture.log, encoding: .utf8).split(separator: "\n")
+            .map { try JSONDecoder().decode(WireMessage.self, from: Data($0.utf8)) }
+        let training = try #require(requests.first { $0.kind == "train.reinforcement.external" })
+        let boundary = try #require(requests.first { $0.kind == "job.externalBoundary" })
+        #expect(training.runID == boundary.runID && training.runID != batch.identity.runID)
+        #expect(boundary.payload.fields?["auditPath"] == .string(batch.path.path))
+        #expect(requests.filter { $0.kind == "job.externalBoundary" }.count == 1)
+        #expect(requests.last?.kind == "shutdown")
+        #expect(coordinator.reinforcementMetrics.first?.iteration == 1)
+    }
+
+    @Test(arguments: ["externalWrongAck", "externalWrongProgress"])
+    func externalPublicationMismatchCannotEnterCatalog(mode: String) async throws {
+        let fixture = try Fixture(mode), store = try LibraryStore(root: fixture.root)
+        let agent = AgentDocument(name: "Boundary mismatch"); try await store.save(agent)
+        let batch = try await makeExternalBatch(fixture: fixture, store: store, agent: agent)
+        let coordinator = LearningCoordinator(store: store, root: fixture.root, bundle: fixture.bundle, changed: {})
+        await #expect(throws: AstraError.self) {
+            try await coordinator.updateExternal(agent: agent, batch: batch, resume: false, validateBoundary: {})
+        }
+        #expect(!coordinator.isBusy && coordinator.failure != nil)
+        #expect(try await store.snapshot().checkpoints.count == 1)
+        #expect(coordinator.activeRun?.status == .failed && coordinator.activeRun?.checkpointID == nil)
+        #expect(try fixture.operations().last == "shutdown")
+    }
+
+    @Test func externalUpdateRefusesLostActorPauseBeforeLaunchingCompute() async throws {
+        let fixture = try Fixture("externalNormal"), store = try LibraryStore(root: fixture.root)
+        let agent = AgentDocument(name: "Pause lost"); try await store.save(agent)
+        let batch = try await makeExternalBatch(fixture: fixture, store: store, agent: agent)
+        let coordinator = LearningCoordinator(store: store, root: fixture.root, bundle: fixture.bundle, changed: {})
+        await #expect(throws: AstraError.self) {
+            try await coordinator.updateExternal(agent: agent, batch: batch, resume: false, validateBoundary: {
+                throw AstraError("test.actorNotPaused", "The actor pause is no longer held")
+            })
+        }
+        #expect(!FileManager.default.fileExists(atPath: fixture.log.path))
+        #expect(coordinator.activeRun?.status == .failed && !coordinator.isBusy)
+    }
+
     @Test func recordedRangeSnapshotAndExactResumeIgnoreLaterAgentSelectionEdits() async throws {
         let fixture = try Fixture("waitForCancel")
         let library = try LibraryStore(root: fixture.root)
@@ -315,6 +499,58 @@ private final class Fixture {
         #expect(coordinator.evaluation?.meanNLL == 0.75)
         #expect(coordinator.evaluation?.available == true)
         #expect(try await store.snapshot().learningRuns.count == 1) // Evaluation is not a fabricated training run.
+    }
+
+    @Test func comparisonUsesOneExplicitDatasetAndPersistsFailuresAlongsideScores() async throws {
+        let fixture = try Fixture("earlyTerminal")
+        let store = try LibraryStore(root: fixture.root)
+        let agent = AgentDocument(name: "Comparison")
+        try await store.save(agent)
+        let coordinator = LearningCoordinator(store: store, root: fixture.root, bundle: fixture.bundle, changed: {})
+        var options = BehaviorOptions(); options.source = .practice; options.epochs = 1
+        try coordinator.start(agent: agent, options: options, recordings: [])
+        try await waitUntil { !coordinator.isBusy }
+        let first = try #require(try await store.snapshot().checkpoints.first { $0.kind == "behavioral" })
+        options.seed = 10
+        try coordinator.start(agent: agent, options: options, recordings: [])
+        try await waitUntil { !coordinator.isBusy }
+        let second = try #require(try await store.snapshot().checkpoints.first { $0.kind == "behavioral" && $0.id != first.id })
+        let incompatible = CheckpointDocument(id: UUID(), agentID: agent.id, runID: first.runID, name: "Different controls", kind: "initial",
+            trainingStep: 0, policySignature: String(repeating: "b", count: 64), parameterCount: 10)
+        try await store.saveCheckpoint(incompatible)
+        try coordinator.evaluate(checkpoints: [first, second, incompatible], agentID: agent.id, datasetCheckpoint: first, split: "test")
+        try await waitUntil { !coordinator.isBusy }
+        let history = try await LibraryStore(root: fixture.root).snapshot().evaluations
+        #expect(history.count == 3 && Set(history.map(\.comparisonID)).count == 1)
+        let scored = history.filter { $0.status == .completed }
+        #expect(scored.count == 2 && scored[0].comparisonIssue(with: scored[1]) == nil)
+        #expect(history.first { $0.checkpointID == incompatible.id }?.status == .failed)
+        #expect(history.first { $0.checkpointID == incompatible.id }?.meanNLL == nil)
+        let requests = try String(contentsOf: fixture.log, encoding: .utf8).split(separator: "\n").map {
+            try JSONDecoder().decode(JSONValue.self, from: Data($0.utf8))
+        }.filter { $0.fields?["kind"] == .string("evaluate.behavioral") }
+        #expect(requests.count == 2)
+        let expected = try await LearningFiles.read(fixture.root.appendingPathComponent("Jobs/\(first.runID!.uuidString.lowercased())/configuration.json")).required("dataset")
+        #expect(requests.allSatisfy { $0.fields?["payload"]?.fields?["dataset"] == expected })
+        #expect(history.allSatisfy { $0.protocolDefinition.sourceRunID == first.runID && $0.protocolDefinition.split == "test" })
+    }
+
+    @Test func unavailableEvaluationPersistsWithoutInventingMetrics() async throws {
+        let fixture = try Fixture("evaluationUnavailable")
+        let store = try LibraryStore(root: fixture.root)
+        let agent = AgentDocument(name: "No held-out sessions")
+        try await store.save(agent)
+        let coordinator = LearningCoordinator(store: store, root: fixture.root, bundle: fixture.bundle, changed: {})
+        var options = BehaviorOptions(); options.source = .practice; options.epochs = 1
+        try coordinator.start(agent: agent, options: options, recordings: [])
+        try await waitUntil { !coordinator.isBusy }
+        let checkpoint = try #require(try await store.snapshot().checkpoints.first { $0.kind == "behavioral" })
+        try coordinator.evaluate(checkpoint: checkpoint, split: "validation")
+        try await waitUntil { !coordinator.isBusy }
+        let document = try #require(try await store.snapshot().evaluations.first)
+        #expect(document.status == .unavailable && document.datasetID != nil)
+        #expect(document.meanNLL == nil && document.decisions == nil)
+        #expect(document.issue == "No independent sessions in this split")
     }
 
     @Test func cancellationWaitsForCheckpointPublicationBeforeShutdown() async throws {

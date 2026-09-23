@@ -202,3 +202,31 @@ func collectorFailureKeepsNativeCommandsAndFinalReceipts(mode: String) async thr
     #expect(journal.contains("control.stopped"))
     #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("frames.astraring").path))
 }
+
+
+@Test(arguments: [false, true])
+func collectorControlCoveragePreservesSilentStateAndRejectsMissingProof(covered: Bool) async throws {
+    let harness = CollectorHarness(), (session, root) = try await collectorFixture(harness)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let original = try collectorObservation(run: session.runID)
+    var fields = original.actorInput.fields!
+    let cutoff = try original.actorInput.required("cutoffNanos").decode(UInt64.self)
+    var controls = try original.actorInput.required("controlState").decode(ControlState.self)
+    controls.observedNanos = cutoff - 300_000_000
+    fields["controlState"] = try .encode(controls); fields["intervalCovered"] = .bool(true)
+    if covered { fields["controlCoverageNanos"] = .unsigned(cutoff) }
+    let observation = InferenceCollectedObservation(runID: original.runID, actorInput: .object(fields), frame: original.frame,
+        pixels: original.pixels, coverage: original.coverage)
+    try session.offer(.actor(sourceID: UUID(), response: .object(["fixture": .bool(true)]), observation: observation))
+    if covered {
+        _ = try await session.finish()
+        let requests = await harness.requests
+        let snapshot = try #require(requests.first { $0.0 == "collector.actor" }).1.required("observation")
+        #expect(try snapshot.required("controlCoverageNanos").decode(UInt64.self) == cutoff)
+        #expect(try snapshot.required("controlState").required("observedNanos").decode(UInt64.self) == controls.observedNanos)
+    } else {
+        await #expect(throws: AstraError.self) { try await session.finish() }
+        #expect(await harness.firstLease == nil)
+        #expect(!(await harness.requests.contains { $0.0 == "collector.actor" }))
+    }
+}

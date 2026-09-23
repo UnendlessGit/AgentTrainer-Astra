@@ -29,7 +29,7 @@ def collector_worker(monkeypatch):
         return Worker()
 
 
-def collect_fixture(native_ring,tmp_path,monkeypatch,*,purpose='learning',abort=False,checkpoint_path=None,previous_actor_progress=None):
+def collect_fixture(native_ring,tmp_path,monkeypatch,*,purpose='learning',abort=False,checkpoint_path=None,previous_actor_progress=None,retrospective=None,continuation_source=None,behavior_batch_id=None,rollout_minimum=1,outcome='terminated'):
     producer,report=native_ring; worker=collector_worker(monkeypatch)
     run=report['reference']['runID'];clock,actor_source,label_source,episode,stream,state_id=(str(uuid.uuid4()) for _ in range(6))
     model=ModelConfig.test_small();vocabulary=ActionVocabulary();mx.random.seed(991)
@@ -38,11 +38,11 @@ def collect_fixture(native_ring,tmp_path,monkeypatch,*,purpose='learning',abort=
     if checkpoint_path is not None:
         origin=checkpoint_path;loaded=load_checkpoint(origin);policy=loaded.policy;policy.eval();checkpoint=loaded.manifest
     if previous_actor_progress is not None:
-        previous_actor_progress={**previous_actor_progress,'runID':str(uuid.UUID(run))}
+        if retrospective is None:previous_actor_progress={**previous_actor_progress,'runID':str(uuid.UUID(run))}
         stream=previous_actor_progress['rngStreamID']
-    training=ReinforcementConfig(rollout_decisions=1,sequence_length=2,burn_in=1,epochs=1,effective_batch_decisions=2)
+    training=ReinforcementConfig(rollout_decisions=rollout_minimum,sequence_length=2,burn_in=1,epochs=1,effective_batch_decisions=2)
     spec=EnvironmentSpec('native-collector-fixture',vocabulary,maximum_episode_ms=1000,
-        maximum_observation_bytes=140,maximum_surfaces=1,reward_signature='1'*64,reset_signature='2'*64)
+        maximum_observation_bytes=140,maximum_surfaces=1,reward_signature=retrospective['programSHA256'] if retrospective else '1'*64,reset_signature='2'*64)
     destination=tmp_path/str(uuid.uuid4());key=mx.random.key(81) if previous_actor_progress is None else mx.array(previous_actor_progress['rngState'],dtype=mx.uint32)
     generation=1 if previous_actor_progress is None else previous_actor_progress['actorResetGeneration']+1
     first_draw=0 if previous_actor_progress is None else previous_actor_progress['drawIndex']+1
@@ -53,11 +53,14 @@ def collect_fixture(native_ring,tmp_path,monkeypatch,*,purpose='learning',abort=
         return response
     try:
         assert worker.hello['payload']['role']=='collector'
-        request('collector.prepare',{'schemaVersion':1,'clockID':clock,'environment':spec.to_dict(),'model':model.to_dict(),
+        request('collector.prepare',{'schemaVersion':2 if retrospective else 1,'clockID':clock,'environment':spec.to_dict(),'model':model.to_dict(),
             'training':asdict(training),'policyID':checkpoint['id'],'policySignature':checkpoint['policySignature'],
             'actorSourceID':actor_source,'environmentSourceID':label_source,'contextIDs':[],'destination':str(destination),
             'rings':[{'path':report['path'],'ringID':report['reference']['ringID']}],'purpose':purpose,
-            **({} if previous_actor_progress is None else {'previousActorProgress':previous_actor_progress})})
+            **({} if previous_actor_progress is None else {'previousActorProgress':previous_actor_progress}),
+            **({} if retrospective is None else {'retrospective':retrospective}),
+            **({} if continuation_source is None else {'continuationSource':continuation_source}),
+            **({} if behavior_batch_id is None else {'behaviorBatchID':behavior_batch_id})})
         start=report['reference']['metadata']['observedNanos']
         request('collector.begin',{'sourceID':label_source,'episodeID':episode,'readyNanos':start,'resetID':str(uuid.uuid4()),
             'controlsReleased':True,'pendingPackets':0})
@@ -105,9 +108,15 @@ def collect_fixture(native_ring,tmp_path,monkeypatch,*,purpose='learning',abort=
                 'resultingState':{**controls,'observedNanos':start+200000000},'commandResults':[]}
             evidence('environment.receipt',{'receipt':{**receipt,'status':'admitted'}},packet['id'])
             evidence('environment.receipt',{'receipt':{**receipt,'status':'executed'}},packet['id'])
-        if purpose=='learning' and not abort:
-            evidence('environment.reward',{'startNanos':start,'endNanos':start+100000000,'value':1.0},packets[0]['id'])
-            evidence('environment.outcome',{'endNanos':start+100000000,'outcome':'terminated'},packets[0]['id'])
+        if purpose in ('learning','retrospective') and not abort:
+            extras={}
+            if retrospective:
+                import base64
+                rules=json.loads(base64.b64decode(retrospective['programBase64']))['rules']
+                extras={'automaticComponents':[{'ruleID':rule['id'],'value':1.0} for rule in rules if rule['kind']!='manualMarker'],
+                    'deferredManualRuleIDs':[rule['id'] for rule in rules if rule['kind']=='manualMarker']}
+            evidence('environment.reward',{'startNanos':start,'endNanos':start+100000000,'value':1.0,**extras},packets[0]['id'])
+            evidence('environment.outcome',{'endNanos':start+100000000,'outcome':outcome},packets[0]['id'])
             evidence('environment.watermark',{'throughNanos':start+100000000,'throughSequence':label_sequence-1,'complete':True})
         request('collector.end',{'sourceID':label_source,'episodeID':episode,'stoppedNanos':start+200000000,'lastActorSequence':first_draw+1,
             'controlsReleased':True,'pendingPackets':0})
@@ -158,6 +167,7 @@ def test_native_collector_cpu_lease_to_immutable_rollout_and_separate_learner_jo
         result=worker.until(lambda event:event['kind'] in ('job.completed','job.failed','job.cancelled'))
         assert result['kind']==('job.cancelled' if mode=='cancel_at_boundary' else 'job.completed'),result
         saved=load_checkpoint(destination,include_training=True)
+        assert result['payload']['result']['parameterCount']==saved.policy.config.parameter_count
         assert saved.training_state['kind']=='reinforcement_external'
         assert saved.training_state['actorProgress']==manifest['actorProgress']
         assert (saved.training_state['learner']['optimizerUpdates']==0) if mode=='cancel_at_boundary' else (saved.training_state['learner']['optimizerUpdates']>0)

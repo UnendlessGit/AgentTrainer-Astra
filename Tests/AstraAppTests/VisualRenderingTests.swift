@@ -70,10 +70,32 @@ import AstraCore
     let interruptedRoot = root.appendingPathComponent("InspectorOnly")
     let interrupted = try makeRenderRecording(root: interruptedRoot, environment: environment,
         issue: "The selected environment changed size while this demonstration was recording. Captured frames and input events were preserved. Review the final interval before including this recording in a training dataset.")
+    var evaluationAgent = AgentDocument(name: "Checkpoint comparison")
+    let evaluationRun = LearningRunDocument(agentID: evaluationAgent.id, kind: .behavioral, name: "Saved shared demonstrations", sourceKind: "practice_oracle")
+    let evaluationFirst = CheckpointDocument(id: UUID(), agentID: evaluationAgent.id, runID: evaluationRun.id,
+        name: "Pointing · after 12 epochs", kind: "behavioral", trainingStep: 120, policySignature: String(repeating: "a", count: 64), parameterCount: 34_638_639)
+    let evaluationSecond = CheckpointDocument(id: UUID(), agentID: evaluationAgent.id, runID: nil,
+        name: "Pointing · refined with reinforcement learning", kind: "reinforcement", trainingStep: 240, policySignature: String(repeating: "a", count: 64), parameterCount: 34_638_639)
+    evaluationAgent.selectedCheckpointID = evaluationFirst.id
+    try await store.save(evaluationAgent); try await store.saveLearningRun(evaluationRun)
+    try await store.saveCheckpoint(evaluationFirst); try await store.saveCheckpoint(evaluationSecond)
+    let evaluationProtocol = try EvaluationProtocol(sourceRunID: evaluationRun.id, sourceCheckpointID: evaluationFirst.id,
+        sourceName: evaluationFirst.name, dataset: .object(["kind": .string("practice_oracle")]),
+        identity: .object(["fixture": .bool(true)]), expectedDatasetID: nil, provenance: "practice_oracle",
+        policySignature: evaluationFirst.policySignature, split: "validation", verificationMode: true)
+    let evaluationDatasetID = UUID()
+    var evaluationRows: [EvaluationDocument] = []
+    for (index, checkpoint) in [evaluationFirst, evaluationSecond].enumerated() {
+        var row = EvaluationDocument(agentID: evaluationAgent.id, checkpoint: checkpoint, protocolDefinition: evaluationProtocol, createdAt: fixtureDate)
+        row.status = .completed; row.datasetID = evaluationDatasetID; row.finishedAt = fixtureDate + 10
+        row.decisions = 1024; row.meanNLL = index == 0 ? 0.7842 : 0.4913
+        try await store.saveEvaluation(row); evaluationRows.append(row)
+    }
     let model = WorkspaceModel()
     await model.start()
     #expect(!model.loading && model.errorMessage == nil)
     var practice = BehaviorOptions(); practice.source = .practice
+    var freshDesktopAgent = agent; freshDesktopAgent.selectedCheckpointID = nil
     var resume = BehaviorOptions(); resume.initialCheckpointID = pausedCheckpoint.id; resume.resume = true
     let metrics = (1...12).map { EpochMetric(epoch: $0, nll: 2.8 / Double($0) + 0.15, decisions: $0 * 10_240) }
     var reinforcement: [ReinforcementMetric] = []
@@ -93,10 +115,15 @@ import AstraCore
     for size in [NSSize(width: 1120, height: 760), NSSize(width: 860, height: 580)] {
         for scheme in [ColorScheme.light, .dark] {
             let variants: [(String, AnyView)] = [
+                ("evaluation-comparison", AnyView(EvaluationWorkspaceView(agent: evaluationAgent, model: model, comparing: true,
+                    sourceID: evaluationFirst.id, candidates: [evaluationFirst.id, evaluationSecond.id],
+                    selectedResults: Set(evaluationRows.map(\.id))).padding(28))),
                 ("behavior-empty", AnyView(BehaviorTrainingView(agent: agent, model: model).padding(28))),
                 ("behavior-practice", AnyView(BehaviorTrainingView(agent: agent, model: model, options: practice).padding(28))),
                 ("behavior-resume", AnyView(BehaviorTrainingView(agent: agent, model: model, options: resume).padding(28))),
                 ("reinforcement", AnyView(ReinforcementTrainingView(agent: agent, model: model).padding(28))),
+                ("reinforcement-practice", AnyView(PracticeReinforcementTrainingView(agent: agent, model: model).padding(28))),
+                ("desktop-learning-advanced", AnyView(DesktopTrainingView(agent: freshDesktopAgent, model: model, showAdvanced: true).padding(28))),
                 ("run-empty", AnyView(RunView(coordinator: nil, checkpoints: [], sources: [], refreshingSources: false,
                     sourceIssue: nil, unavailableReason: nil, refreshSources: {}, selectCheckpoint: { _ in }, start: { _, _, _ in }).padding(28))),
                 ("run-checkpoint", AnyView(RunView(coordinator: nil, checkpoints: [checkpoint], sources: [], refreshingSources: false,

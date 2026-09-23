@@ -47,6 +47,7 @@ enum PolicyActorValidation {
               input.executedEvents.count <= 2048 else {
             throw AstraError("inference.inputCoverage", "A complete causal source and settled input observation are required.")
         }
+        try input.validateControlCoverage()
         if let previousCutoff {
             let bound = previousCutoff.addingReportingOverflow(episodeStep == 0 ? 1 : UInt64(periodMS) * 1_000_000)
             guard !bound.overflow, cutoff >= bound.partialValue else {
@@ -107,6 +108,12 @@ enum PolicyActorValidation {
                            rngStreamID: UUID?, expectedRNG: [UInt32]?) throws -> JSONValue {
         let record = try value.required("collectionRecord"), input = observation.actorInput
         let sampler = try record.required("sampler")
+        let suppliedCoverage = try record.fields?["controlCoverageNanos"].flatMap { value in
+            value == .null ? nil : try value.decode(UInt64.self)
+        }
+        let observedCoverage = try input.fields?["controlCoverageNanos"].flatMap { value in
+            value == .null ? nil : try value.decode(UInt64.self)
+        }
         let before = try sampler.required("stateBefore").decode([UInt32].self)
         let after = try sampler.required("stateAfter").decode([UInt32].self)
         let sampleKey = try sampler.required("sampleKey").decode([UInt32].self)
@@ -117,6 +124,7 @@ enum PolicyActorValidation {
               record.fields?["previousStateID"]?.uuid == input.fields?["previousStateID"]?.uuid,
               record.fields?["nextStateID"]?.uuid == value.fields?["stateID"]?.uuid,
               record.fields?["cutoffNanos"]?.uint64 == input.fields?["cutoffNanos"]?.uint64,
+              suppliedCoverage == observedCoverage,
               record.fields?["geometryRevision"]?.uint64 == packet.geometryRevision,
               try record.required("frameIDs").decode([UUID].self) == observation.frames.map(\.metadata.id),
               record.fields?["contextIDs"] == input.fields?["contextIDs"],

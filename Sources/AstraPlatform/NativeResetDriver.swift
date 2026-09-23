@@ -25,6 +25,7 @@ public final class NativeResetDriver: ResetControlDriver, @unchecked Sendable {
     private var releaseWork: Task<ResetReleaseProof, Never>?
     private var releaseID: UUID?
     private var lastRelease: ResetReleaseProof?
+    private var unconfirmedCompletion: NativeControlCompletion?
     private var scopeWatch: Task<Void, Never>?
     private var observationWork: [UUID: Task<ResetObservationSnapshot, any Error>] = [:]
     private var scopeCheckedAt: UInt64 = 0
@@ -51,7 +52,7 @@ public final class NativeResetDriver: ResetControlDriver, @unchecked Sendable {
         guard context.environmentID == environmentID else { throw AstraError("reset.environment", "The reset belongs to a different bound environment.") }
         _ = try capabilities.validated()
         let selected = try lock.withLock { () throws -> (Task<ResetBinding, any Error>, UUID) in
-            guard released, preparation == nil, releaseWork == nil, observationWork.isEmpty else {
+            guard released, preparation == nil, releaseWork == nil, observationWork.isEmpty, unconfirmedCompletion == nil else {
                 throw AstraError("reset.previousOwner", "The previous reset preparation, observation or control cleanup has not joined.")
             }
             let id = UUID(); generation = id; self.context = context; stopped = false; released = false; healthError = nil; lastRelease = nil; scopeCheckedAt = 0
@@ -137,6 +138,27 @@ public final class NativeResetDriver: ResetControlDriver, @unchecked Sendable {
         }
         values.0?.requestStop(); values.1.forEach { $0.cancel() }
     }
+    /// Read a completed warning for explicit human acknowledgement. The native
+    /// session ID prevents an old warning from acknowledging a later attempt
+    /// that happens to reuse the same ResetContext.
+    public func unconfirmedControlCleanup(resetID: UUID) -> NativeControlCompletion? {
+        lock.withLock {
+            guard context?.resetID == resetID, released, preparation == nil, releaseWork == nil else { return nil }
+            return unconfirmedCompletion
+        }
+    }
+    public func acknowledgeManualControlCleanup(resetID: UUID, sessionID: UUID) throws {
+        try lock.withLock {
+            guard context?.resetID == resetID, released, preparation == nil, releaseWork == nil,
+                  observationWork.isEmpty, unconfirmedCompletion?.sessionID == sessionID else {
+                throw AstraError("reset.cleanupWarning", "There is no matching completed reset cleanup warning to acknowledge.")
+            }
+            try owner.acknowledgeManualCleanup(sessionID: sessionID)
+            unconfirmedCompletion = nil
+            // Preserve lastRelease and healthError: this is permission for a
+            // fresh attempt, never readiness or cleanup proof for the old one.
+        }
+    }
     public func release(context: ResetContext) async -> ResetReleaseProof {
         let selected = lock.withLock { () -> (Task<ResetReleaseProof, Never>, UUID?) in
             guard self.context == context else {
@@ -162,7 +184,10 @@ public final class NativeResetDriver: ResetControlDriver, @unchecked Sendable {
                 let failure = lock.withLock { healthError = healthError ?? completion?.issue; return healthError }
                 let proof = ResetReleaseProof(resetID: context.resetID, observedNanos: MonotonicClock.now, confirmed: confirmed,
                                               issue: failure?.message ?? (confirmed ? nil : "The previous control owner remains unconfirmed."))
-                lock.withLock { session = nil; scopeWatch = nil; preparation = nil; observationWork = [:]; released = true; lastRelease = proof }
+                lock.withLock {
+                    session = nil; scopeWatch = nil; preparation = nil; observationWork = [:]; released = true; lastRelease = proof
+                    unconfirmedCompletion = completion?.cleanupConfirmed == false ? completion : nil
+                }
                 return proof
             }
             releaseWork = task; releaseID = id; return (task, id)

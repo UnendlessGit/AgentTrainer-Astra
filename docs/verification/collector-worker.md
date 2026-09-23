@@ -45,6 +45,13 @@ Compute job: `train.reinforcement.external` with `{checkpointPath,rolloutPath,de
 
 Publication is a separate phase: the job emits `job.progress` with `phase:"waiting_for_actor_boundary"`. Native confirms a joined physical episode/control boundary and sends `job.externalBoundary` with `{jobID,auditPath}`, where auditPath is the latest immutable completed collector package. It may be the original rollout package if the actor remained stopped. The boundary package must continue the same actor stream and preserve every consumed RNG draw, including continuity and excluded suffix actions.
 
+The required `waiting_for_actor_boundary` progress item is reliable protocol
+control: output coalescing/reclamation can remove ordinary metrics but cannot
+replace or drop this handshake. A saturated reliable queue fails the channel
+explicitly. A clean stop before a learnable rollout uses
+[`checkpoint.externalBoundary`](stopped-actor-checkpoint.md) to preserve the
+latest real cursor with unchanged weights and optimizer state.
+
 Cancellation during the update or while waiting for its publication boundary restores pre-update parameters, optimizer and counters; it still requires the latest boundary proof before publishing a resumable checkpoint. Timeout or shutdown without that proof reports `checkpointPublished=false`. The boundary request uses the compute job's `runID` and `jobID`; its package must match the rollout's actor run/clock/policy/source identities, environment/model/context configuration, and RNG stream. Older draw/reset generation, inconsistent unchanged-draw state, discontinuous continuation, reused rollout and reused boundary proof are rejected. No further actor sampling may occur after that boundary until publication and a fresh physical reset/activation. The external checkpoint state wraps the existing version-2 learner state plus current actor progress and requires a new confirmed physical reset; actor reset generations are never relabelled physical reset counts. Changed weights receive a new checkpoint identity and activate only at the next confirmed reset.
 
 The completed job returns `checkpointPath`, `manifest`, `checkpointPublished`, `cancelled`, `resumable`, `requiresEnvironmentReset`, `sourceKind`, `provenance`, `actorProgress`, `boundaryCollectionID`, `rolloutID`, and update `metrics`. Missing-boundary cancellation returns no checkpoint path and a reason. External state is `{kind:"reinforcement_external",schemaVersion:1,learner:<reinforcement v2>,actorProgress,consumedRolloutIDs,requiresEnvironmentReset:true}`. The saved learner policy identity equals the new immutable checkpoint UUID. Actor reset generation remains distinct from learner physical reset counts.

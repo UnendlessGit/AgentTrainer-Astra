@@ -2,6 +2,11 @@
 
 2026-09-12. The first Stage 1 GRU tranche and its paired-data follow-up are complete; the 90% memory target is not met. No production model, schema or training default changed. Further temporal work is limited to GRU diagnostics under the [current scope decision](temporal-scope.md).
 
+September 19 follow-up: a [CPU exposure audit and bounded matched GRU pilot](gru-exposure-diagnosis.md)
+found a learned cue-conditioned ranking at all three delays in one explicitly
+experimental per-choice/clipping condition. Other matched controls remain at
+chance; independent-seed replication and autonomous behavior remain open.
+
 The experimental implementation lives in `experiments/temporal_study.py`, with `scripts/temporal_study.py` for bounded execution and `scripts/inspect_temporal.py` for representation/fit diagnostics. The cache contains exact production-resolution visual features from the common native initial checkpoint. Source pixels remain 1280×720 with the default global/detail/cursor processing. This freezes all visual parameters and therefore is not production end-to-end learning evidence.
 
 ## Verification

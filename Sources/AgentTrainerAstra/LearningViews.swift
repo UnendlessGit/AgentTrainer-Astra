@@ -303,63 +303,7 @@ struct LearningProgressContent: View {
 struct LearningEvaluationView: View {
     let agent: AgentDocument
     @Bindable var model: WorkspaceModel
-    @State private var split = "validation"
-    private var checkpoint: CheckpointDocument? {
-        model.checkpoints.first { $0.id == agent.selectedCheckpointID && model.checkpointLinks[agent.id]?.contains($0.id) == true }
-    }
-    private var hasDemonstrationDataset: Bool {
-        guard let runID = checkpoint?.runID else { return false }
-        return model.learningRuns.first { $0.id == runID }?.kind == .behavioral
-    }
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                Text("Evaluate a checkpoint").font(.title2.weight(.semibold))
-                Text("Score the selected checkpoint against its saved demonstration dataset. Validation and test sessions stay independent from training.")
-                    .foregroundStyle(.secondary)
-                if let checkpoint {
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 14) {
-                            Text(checkpoint.name).font(.headline)
-                            Text("\(checkpoint.trainingStep.formatted()) updates · \(checkpoint.parameterCount.formatted()) parameters")
-                                .font(.caption).foregroundStyle(.secondary)
-                            if !hasDemonstrationDataset {
-                                Text("This checkpoint has no saved demonstration dataset to score. Practice success evaluation is being integrated separately.")
-                                    .font(.callout).foregroundStyle(.secondary)
-                            }
-                            Picker("Demonstrations", selection: $split) {
-                                Text("Validation").tag("validation"); Text("Test").tag("test"); Text("Training (diagnostic)").tag("train")
-                            }
-                            Button("Evaluate", systemImage: "checkmark.seal") { model.evaluateCheckpoint(checkpoint, agentID: agent.id, split: split) }
-                                .buttonStyle(.borderedProminent).disabled(model.isClosing || model.isRunningAgent || model.learning == nil || model.learning?.isBusy == true || !hasDemonstrationDataset)
-                        }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
-                    }
-                    if let result = model.learning?.evaluation, result.checkpointID == checkpoint.id, model.learning?.resultAgentID == agent.id {
-                        GroupBox {
-                            VStack(alignment: .leading, spacing: 12) {
-                                if result.available, let nll = result.meanNLL {
-                                    LabeledContent("Demonstrations", value: result.split.capitalized)
-                                    LabeledContent("Decisions", value: result.decisions.formatted())
-                                    LabeledContent("Imitation loss", value: nll.formatted(.number.precision(.fractionLength(3))))
-                                    Text("This measures demonstration likelihood. It does not measure success while controlling an environment.")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                } else { Text(result.reason ?? "This dataset has no independent demonstrations in the selected split.").foregroundStyle(.secondary) }
-                                Button("Show Saved Result") { NSWorkspace.shared.activateFileViewerSelecting([result.savedAt]) }
-                            }.padding(8)
-                        } label: { Text("Evaluation result").font(.headline) }
-                    }
-                    if let failure = model.learning?.failure, model.learning?.resultAgentID == agent.id {
-                        AttentionLabel(message: failure)
-                    }
-                } else {
-                    ContentUnavailableView {
-                        Label("Choose a checkpoint", systemImage: "checkmark.seal")
-                    } description: { Text("Train an agent or select one of its saved checkpoints to evaluate it.") }
-                    actions: { Button("Open Training") { model.section = .training } }
-                }
-            }.padding(.trailing, 8)
-        }
-    }
+    var body: some View { EvaluationWorkspaceView(agent: agent, model: model) }
 }
 
 struct LearningRunList: View {

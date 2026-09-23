@@ -22,6 +22,18 @@ public struct ActionCapabilities: Codable, Hashable, Sendable {
         }
         return self
     }
+    /// The model vocabulary includes scroll quantization in addition to native
+    /// execution capabilities. Keep it explicit at native/compute boundaries.
+    public func policyVocabulary(scrollUnitsPerPoint: Int = 8) throws -> JSONValue {
+        _ = try validated()
+        guard [1, 2, 4, 8, 16].contains(scrollUnitsPerPoint) else {
+            throw AstraError("actions.scrollQuantization", "Unsupported policy scroll quantization.")
+        }
+        return .object(["keyCodes": .array(keyCodes.sorted().map { .integer(Int64($0)) }),
+            "mouseButtons": .array(mouseButtons.sorted().map { .integer(Int64($0)) }),
+            "absolutePointer": .bool(absolutePointer), "relativePointer": .bool(relativePointer), "scroll": .bool(scroll),
+            "scrollUnitsPerPoint": .integer(Int64(scrollUnitsPerPoint))])
+    }
     public func intersection(_ other: Self) -> Self {
         Self(keyCodes: keyCodes.intersection(other.keyCodes), mouseButtons: mouseButtons.intersection(other.mouseButtons),
              absolutePointer: absolutePointer && other.absolutePointer,

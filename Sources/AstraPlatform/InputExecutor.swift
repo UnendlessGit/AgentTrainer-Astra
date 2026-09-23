@@ -25,6 +25,35 @@ public struct ControlObservation: Codable, Sendable {
     public var intervalCovered: Bool
     public var cutoffNanos: UInt64
     public var lastSequence: UInt64?
+    /// Fresh authority for this exact atomic cutoff; never a replacement for
+    /// the last state-observation timestamp or input-event time.
+    public var controlCoverageNanos: UInt64? = nil
+
+    public init(controlState: ControlState, executedEvents: [RawInputEvent], intervalCovered: Bool,
+                cutoffNanos: UInt64, lastSequence: UInt64?, controlCoverageNanos: UInt64? = nil) {
+        self.controlState = controlState; self.executedEvents = executedEvents; self.intervalCovered = intervalCovered
+        self.cutoffNanos = cutoffNanos; self.lastSequence = lastSequence; self.controlCoverageNanos = controlCoverageNanos
+    }
+
+    public func validateControlCoverage(maximumAgeNanos: UInt64 = 250_000_000) throws {
+        try Self.validateControlCoverage(state: controlState, cutoffNanos: cutoffNanos,
+            coverageNanos: controlCoverageNanos, intervalCovered: intervalCovered, maximumAgeNanos: maximumAgeNanos)
+    }
+    public static func validateControlCoverage(state: ControlState, cutoffNanos: UInt64, coverageNanos: UInt64?,
+                                               intervalCovered: Bool, maximumAgeNanos: UInt64 = 250_000_000) throws {
+        guard state.valid, intervalCovered, state.observedNanos <= cutoffNanos else {
+            throw AstraError("control.observationCoverage", "The control state or its causal history is unavailable.")
+        }
+        if let coverageNanos {
+            guard coverageNanos == cutoffNanos, coverageNanos >= state.observedNanos else {
+                throw AstraError("control.observationCoverage", "Control coverage must certify this exact atomic cutoff.")
+            }
+        } else {
+            guard cutoffNanos - state.observedNanos <= maximumAgeNanos else {
+                throw AstraError("control.staleObservation", "The older control snapshot has no current coverage proof.")
+            }
+        }
+    }
 }
 
 public enum ControlStopCause: String, Codable, Sendable {
@@ -153,8 +182,29 @@ public final class InputExecutor: @unchecked Sendable {
     }
 
     public func observation(afterSequence: UInt64? = nil) throws -> ControlObservation {
-        try lock.withLock {
+        var healthFailure: (reason: String, generation: UInt64)?
+        defer {
+            if let healthFailure { requestDisarm(reason: healthFailure.reason, expectedGeneration: healthFailure.generation) }
+        }
+        return try lock.withLock {
             let cutoff = clock()
+            // These probes read cached backend proofs and atomic guardian state;
+            // neither performs OS IPC. Holding the observation lock prevents an
+            // input post/history mutation from crossing this causal cut.
+            if lease.request != nil {
+                do {
+                    try backend.checkHealth()
+                    guard recovery?.guardianIsFresh(now: cutoff) ?? true else {
+                        throw AstraError("control.guardianHealth", "Independent cleanup protection is unavailable.")
+                    }
+                    guard cutoff < lease.expiresAtNanos else {
+                        throw AstraError("control.expired", "The control heartbeat expired.")
+                    }
+                } catch {
+                    observed.valid = false // A health gap stays invalid until a new arm.
+                    healthFailure = (error.localizedDescription, epoch)
+                }
+            }
             if let afterSequence {
                 guard let deliveredEventSequence, afterSequence <= deliveredEventSequence else { throw AstraError("control.historyCursor", "The input-history acknowledgement was never produced by this run.") }
                 if let acknowledgedEventSequence, afterSequence < acknowledgedEventSequence {
@@ -169,7 +219,8 @@ public final class InputExecutor: @unchecked Sendable {
             value.valid = value.valid && lease.request != nil && cutoff < lease.expiresAtNanos && inFlightPacketID == nil && !arming && cleaning == 0 && interruption == nil
             deliveredEventSequence = nextEventSequence == 0 ? nil : nextEventSequence - 1
             return ControlObservation(controlState: value, executedEvents: executedEvents, intervalCovered: historyCovered,
-                                      cutoffNanos: cutoff, lastSequence: nextEventSequence == 0 ? nil : nextEventSequence - 1)
+                                      cutoffNanos: cutoff, lastSequence: nextEventSequence == 0 ? nil : nextEventSequence - 1,
+                                      controlCoverageNanos: value.valid && historyCovered && value.observedNanos <= cutoff ? cutoff : nil)
         }
     }
 

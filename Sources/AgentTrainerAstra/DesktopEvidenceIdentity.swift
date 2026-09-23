@@ -2,7 +2,7 @@ import Foundation
 import AstraCore
 import AstraPlatform
 
-struct DesktopEvidenceIdentity: Equatable, Sendable {
+struct DesktopEvidenceIdentity: Codable, Equatable, Sendable {
     let runID: UUID
     let clockID: UUID
     let environmentID: UUID
@@ -31,11 +31,24 @@ final class DesktopEnvironmentSequence: @unchecked Sendable {
             try emit("environment.receipt", payload: fields, packetID: packetID, episodeID: episodeID, collector: collector)
         }
     }
-    func interval(_ evaluation: RewardEvaluation, packetID: UUID, collector: CollectorSession) throws {
+    func interval(_ evaluation: RewardEvaluation, packetID: UUID, collector: CollectorSession, deferredProgram: RewardProgram? = nil) throws {
         try lock.withLock {
             guard next <= UInt64.max - 3 else { throw AstraError("desktop.evidenceSequence", "The environment evidence sequence is exhausted.") }
-            try emit("environment.reward", payload: ["startNanos": .unsigned(evaluation.startNanos),
-                "endNanos": .unsigned(evaluation.endNanos), "value": evaluation.value.map(JSONValue.number) ?? .null],
+            var reward: [String: JSONValue] = ["startNanos": .unsigned(evaluation.startNanos),
+                "endNanos": .unsigned(evaluation.endNanos), "value": evaluation.value.map(JSONValue.number) ?? .null]
+            if let program = deferredProgram {
+                let deferred = program.rules.filter { $0.kind == .manualMarker }.map(\.id)
+                guard deferred.allSatisfy({ evaluation.components[$0] == nil }) else {
+                    throw AstraError("feedback.liveAndDeferred", "A reward interval cannot mix live and retrospective manual feedback.")
+                }
+                let automatic = program.rules.filter { $0.kind != .manualMarker }
+                let known = evaluation.unknownRules.allSatisfy(Set(deferred).contains)
+                reward["value"] = known ? .number(automatic.reduce(0) { $0 + (evaluation.components[$1.id] ?? 0) }) : .null
+                reward["automaticComponents"] = .array(automatic.map { .object([
+                    "ruleID": .string($0.id.uuidString.lowercased()), "value": evaluation.components[$0.id].map(JSONValue.number) ?? .null]) })
+                reward["deferredManualRuleIDs"] = .array(deferred.map { .string($0.uuidString.lowercased()) })
+            }
+            try emit("environment.reward", payload: reward,
                 packetID: packetID, episodeID: evaluation.episodeID, collector: collector)
             try emit("environment.outcome", payload: ["endNanos": .unsigned(evaluation.endNanos),
                 "outcome": .string(evaluation.outcome.rawValue)], packetID: packetID, episodeID: evaluation.episodeID, collector: collector)
@@ -77,12 +90,12 @@ struct DesktopTerminalEvidence: Sendable {
     let cutoffNanos: UInt64
     let outcome: RewardOutcome
 }
-enum DesktopEpisodeStop: Sendable {
+enum DesktopEpisodeStop: Codable, Sendable {
     case semanticBoundary(UInt64)
     case operatorAbort
     case failure(String)
 }
-struct DesktopEpisodeJoin: Sendable {
+struct DesktopEpisodeJoin: Codable, Sendable {
     let runID: UUID
     let episodeID: UUID
     let generationID: UUID

@@ -24,6 +24,15 @@ struct ReinforcementOptions: Sendable {
     var entropyCoefficient = 0.01
     var shapingScale = 0.1
 
+    var settings: ReinforcementSettings {
+        var value = ReinforcementSettings()
+        value.rolloutDecisions = rolloutDecisions; value.epochs = epochs; value.sequenceLength = sequenceLength
+        value.burnIn = burnIn; value.effectiveBatchDecisions = effectiveBatchDecisions
+        value.learningRate = learningRate; value.pretrainedLearningRate = pretrainedLearningRate
+        value.clipRatio = clipRatio; value.targetKL = targetKL; value.entropyCoefficient = entropyCoefficient; value.seed = seed
+        return value
+    }
+
     func validated() throws -> Self {
         if resume {
             guard initialCheckpointID != nil, (1...100_000).contains(iterations) else {
@@ -31,15 +40,11 @@ struct ReinforcementOptions: Sendable {
             }
             return self
         }
+        _ = try settings.validated()
         guard (1...100_000).contains(iterations), ["pointing", "delayed_memory"].contains(task),
               [2000, 8000, 30000].contains(delayMS), (0...1_000_000_000).contains(seed),
               [50, 100].contains(periodMS), (0...2000).contains(leadMS), [16, 32, 64].contains(packetCapacity),
-              (1...65536).contains(rolloutDecisions), (1...100).contains(epochs),
-              (1...512).contains(sequenceLength), (0...4096).contains(burnIn), (1...65536).contains(effectiveBatchDecisions),
-              [learningRate, pretrainedLearningRate, clipRatio, targetKL, entropyCoefficient, shapingScale].allSatisfy(\.isFinite),
-              learningRate > 0, learningRate <= 1, pretrainedLearningRate > 0, pretrainedLearningRate <= 1,
-              clipRatio > 0, clipRatio < 1, targetKL > 0, targetKL <= 1,
-              entropyCoefficient >= 0, entropyCoefficient <= 1, shapingScale >= 0, shapingScale <= 1,
+              shapingScale.isFinite, shapingScale >= 0, shapingScale <= 1,
               !resume || initialCheckpointID != nil else {
             throw AstraError("reinforcement.options", "Choose a practice environment and valid reinforcement settings before starting.")
         }
@@ -61,13 +66,7 @@ struct ReinforcementOptions: Sendable {
                  "shaping_scale": .number(task == "pointing" ? shapingScale : 0), "discount_half_life_ms": .number(30000)])
     }
     var training: JSONValue {
-        .object(["rollout_decisions": .integer(Int64(rolloutDecisions)), "epochs": .integer(Int64(epochs)),
-                 "sequence_length": .integer(Int64(sequenceLength)), "burn_in": .integer(Int64(burnIn)),
-                 "effective_batch_decisions": .integer(Int64(effectiveBatchDecisions)),
-                 "learning_rate": .number(learningRate), "pretrained_learning_rate": .number(pretrainedLearningRate),
-                 "seed": .integer(Int64(seed)), "ppo": .object(["clip_ratio": .number(clipRatio), "target_kl": .number(targetKL),
-                    "entropy_coefficient": .number(entropyCoefficient)]),
-                 "returns": .object(["discount_half_life_seconds": .number(30)])])
+        settings.payload
     }
 }
 
@@ -123,12 +122,31 @@ struct LearningTrainingView: View {
             if mode == .behavioral { BehaviorTrainingView(agent: agent, model: model) }
             else { ReinforcementTrainingView(agent: agent, model: model) }
         }.onAppear {
-            if model.learning?.activeRun?.agentID == agent.id, let kind = model.learning?.activeRun?.kind { mode = kind }
+            if model.desktopLearning?.agentID == agent.id, model.desktopLearning?.isBusy == true { mode = .reinforcement }
+            else if model.learning?.activeRun?.agentID == agent.id, let kind = model.learning?.activeRun?.kind { mode = kind }
         }
     }
 }
 
 struct ReinforcementTrainingView: View {
+    let agent: AgentDocument
+    @Bindable var model: WorkspaceModel
+    @State private var desktop = true
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Picker("Learning environment", selection: $desktop) {
+                Text("Desktop environment").tag(true)
+                Text("Practice environment").tag(false)
+            }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 420)
+            if desktop { DesktopTrainingView(agent: agent, model: model) }
+            else { PracticeReinforcementTrainingView(agent: agent, model: model) }
+        }.onAppear {
+            if model.learning?.activeRun?.agentID == agent.id, model.learning?.activeRun?.sourceKind == "practice_rollout" { desktop = false }
+        }
+    }
+}
+
+struct PracticeReinforcementTrainingView: View {
     let agent: AgentDocument
     @Bindable var model: WorkspaceModel
     @State private var options = ReinforcementOptions()
@@ -137,7 +155,10 @@ struct ReinforcementTrainingView: View {
     private var checkpoints: [CheckpointDocument] {
         model.checkpoints.filter { model.checkpointLinks[agent.id]?.contains($0.id) == true }
     }
-    private var resumableSelection: Bool { checkpoints.first { $0.id == options.initialCheckpointID }?.kind == "reinforcement" }
+    private var resumableSelection: Bool {
+        guard let selected = checkpoints.first(where: { $0.id == options.initialCheckpointID }), selected.kind == "reinforcement" else { return false }
+        return model.learningRuns.first { $0.id == selected.runID }?.sourceKind == "practice_rollout"
+    }
     private var ownsRun: Bool { model.learning?.activeRun?.agentID == agent.id && model.learning?.activeRun?.kind == .reinforcement }
 
     var body: some View {
@@ -178,8 +199,6 @@ struct ReinforcementTrainingView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         }
-                        Text("Training against external macOS applications will appear here when live rollout and reward integration is ready.")
-                            .font(.caption).foregroundStyle(.secondary)
                     }.padding(8)
                 } label: { Text("Environment").font(.headline) }
                 GroupBox {

@@ -254,3 +254,31 @@ private func resetRunnerRejectsUnprovenExecutionAndForeignOrUnconfirmedEvidence(
     let result = try await task.value
     #expect(result.status == .cancelled && result.cleanupConfirmed && driver.held.isEmpty)
 }
+
+@Test func resetRunnerStickyCancellationClosesAdmissionBeforeTheRunExists() async throws {
+    let driver = ResetFixtureDriver(), context = try driver.context()
+    let cancellation = ResetCancellation(resetID: context.resetID)
+    cancellation.cancel()
+    let result = try await driver.runner().run(context: context, program: driver.program(), cancellation: cancellation)
+    #expect(result.status == .cancelled && result.cleanupConfirmed)
+    #expect(driver.prepared == 0 && driver.posted.isEmpty)
+}
+
+@Test func resetRunnerCancellationTokensCannotBeReusedOrReachTheNextAttempt() async throws {
+    let driver = ResetFixtureDriver(), runner = driver.runner(), original = try driver.context()
+    let cancellation = ResetCancellation(resetID: original.resetID)
+    await #expect(throws: AstraError.self) { try await runner.run(context: driver.context(), program: driver.program(), cancellation: cancellation) }
+    #expect(driver.prepared == 0)
+    let first = try await runner.run(context: original, program: driver.program(), cancellation: cancellation)
+    #expect(first.status == .ready)
+    let before = driver.prepared
+    await #expect(throws: AstraError.self) { try await runner.run(context: original, program: driver.program(), cancellation: cancellation) }
+    #expect(driver.prepared == before)
+    let next = try driver.context(), current = ResetCancellation(resetID: next.resetID)
+    let work = Task { try await runner.run(context: next, program: driver.program(automatic: false), cancellation: current) }
+    try await waitForReset { driver.progress.last?.phase == .awaitingManualReady }
+    cancellation.cancel() // Detached old token cannot cancel the next manual wait.
+    #expect(runner.confirmManualReady(resetID: next.resetID))
+    let second = try await work.value
+    #expect(second.status == .ready && second.cleanupConfirmed)
+}

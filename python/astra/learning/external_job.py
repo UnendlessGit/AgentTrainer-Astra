@@ -10,7 +10,7 @@ import mlx.core as mx
 
 from astra.checkpoints import save_checkpoint, _sync
 from mlx.utils import tree_flatten, tree_unflatten
-from astra.environments.interface import EnvironmentSpec, EnvironmentError, same_id, fields
+from astra.environments.interface import EnvironmentSpec, EnvironmentError, same_id, fields, integer
 from .reinforcement import ReinforcementTrainer
 from .rollout_artifacts import inspect_package, load_rollout, encoded
 
@@ -44,7 +44,17 @@ def run_external_job(manager,job,loaded):
     value=job.configuration;path=Path(value['rolloutPath']);manifest=inspect_package(path);binding=manifest['binding']
     if manifest['status']!='sealed' or not same_id(binding['policyID'],loaded.manifest['id']) or binding['policySignature']!=loaded.manifest['policySignature']:
         raise JobError('job.rolloutMismatch','Sealed behavior policy does not match the checkpoint')
+    claim_parents=[path.parent];boundary_binding=binding
+    if manifest['schemaVersion']==2:
+        from .review_pipeline import validate_derived
+        claim_parents=[validate_derived(path,manifest)]
+        if binding['continuationSource'] is not None:
+            raise JobError('job.fragmentNeedsBatch','Continued experience requires a complete reviewed fragment batch')
+    elif manifest['schemaVersion']==3:
+        from .review_batches import batch_admission
+        claim_parents,boundary_binding=batch_admission(manifest)
     training=_reinforcement_config(binding['training']);spec=EnvironmentSpec.from_dict(binding['environment'])
+    integer(manifest['decisions'],training.maximum_rollout_decisions,training.rollout_decisions)
     if loaded.policy.config.to_dict()!=binding['model'] or loaded.policy.actions.vocabulary!=spec.action_vocabulary:
         raise JobError('job.rolloutMismatch','External model or action vocabulary differs from its checkpoint')
     restored=None;history=[]
@@ -64,7 +74,9 @@ def run_external_job(manager,job,loaded):
         raise JobError('job.rolloutConsumed','This rollout was already consumed or exceeded resume history capacity')
     # Claims are adjacent to the immutable package, never mutations of it. A
     # failed/crashed consumer needs fresh experience, not silent readmission.
-    _claim(path.parent,'.consumed-'+manifest['rolloutID']+'.json',{'jobID':job.identifier,'runID':job.request.run_id,'rolloutID':manifest['rolloutID']})
+    try:
+        for claim_parent in claim_parents:_claim(claim_parent,'.consumed-'+manifest['rolloutID']+'.json',{'jobID':job.identifier,'runID':job.request.run_id,'rolloutID':manifest['rolloutID']})
+    except FileExistsError as error:raise JobError('job.rolloutConsumed','This behavior batch was already consumed; changing its reward revision cannot reuse it') from error
     history.append(manifest['rolloutID'])
     trainer=ReinforcementTrainer(loaded.policy,SealedEnvironment(spec,binding['runID']),training,
         policy_id=loaded.manifest['id'],context_ids=tuple(binding['contextIDs']),restored_state=restored)
@@ -73,7 +85,7 @@ def run_external_job(manager,job,loaded):
     def report(phase,**extra):
         manager._progress(job,{'phase':phase,'sourceKind':'external_rollout','provenance':'external_rollout',
             'iteration':trainer.iteration,'decisions':trainer.decisions,'optimizer_updates':trainer.optimizer_updates,
-            'actor_policy_id':binding['policyID'],'actorRunID':binding['runID'],'rolloutID':manifest['rolloutID'],
+            'actor_policy_id':binding['policyID'],'actorRunID':boundary_binding['runID'],'rolloutID':manifest['rolloutID'],
             'elapsed_seconds':time.monotonic()-started,**extra})
     try:
         rollout=load_rollout(path,manifest,training);trainer.admit_external_rollout(rollout)
@@ -95,9 +107,12 @@ def run_external_job(manager,job,loaded):
                 return {'checkpointPublished':False,'cancelled':True,'resumable':False,'requiresEnvironmentReset':True,
                     'reason':'No verified joined actor boundary was available for checkpoint publication','rolloutID':manifest['rolloutID']}
         boundary=inspect_package(Path(job.external_boundary_path));other=boundary['binding']
-        if boundary['status'] not in ('sealed','audited') or not boundary['controlClosureKnown'] or boundary['actorProgress'] is None:
+        if boundary['schemaVersion']==3:
+            from .review_batches import batch_admission
+            _,other=batch_admission(boundary)
+        if boundary['status'] not in ('sealed','audited','awaiting_manual_review') or not boundary['controlClosureKnown'] or boundary['actorProgress'] is None:
             raise JobError('job.boundaryUnavailable','Boundary package has no completely validated actor/control stream')
-        if any(other[key]!=binding[key] for key in ('runID','clockID','policyID','policySignature','actorSourceID','environmentSourceID','environment','model','contextIDs')):
+        if any(other[key]!=boundary_binding[key] for key in ('runID','clockID','policyID','policySignature','actorSourceID','environmentSourceID','environment','model','contextIDs')):
             raise JobError('job.boundaryMismatch','Boundary package belongs to another actor/run/policy')
         old,new=manifest['actorProgress'],boundary['actorProgress']
         if new['rngStreamID']!=old['rngStreamID'] or new['drawIndex']<old['drawIndex'] or new['actorResetGeneration']<old['actorResetGeneration']:
@@ -107,7 +122,7 @@ def run_external_job(manager,job,loaded):
         elif other['previousActorProgress'] is None or not _same_progress(other['previousActorProgress'],old):
             raise JobError('job.boundaryMismatch','Continuity audit does not begin at the sealed rollout random state')
         _claim(Path(job.external_boundary_path).parent,'.boundary-'+boundary['id']+'.json',
-               {'jobID':job.identifier,'jobRunID':job.request.run_id,'actorRunID':binding['runID'],'actorProgress':new})
+               {'jobID':job.identifier,'jobRunID':job.request.run_id,'actorRunID':boundary_binding['runID'],'actorProgress':new})
         interrupted=interrupted or job.cancel.is_set()
         if interrupted and completed is not None:
             # Publication is the external job's commit point. Cancellation
@@ -127,7 +142,8 @@ def run_external_job(manager,job,loaded):
             training_state=state,parent_id=loaded.manifest['id'],metrics=metrics,training_config=asdict(training))
         return {'checkpointPath':value['destination'],'manifest':saved,'checkpointPublished':True,'cancelled':interrupted,
             'resumable':True,'requiresEnvironmentReset':True,'sourceKind':'external_rollout','provenance':'external_rollout',
-            'actorProgress':new,'boundaryCollectionID':boundary['id'],'rolloutID':manifest['rolloutID'],'metrics':completed}
+            'actorProgress':new,'boundaryCollectionID':boundary['id'],'rolloutID':manifest['rolloutID'],'metrics':completed,
+            'parameterCount':trainer.policy.config.parameter_count}
     finally:
         if rollout is not None:rollout.close()
         trainer.stop('External learner finished without owning native controls')

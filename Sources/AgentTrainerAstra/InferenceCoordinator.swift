@@ -39,6 +39,7 @@ struct InferenceDependencies: Sendable {
     /// runtimes have no physical input ownership and are tested independently.
     var protectsPhysicalInputs = false
     var controlOwner = NativeControlOwner()
+    var showOperator: @MainActor @Sendable () -> Void = {}
 
     static func live(bundle: Bundle) -> Self {
         let helpers = bundle.bundleURL.appendingPathComponent("Contents/Helpers")
@@ -66,8 +67,14 @@ struct InferenceDependencies: Sendable {
                     throw AstraError("inference.targetChanged", "The selected application closed or restarted. Choose it again.")
                 }
                 application.activate()
+            } else {
+                // Display observation must match the actual unobstructed
+                // desktop, not pixels with an invisible control panel removed.
+                NSApp?.hide(nil)
             }
-        }, protectsPhysicalInputs: true, controlOwner: .shared)
+        }, protectsPhysicalInputs: true, controlOwner: .shared, showOperator: {
+            NSApp?.unhide(nil); NSApp?.activate(ignoringOtherApps: true)
+        })
     }
 }
 
@@ -154,7 +161,9 @@ struct InferencePolicyDetails: Sendable {
     private(set) var failure: String?
     private(set) var stopReason: String?
     private(set) var countdown: Int?
+    /// Packets admitted by the control helper; production and execution are separate.
     private(set) var decisions = 0
+    private(set) var producedPackets: UInt64 = 0
     private(set) var executedPackets = 0
     private(set) var lastLatencyMS: Double?
     private(set) var maximumLatencyMS: Double?
@@ -169,17 +178,16 @@ struct InferencePolicyDetails: Sendable {
     private let dependencies: InferenceDependencies
     private var work: Task<Void, Never>?
     private var urgentStop: Task<Void, Never>?
-    private var actor: InferenceRuntime?
+    private var actor: PolicyActorSession?
     private var control: NativeControlSession?
     private var capture: InferenceCapture?
-    private var ring: SharedFrameRing?
     private var inbox: InferenceFrameInbox?
     private var stopRequested = false
     private var userOrInterventionStop = false
     private var unconfirmedControlSessionID: UUID?
     private var collectionSink: InferenceCollectionSink?
     private var collectionFault: InferenceCollectionFault?
-    private var collectionPredictionPending = false
+    private var collectionNextSequence: UInt64 = 0
 
     init(store: LibraryStore, root: URL, bundle: Bundle = .main, dependencies: InferenceDependencies? = nil) {
         self.store = store; self.root = root; self.dependencies = dependencies ?? .live(bundle: bundle)
@@ -196,12 +204,12 @@ struct InferencePolicyDetails: Sendable {
         }
         let run = UUID()
         isBusy = true; isStopping = false; activeAgentID = agent.id; runID = run; stopRequested = false; userOrInterventionStop = false
-        failure = nil; stopReason = nil; phase = "Opening the local policy…"; decisions = 0; executedPackets = 0
+        failure = nil; stopReason = nil; phase = "Opening the local policy…"; decisions = 0; producedPackets = 0; executedPackets = 0
         lastLatencyMS = nil; maximumLatencyMS = nil; warmupLatencyMS = []; policy = nil; resultsURL = nil
         cleanupConfirmed = false; cleanupRecoveredByGuardian = false; unconfirmedControlSessionID = nil
         collectionSink = collection
         collectionFault = collection == nil ? nil : InferenceCollectionFault()
-        collectionPredictionPending = false
+        collectionNextSequence = 0
         work = Task { [weak self] in await self?.perform(agent: agent, checkpoint: checkpoint, source: source, options: options, run: run) }
     }
 
@@ -230,9 +238,9 @@ struct InferencePolicyDetails: Sendable {
             urgentStop = Task {
                 if let control { _ = try? await control.disarm() }
                 // Shutdown interrupts a blocked actor request. Its completion
-                // joins process exit; the ring remains mapped until finish.
+                // joins process exit before its session retires mapped leases.
                 async let stoppedCapture: Void = capture?.stop() ?? ()
-                _ = await actor?.shutdown()
+                await actor?.shutdown(interruptPending: true)
                 await stoppedCapture
             }
         }
@@ -310,42 +318,28 @@ struct InferencePolicyDetails: Sendable {
             try await capture.start({ inbox.receive($0) }, { inbox.health($0) })
             let first = try await waitForFrame(inbox)
             let initialSurface = try first.metadata.surface.validated()
-            let ring = try await Task.detached {
-                try SharedFrameRing(url: directory.appendingPathComponent("frames.astraring"), runID: run, slotCount: 2,
-                                    slotCapacity: first.metadata.byteCount)
-            }.value
-            self.ring = ring
             try checkRunning()
-            let actor = makeActorRuntime(run: run)
+            let actor = PolicyActorSession(runID: run, ringURL: directory.appendingPathComponent("frames.astraring"),
+                slotCapacity: first.metadata.byteCount, runtime: makeActorRuntime(run: run))
+            // Publish ownership before preparation can suspend. Stop explicitly
+            // interrupts this session's owned task and joins its mapped leases.
             self.actor = actor
-            try validateHello(try await actor.start(), role: "actor"); try checkRunning()
-            let checkpointPath = root.appendingPathComponent("Models").appendingPathComponent(checkpoint.id.uuidString.lowercased()).path
-            var preparation: [String: JSONValue] = ["checkpointPath": .string(checkpointPath),
-                "ring": .object(["path": .string(ring.url.path), "ringID": .string(ring.ringID.uuidString.lowercased())]),
-                "seed": .integer(Int64(options.seed)), "deterministic": .bool(options.deterministic)]
-            if collectionSink != nil { preparation["collection"] = .bool(true) }
-            let ready = try await actor.request("inference.prepare", .object(preparation), run, .seconds(120), false)
-            guard ready.kind == "ack", ready.runID == run else { throw AstraError("inference.run", "The actor prepared a different run.") }
-            let details = try InferencePolicyDetails(ready.payload, checkpoint: checkpoint, runID: run, ringID: ring.ringID)
-            guard options.contextIDs.count == details.contextSizes.count,
-                  zip(options.contextIDs, details.contextSizes).allSatisfy({ $0 < $1 }) else {
-                throw AstraError("inference.contexts", "Choose one valid value for every context in this checkpoint.")
-            }
-            policy = details; try checkRunning()
-            if let collectionSink {
-                guard ready.payload.fields?["collection"] == .bool(true), ready.payload.fields?["collectionVersion"] == .integer(1),
-                      ready.payload.fields?["rngStreamID"]?.uuid != nil, ready.payload.fields?["deterministic"] == .bool(false) else {
-                    throw AstraError("inference.collectionVersion", "The actor cannot provide the required on-policy collection evidence.")
-                }
-                try collectionSink.offer(.prepared(runID: run, actor: ready.payload))
-            }
+            let selected = PolicyActorCheckpoint(document: checkpoint,
+                directory: root.appendingPathComponent("Models").appendingPathComponent(checkpoint.id.uuidString.lowercased()))
+            let ready = try await actor.prepare(checkpoint: selected, collection: collectionSink != nil,
+                deterministic: options.deterministic, mode: .fresh(seed: UInt64(options.seed)))
+            try checkRunning()
+            guard let details = await actor.policy else { throw AstraError("inference.policy", "The actor did not prepare its policy.") }
+            try checkRunning()
+            policy = details
+            if let collectionSink { try collectionSink.offer(.prepared(runID: run, actor: ready.payload)) }
             phase = "Warming the local policy…"
             // Warmup runs the actual mapped image/preprocessing/policy/decoder
             // path, but the actor restores recurrent, sequence and RNG state.
             // The first step pays compilation cost. Two measured warm steps
             // must leave headroom within both immutable cadence and lead.
             let warmEpisode = UUID()
-            let warmReset = try await reset(actor, run: run, episode: warmEpisode, contexts: options.contextIDs)
+            _ = try await actor.reset(confirmedEpisodeID: warmEpisode, contextIDs: options.contextIDs, timeout: .seconds(20))
             var warmState = ControlState(); warmState.valid = true
             warmState.pointer = Point2D(x: initialSurface.globalBounds.x + initialSurface.globalBounds.width / 2,
                                         y: initialSurface.globalBounds.y + initialSurface.globalBounds.height / 2)
@@ -354,17 +348,14 @@ struct InferencePolicyDetails: Sendable {
                 guard let frame = try inbox.read(), frame.metadata.surface == initialSurface else {
                     throw AstraError("inference.geometryChanged", "The environment changed while warming the policy. Choose it again and restart.")
                 }
-                let cutoff = MonotonicClock.now, observationID = UUID()
+                let cutoff = MonotonicClock.now
                 guard frame.metadata.observedNanos <= cutoff else { throw AstraError("inference.causality", "Capture returned an image from a future observation.") }
                 warmState.observedNanos = cutoff
                 let begin = MonotonicClock.now
-                let warm = try await predict(actor, ring: ring, frame: frame, run: run, episode: warmEpisode,
-                    previousState: warmReset, cutoff: cutoff, controls: warmState, events: [], contexts: options.contextIDs,
-                    observationID: observationID, warmup: true)
-                try requireSuccess(warm); try checkRunning()
-                guard warm.payload.fields?["warmup"] == .bool(true) else { throw AstraError("inference.warmup", "The actor did not isolate its warmup state.") }
-                _ = try validateResult(warm.payload, checkpoint: checkpoint, run: run, episode: warmEpisode,
-                    previousState: warmReset, observationID: observationID, cutoff: cutoff, sequence: 0, surface: initialSurface, details: details)
+                let observation = ControlObservation(controlState: warmState, executedEvents: [], intervalCovered: true,
+                    cutoffNanos: cutoff, lastSequence: nil)
+                _ = try await actor.warmup(.init(frame: frame, controls: observation))
+                try checkRunning()
                 let elapsed = Double(MonotonicClock.now - begin) / 1_000_000
                 warmupLatencyMS.append(elapsed)
                 if index > 0 {
@@ -377,8 +368,10 @@ struct InferencePolicyDetails: Sendable {
             // Warmup is not an environment episode and does not consume the
             // run's action sequence. Confirm the real initial state only now.
             let episode = UUID()
-            var previousState = try await reset(actor, run: run, episode: episode, contexts: options.contextIDs,
-                                                seed: collectionSink == nil ? options.seed : nil)
+            // Preparation seeds the actor once; all isolated warmups restore
+            // that key. Reset clears recurrence without replacing this stream.
+            _ = try await actor.reset(confirmedEpisodeID: episode, contextIDs: options.contextIDs, timeout: .seconds(20))
+            try checkRunning()
             if dependencies.countdownSeconds > 0 {
                 for remaining in (1...dependencies.countdownSeconds).reversed() {
                     countdown = remaining; phase = "Agent starts in \(remaining)…"
@@ -401,7 +394,6 @@ struct InferencePolicyDetails: Sendable {
             phase = "Agent running · move the pointer or press a key to take over"
             var nextDecision = MonotonicClock.now
             var lastEventSequence: UInt64?
-            var previousCutoff: UInt64?
             while true {
                 try checkRunning()
                 try await sleep(until: nextDecision)
@@ -413,22 +405,21 @@ struct InferencePolicyDetails: Sendable {
                     throw AstraError("inference.geometryChanged", "The environment changed size or position. Select the environment again before restarting.")
                 }
                 let observed = try await observation(control, after: lastEventSequence)
-                guard image.metadata.observedNanos <= observed.cutoffNanos, image.metadata.eventNanos <= image.metadata.observedNanos,
-                      previousCutoff.map({ observed.cutoffNanos >= $0 + UInt64(details.periodMS) * 1_000_000 }) ?? true else {
-                    throw AstraError("inference.causality", "Capture and input timestamps do not form a valid causal observation.")
-                }
+                try checkRunning()
                 let begin = MonotonicClock.now
-                let observationID = UUID()
-                let result = try await predict(actor, ring: ring, frame: image, run: run, episode: episode,
-                    previousState: previousState, cutoff: observed.cutoffNanos, controls: observed.controlState,
-                    events: observed.executedEvents, contexts: options.contextIDs, observationID: observationID)
-                try requireSuccess(result); try checkRunning()
+                let sink = collectionSink
+                let ticket = try await actor.beginPrediction(.init(frame: image, controls: observed), onObservation: { owned in
+                    // This bounded offer completes before sampling and retains
+                    // the exact CPU copy published by the actor session.
+                    if let sink { try sink.offer(.observation(try owned.singleSource())) }
+                })
+                let result = try await ticket.value()
+                producedPackets = result.packet.sequence + 1
+                try checkRunning()
                 guard let current = try inbox.read(), current.metadata.surface == initialSurface else {
                     throw AstraError("inference.geometryChanged", "The environment changed while the policy was deciding. Select it again before restarting.")
                 }
-                let packet = try validateResult(result.payload, checkpoint: checkpoint, run: run, episode: episode,
-                    previousState: previousState, observationID: observationID, cutoff: observed.cutoffNanos,
-                    sequence: UInt64(decisions), surface: initialSurface, details: details)
+                let packet = result.packet
                 let now = MonotonicClock.now
                 lastLatencyMS = Double(now - begin) / 1_000_000
                 maximumLatencyMS = max(maximumLatencyMS ?? 0, lastLatencyMS ?? 0)
@@ -436,32 +427,12 @@ struct InferencePolicyDetails: Sendable {
                     throw AstraError("inference.deadline", "The local policy missed its \(details.leadMS) ms execution lead. Use a checkpoint trained with a longer lead, or stop other GPU work before restarting.")
                 }
                 if let collectionSink {
-                    let record = try result.payload.required("collectionRecord")
-                    guard record.fields?["schemaVersion"] == .integer(1), record.fields?["checkpointID"]?.uuid == checkpoint.id,
-                          record.fields?["policySignature"] == .string(checkpoint.policySignature), record.fields?["episodeID"]?.uuid == episode,
-                          record.fields?["observationID"]?.uuid == observationID, record.fields?["previousStateID"]?.uuid == previousState,
-                          record.fields?["nextStateID"]?.uuid == result.payload.fields?["stateID"]?.uuid,
-                          try record.required("cutoffNanos").decode(UInt64.self) == observed.cutoffNanos,
-                          try record.required("frameIDs").decode([UUID].self) == [image.metadata.id],
-                          try record.required("contextIDs").decode([Int].self) == options.contextIDs,
-                          try record.required("episodeStep").decode(UInt64.self) == UInt64(decisions),
-                          record.fields?["recurrentReset"] == .bool(decisions == 0),
-                          record.fields?["logProbability"]?.double == result.payload.fields?["logProbability"]?.double,
-                          record.fields?["value"]?.double == result.payload.fields?["value"]?.double,
-                          record.fields?["sampler"]?.fields?["rngStreamID"]?.uuid == ready.payload.fields?["rngStreamID"]?.uuid,
-                          try record.required("sampler").required("drawIndex").decode(UInt64.self) == UInt64(decisions),
-                          record.fields?["sampler"]?.fields?["kind"] == .string("categorical"),
-                          record.fields?["sampler"]?.fields?["temperature"]?.double == 1,
-                          record.fields?["sampler"]?.fields?["mixture"] == .string("none") else {
-                        throw AstraError("inference.collectionIdentity", "The actor returned inconsistent collection evidence.")
-                    }
-                    try collectionSink.offer(.decision(result.payload))
-                    collectionPredictionPending = false
+                    try collectionSink.offer(.decision(result.response.payload))
+                    collectionNextSequence = packet.sequence + 1
                 }
                 let submitted = try await control.submit(packet)
                 guard submitted.admitted else { throw AstraError("inference.admission", "The control helper did not admit the action packet.") }
-                decisions += 1; previousState = try result.payload.requiredUUID("stateID")
-                previousCutoff = observed.cutoffNanos; lastEventSequence = observed.lastSequence
+                decisions += 1; lastEventSequence = observed.lastSequence
                 let addition = observed.cutoffNanos.addingReportingOverflow(UInt64(details.periodMS) * 1_000_000)
                 guard !addition.overflow else { throw AstraError("inference.clock", "The decision clock is exhausted.") }
                 nextDecision = addition.partialValue
@@ -474,14 +445,11 @@ struct InferencePolicyDetails: Sendable {
             }
         }
         await finish()
-        if collectionPredictionPending {
-            collectionFault?.record(AstraError("inference.unresolvedPrediction", "The actor ended before its in-flight sampled result could be fully retained. Its final random-stream progress is unverified."))
-        }
         if let message = collectionFault?.message {
             failure = [failure, "Collection evidence is incomplete: \(message)"].compactMap { $0 }.joined(separator: "\n")
         }
         var summary: JSONValue = .object(["runID": .string(run.uuidString.lowercased()), "status": .string(failure == nil ? "stopped" : "failed"),
-            "decisions": .integer(Int64(decisions)), "executedPackets": .integer(Int64(executedPackets)),
+            "decisions": .integer(Int64(decisions)), "producedPackets": .unsigned(producedPackets), "executedPackets": .integer(Int64(executedPackets)),
             "warmupLatencyMS": .array(warmupLatencyMS.map(JSONValue.number)),
             "elapsedSeconds": .number(Date().timeIntervalSince(startedAt)), "maximumLatencyMS": maximumLatencyMS.map(JSONValue.number) ?? .null,
             "issue": failure.map(JSONValue.string) ?? .null, "stopReason": stopReason.map(JSONValue.string) ?? .null,
@@ -523,54 +491,6 @@ struct InferencePolicyDetails: Sendable {
         throw AstraError("inference.captureTimeout", "The selected environment did not produce a frame in time.")
     }
 
-    private func reset(_ actor: InferenceRuntime, run: UUID, episode: UUID, contexts: [Int], seed: Int? = nil) async throws -> UUID {
-        var payload: [String: JSONValue] = ["confirmed": .bool(true), "episodeID": .string(episode.uuidString.lowercased()),
-            "contextIDs": .array(contexts.map { .integer(Int64($0)) })]
-        if let seed { payload["seed"] = .integer(Int64(seed)) }
-        let response = try await actor.request("inference.reset", .object(payload), run, .seconds(20), false)
-        guard response.kind == "ack", response.runID == run, response.payload.fields?["runID"]?.uuid == run, response.payload.fields?["episodeID"]?.uuid == episode,
-              response.payload.fields?["needsReset"] == .bool(false) else { throw AstraError("inference.reset", "The actor did not confirm a fresh recurrent episode.") }
-        return try response.payload.requiredUUID("stateID")
-    }
-
-    private func predict(_ actor: InferenceRuntime, ring: SharedFrameRing, frame: InferenceImage, run: UUID, episode: UUID,
-                         previousState: UUID, cutoff: UInt64, controls: ControlState, events: [RawInputEvent], contexts: [Int],
-                         observationID: UUID = UUID(), warmup: Bool = false) async throws -> WireMessage {
-        try checkRunning()
-        let collecting = collectionSink != nil && !warmup
-        if let coverage = frame.coverage { try coverage.validated(frame: frame.metadata, cutoffNanos: cutoff, maximumAgeMS: 250) }
-        else {
-            guard frame.metadata.eventNanos <= frame.metadata.observedNanos, frame.metadata.observedNanos <= cutoff,
-                  cutoff - frame.metadata.eventNanos <= 250_000_000 else {
-                throw AstraError("capture.stale", "The actor observation has no recent source coverage.")
-            }
-        }
-        let (reference, collectedPixels) = try await Task.detached {
-            let pixels = try frame.pixels()
-            return (try ring.publish(pixels: pixels, metadata: frame.metadata), collecting ? pixels : nil)
-        }.value
-        try checkRunning()
-        let payload: JSONValue = .object(["observationID": .string(observationID.uuidString.lowercased()), "episodeID": .string(episode.uuidString.lowercased()),
-            "previousStateID": .string(previousState.uuidString.lowercased()), "cutoffNanos": .unsigned(cutoff),
-            "geometryRevision": .unsigned(frame.metadata.surface.geometryRevision), "frames": .array([try .encode(reference)]),
-            "controlState": try .encode(controls), "executedEvents": try .encode(events), "intervalCovered": .bool(true),
-            "contextIDs": .array(contexts.map { .integer(Int64($0)) })])
-        if let collectedPixels, let collectionSink, var input = payload.fields {
-            input.removeValue(forKey: "frames")
-            try collectionSink.offer(.observation(.init(runID: run, actorInput: .object(input), frame: frame.metadata,
-                pixels: collectedPixels, coverage: frame.coverage)))
-        }
-        if collecting { collectionPredictionPending = true }
-        let response = try await actor.request(warmup ? "inference.warmup" : "inference.step", payload, run, .seconds(120), true)
-        guard response.runID == run else { throw AstraError("inference.run", "The actor replied for another run.") }
-        let released = try response.payload.required("releasedFrames").decode([SharedFrameAcknowledgement].self)
-        guard released == [reference.acknowledgement] || (response.kind == "error" && released.isEmpty) else {
-            throw AstraError("inference.frameAcknowledgement", "The actor acknowledged a different or repeated image lease.")
-        }
-        for acknowledgement in released { try ring.release(acknowledgement) }
-        return response
-    }
-
     private func observation(_ control: NativeControlSession, after: UInt64?) async throws -> AstraPlatform.ControlObservation {
         let deadline = MonotonicClock.now + 20_000_000
         while true {
@@ -584,42 +504,11 @@ struct InferencePolicyDetails: Sendable {
                 previous = event.sequence
             }
             guard previous == value.lastSequence else { throw AstraError("inference.inputCursor", "Executed input history does not match its cursor.") }
-            if value.controlState.valid { return value }
+            if value.controlState.valid { try value.validateControlCoverage(); return value }
             try checkRunning()
             guard MonotonicClock.now < deadline else { throw AstraError("inference.inputBusy", "The control helper could not provide a settled input observation in time.") }
             try await Task.sleep(for: .milliseconds(1))
         }
-    }
-
-    private func validateHello(_ message: WireMessage, role: String) throws {
-        guard message.kind == "hello", message.version == AstraVersion.protocolVersion,
-              message.payload.fields?["role"]?.text == role,
-              message.payload.fields?["protocolVersion"]?.int == AstraVersion.protocolVersion else {
-            throw AstraError("inference.runtime", "The local \(role) runtime reported an incompatible identity.")
-        }
-    }
-
-    private func requireSuccess(_ response: WireMessage) throws {
-        guard response.kind == "ack" else {
-            throw AstraError(response.payload.fields?["code"]?.text ?? "inference.actor", response.payload.fields?["message"]?.text ?? "The local actor rejected its observation.")
-        }
-    }
-
-    private func validateResult(_ value: JSONValue, checkpoint: CheckpointDocument, run: UUID, episode: UUID, previousState: UUID,
-                                observationID: UUID, cutoff: UInt64, sequence: UInt64, surface: SurfaceDescriptor,
-                                details: InferencePolicyDetails) throws -> ActionPacket {
-        let packet = try value.required("packet").decode(ActionPacket.self)
-        guard value.fields?["runID"]?.uuid == run, value.fields?["checkpointID"]?.uuid == checkpoint.id,
-              value.fields?["policySignature"]?.text == checkpoint.policySignature, value.fields?["episodeID"]?.uuid == episode,
-              value.fields?["stateID"]?.uuid != nil, value.fields?["stateID"]?.uuid != previousState, value.fields?["needsReset"] == .bool(false),
-              ["logProbability", "conditionalEntropy", "value"].allSatisfy({ value.fields?[$0]?.double?.isFinite == true }),
-              try value.required("surfaces").decode([SurfaceDescriptor].self) == [surface], packet.runID == run,
-              packet.observationID == observationID, packet.sequence == sequence, packet.geometryRevision == surface.geometryRevision,
-              !cutoff.addingReportingOverflow(UInt64(details.leadMS) * 1_000_000).overflow,
-              packet.executeAtNanos == cutoff.addingReportingOverflow(UInt64(details.leadMS) * 1_000_000).partialValue, packet.durationMs == details.periodMS else {
-            throw AstraError("inference.resultIdentity", "The actor returned an invalid policy, recurrent state, observation or action identity.")
-        }
-        return try packet.validated(capabilities: details.capabilities, surfaces: [surface], capacity: details.capacity)
     }
 
     private func receive(_ message: WireMessage) {
@@ -678,7 +567,16 @@ struct InferencePolicyDetails: Sendable {
         self.control = nil
         inbox?.close()
         await capture?.stop(); capture = nil; inbox = nil
-        _ = await actor?.shutdown(); actor = nil
-        ring?.closeAfterConsumerExit(); ring = nil
+        if let actor {
+            await actor.shutdown(interruptPending: true)
+            let state = await actor.state
+            producedPackets = state.nextPacketSequence
+            // Actor knowledge alone does not prove that the sink retained the
+            // result: Stop can arrive after sampling but before live admission.
+            if collectionSink != nil, !state.sampledProgressKnown || state.nextPacketSequence != collectionNextSequence {
+                collectionFault?.record(AstraError("inference.unresolvedPrediction", "The actor ended before its in-flight sampled result could be fully retained. Its final random-stream progress is unverified."))
+            }
+        }
+        actor = nil
     }
 }

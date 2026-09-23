@@ -19,6 +19,7 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
     private let sequence: DesktopEnvironmentSequence
     private let program: RewardProgram, scope: ControlScope
     private let limits: Limits
+    private let deferManualFeedback: Bool
     private let onTerminal: @Sendable (DesktopTerminalEvidence) -> Void
     private let onFault: @Sendable (DesktopEpisodeFault) -> Void
     private let owner = DispatchQueue(label: "astra.desktop.episodeEvidence", qos: .userInitiated)
@@ -71,7 +72,7 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
     }
     private init(identity: DesktopEvidenceIdentity, episodeID: UUID, generationID: UUID, policyID: UUID, policySignature: String,
                  collector: CollectorSession, sequence: DesktopEnvironmentSequence, program: RewardProgram, scope: ControlScope,
-                 limits: Limits, onTerminal: @escaping @Sendable (DesktopTerminalEvidence) -> Void,
+                 limits: Limits, deferManualFeedback: Bool, onTerminal: @escaping @Sendable (DesktopTerminalEvidence) -> Void,
                  onFault: @escaping @Sendable (DesktopEpisodeFault) -> Void) throws {
         guard collector.runID == identity.runID, sequence.identity == identity, policySignature.utf8.count == 64,
               (2 * AstraVersion.maximumMessageBytes...1024 * 1024 * 1024).contains(limits.maximumBytes),
@@ -82,18 +83,19 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
         self.identity = identity; self.episodeID = episodeID; self.generationID = generationID
         self.policyID = policyID; self.policySignature = policySignature; self.collector = collector; self.sequence = sequence
         self.program = try program.validated(); self.scope = try scope.validated(); self.limits = limits
+        self.deferManualFeedback = deferManualFeedback
         self.onTerminal = onTerminal; self.onFault = onFault
     }
     static func prepare(identity: DesktopEvidenceIdentity, episodeID: UUID, generationID: UUID = UUID(),
                         policyID: UUID, policySignature: String, collector: CollectorSession, sequence: DesktopEnvironmentSequence,
                         program: RewardProgram, scope: ControlScope, assetRoot: URL, warmupFrames: [RewardImageFrame],
-                        limits: Limits = Limits(), detector: @escaping RewardAnalysisQueue.Detector = {
+                        limits: Limits = Limits(), deferManualFeedback: Bool = false, detector: @escaping RewardAnalysisQueue.Detector = {
                             try VisualRewardDetector.read(signals: $0, frames: $1, episodeID: $2, templates: $3)
                         }, onTerminal: @escaping @Sendable (DesktopTerminalEvidence) -> Void,
                         onFault: @escaping @Sendable (DesktopEpisodeFault) -> Void) async throws -> DesktopEpisodeEvidence {
         let result = try Self(identity: identity, episodeID: episodeID, generationID: generationID, policyID: policyID,
             policySignature: policySignature, collector: collector, sequence: sequence, program: program, scope: scope,
-            limits: limits, onTerminal: onTerminal, onFault: onFault)
+            limits: limits, deferManualFeedback: deferManualFeedback, onTerminal: onTerminal, onFault: onFault)
         result.analysis = try await RewardAnalysisQueue.prepare(program: program, scope: scope, episodeID: episodeID,
             assetRoot: assetRoot, warmupFrames: warmupFrames, detector: detector,
             onResult: { [weak result] value in
@@ -213,7 +215,7 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
         }
     }
 
-    private var requiresManualSeal: Bool { program.signals.contains { $0.kind == .manual } || program.rules.contains { $0.kind == .manualMarker } }
+    private var requiresManualSeal: Bool { program.signals.contains { $0.kind == .manual } || (!deferManualFeedback && program.rules.contains { $0.kind == .manualMarker }) }
     private func entry(_ id: UUID) throws -> Entry {
         if let value = entries[id] { return value }
         guard entries.count < limits.maximumEpisodeDecisions else { throw AstraError("desktop.episodeCapacity", "Episode identity history reached its configured capacity.") }
@@ -394,7 +396,7 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
         guard began, !auditOnly else { return }
         for start in evaluations.keys.sorted() {
             guard let packet = byCutoff[start], let evaluation = evaluations[start] else { return }
-            try sequence.interval(evaluation, packetID: packet, collector: collector)
+            try sequence.interval(evaluation, packetID: packet, collector: collector, deferredProgram: deferManualFeedback ? program : nil)
             evaluations[start] = nil
         }
     }

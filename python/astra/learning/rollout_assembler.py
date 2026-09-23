@@ -21,7 +21,7 @@ import uuid
 import numpy as np
 
 from astra.environments.interface import (EnvironmentObservation, EnvironmentSpec, EnvironmentError,
-    DecisionContext, SurfaceObservation, fields, integer, same_id, uuid_key, owned_bgra)
+    DecisionContext, SurfaceObservation, fields, integer, same_id, uuid_key, owned_bgra, control_observation)
 from astra.environments.evidence import DecisionEvidence, OUTCOMES
 from astra.environments.external import validate_commands, json_geometry
 from astra.environments.observation_transport import SnapshotDecoder
@@ -102,6 +102,10 @@ class ActorRecord:
         collection=response['collectionRecord']
         if type(collection) is not dict or 'episodeID' not in collection:
             raise EnvironmentError('Actor collection record is missing its episode binding')
+        coverage=collection.get('controlCoverageNanos')
+        if coverage is not None:integer(coverage)
+        if type(snapshot) is not dict or coverage!=snapshot.get('controlCoverageNanos'):
+            raise EnvironmentError('Actor and snapshot control coverage disagree before acquisition')
         decoded,events=SnapshotDecoder(spec,resolve_frame,on_consumed).decode(snapshot,episode=collection['episodeID'],
             expected_cutoff=collection.get('cutoffNanos'))
         return cls(copy.deepcopy(response['packet']),copy.deepcopy(collection),decoded,events)
@@ -127,6 +131,7 @@ class _ActorRow:
     collection: dict
     evidence: DecisionEvidence
     arrived: float
+    retrospective: dict | None = None
 
 
 @dataclass
@@ -158,7 +163,7 @@ class AsyncRolloutAssembler:
                  run_id: str, clock_id: str, policy_id: str, policy_signature: str,
                  actor_source_id: str, environment_source_id: str, audit_path: Path,
                  context_ids=(), limits: AssemblyLimits = AssemblyLimits(), scratch_directory: Path | None = None,
-                 on_fault=lambda _: None, audit_only=False, previous_actor_progress=None):
+                 on_fault=lambda _: None, audit_only=False, previous_actor_progress=None, retrospective_program=None, behavior_batch_id=None):
         self.spec, self.model, self.training, self.limits = spec.validate(), model.validate(), training.validate(), limits.validate()
         self.run_id, self.clock_id = uuid_key(run_id), uuid_key(clock_id)
         self.actor_source_id, self.environment_source_id = uuid_key(actor_source_id), uuid_key(environment_source_id)
@@ -178,9 +183,12 @@ class AsyncRolloutAssembler:
                                 disk_bytes=training.maximum_rollout_disk_bytes, directory=scratch_directory)
         if type(audit_only) is not bool: raise EnvironmentError('Audit-only collection must be explicit')
         self.audit_only = audit_only
+        self.retrospective_program = retrospective_program
+        self.behavior_batch_id = None if behavior_batch_id is None else uuid_key(behavior_batch_id)
         if previous_actor_progress is not None:
             from .rollout_artifacts import progress
-            progress(previous_actor_progress,self.run_id)
+            progress(previous_actor_progress,self.run_id if retrospective_program is None else None)
+        self._retrospective_excluded=set()
         self._previous_actor_progress=previous_actor_progress
         self._on_fault = on_fault
         self._condition = threading.Condition()
@@ -262,13 +270,14 @@ class AsyncRolloutAssembler:
             prepare=lambda:ActorRecord.from_wire(response,snapshot,spec=self.spec,
                 resolve_frame=resolve_frame,on_consumed=on_consumed))
 
-    def submit_bootstrap_wire(self,*,episode_id,snapshot,value,policy_id,preceding_packet_id,source_id,resolve_frame,on_consumed):
+    def submit_bootstrap_wire(self,*,episode_id,snapshot,value,policy_id,preceding_packet_id,source_id,resolve_frame,on_consumed,endpoint=False):
         if not same_id(source_id,self.actor_source_id) or not same_id(policy_id,self.policy_id):
             raise EnvironmentError('Bootstrap did not come from the bound behavior actor')
-        if type(value) not in (int,float) or not math.isfinite(value):raise EnvironmentError('Bootstrap must have a finite value')
+        if not (endpoint and self.retrospective_program is not None and value is None) and (type(value) not in (int,float) or not math.isfinite(value)):
+            raise EnvironmentError('Bootstrap must have a finite value')
         def prepare():
             observed,events=SnapshotDecoder(self.spec,resolve_frame,on_consumed).decode(snapshot,episode=episode_id)
-            return uuid_key(episode_id),observed,float(value),uuid_key(preceding_packet_id),events
+            return uuid_key(episode_id),observed,None if value is None else float(value),uuid_key(preceding_packet_id),events
         self._submit('bootstrap',None,size=self.wire_byte_count({},snapshot),prepare=prepare)
 
     def submit_evidence(self, message: Message, *, source_id):
@@ -347,7 +356,10 @@ class AsyncRolloutAssembler:
                     elif kind == 'evidence': self._evidence(value)
                     elif kind == 'end': self._end(*value)
                     elif kind == 'bootstrap': self._bootstrap(*value)
-                    elif kind == 'abort_learning':self.audit_only=True
+                    elif kind == 'abort_learning':
+                        if self.retrospective_program is None:self.audit_only=True
+                        else:self._retrospective_excluded.update(identifier for identifier,episode in self._episodes.items()
+                            if episode.closed_nanos is None or episode.boundary is None or any(row.evidence.outcome=='aborted' for row in episode.rows))
                     elif kind == 'finish':
                         if self._active_episode is not None: raise EnvironmentError('Join episode stop before finishing actor collection')
                         self._finished_collection = True
@@ -393,7 +405,7 @@ class AsyncRolloutAssembler:
         required = ('schemaVersion','checkpointID','policySignature','modelSignature','episodeID','episodeStep',
             'observationID','cutoffNanos','geometryRevision','frameIDs','contextIDs','previousStateID','nextStateID',
             'recurrentReset','elapsedSeconds','stateBefore','packetFields','logProbability','value','sampler','environmentResets')
-        fields(value, required)
+        fields(value, required, ('controlCoverageNanos',))
         fields(packet, ('id','runID','sequence','observationID','geometryRevision','executeAtNanos','durationMs','commands'))
         if integer(value['schemaVersion'],1,1) != 1 or not same_id(value['checkpointID'],self.policy_id) or value['policySignature'] != self.policy_signature or value['modelSignature'] != self.model.signature:
             raise EnvironmentError('Actor used a different policy or model configuration')
@@ -409,6 +421,9 @@ class AsyncRolloutAssembler:
         cutoff = integer(value['cutoffNanos']); integer(value['geometryRevision'])
         if not same_id(observed.episode_id, episode_id) or not same_id(value['observationID'], observed.id) or not same_id(packet['observationID'], observed.id) or not same_id(packet['runID'], self.run_id):
             raise EnvironmentError('Actor snapshot and packet identities disagree')
+        if value.get('controlCoverageNanos') is not None:integer(value['controlCoverageNanos'])
+        if value.get('controlCoverageNanos')!=observed.control_coverage_nanos:
+            raise EnvironmentError('Actor and retained observation control coverage disagree')
         if cutoff != observed.cutoff_nanos or value['geometryRevision'] != observed.geometry_revision or packet['geometryRevision'] != observed.geometry_revision:
             raise EnvironmentError('Actor snapshot clocks/geometry disagree')
         if type(value['frameIDs']) is not list or [uuid_key(item) for item in value['frameIDs']] != [uuid_key(frame.metadata['id']) for frame in observed.frames] or value['contextIDs'] != list(self.context_ids):
@@ -477,17 +492,18 @@ class AsyncRolloutAssembler:
                 raise EnvironmentError('Actor input contains feedback/intervention, a gap or noncausal history')
             if step and event['observedNanos']<=episode.rows[-1].record.cutoff_nanos: raise EnvironmentError('Actor input history was delivered outside its observation interval')
             last_event=event['sequence']
-        if not observed.control_state['valid'] or cutoff-observed.control_state['observedNanos']>self.spec.maximum_frame_age_ms*1000000:
-            raise EnvironmentError('Actor controls are unavailable or stale')
+        control_observation(observed.control_state,cutoff,observed.control_coverage_nanos,
+                            maximum_age_ms=self.spec.maximum_frame_age_ms)
         observed=replace(observed,id=uuid_key(observed.id),episode_id=episode_id)
-        if self.audit_only:
+        if self.audit_only or episode_id in self._retrospective_excluded:
             # Continuity is explicitly ineligible for learning. Retain timing,
             # controls and exact actor/receipt evidence, without spooling visual
             # tensors that no learner may consume. CPU lease validation still
             # completed before this branch.
             record=ObservationRecord((),observed.id,episode_id,cutoff,observed.geometry_revision,
                 json.dumps(observed.control_state,separators=(',',':')).encode(),
-                json.dumps(actor.events,separators=(',',':')).encode(),elapsed,step==0,episode.last_input_nanos)
+                json.dumps(actor.events,separators=(',',':')).encode(),elapsed,step==0,episode.last_input_nanos,
+                observed.control_coverage_nanos)
             self._spool.reserve_metadata(record.metadata_byte_count)
         else:
             record=ObservationRecord.capture(observed, events=actor.events, elapsed_seconds=elapsed, reset=step==0,
@@ -542,6 +558,10 @@ class AsyncRolloutAssembler:
             row=self._rows.get(uuid_key(message.request_id))
             if row is None or row.record.episode_id!=episode.id: raise EnvironmentError('Evidence has no matching actor decision')
             if message.kind in ('environment.reward','environment.outcome'):
+                if self.retrospective_program is not None and message.kind=='environment.reward':
+                    from .feedback_program import automatic_reward
+                    row.retrospective=automatic_reward(payload,self.retrospective_program)
+                    payload={key:value for key,value in payload.items() if key not in ('automaticComponents','deferredManualRuleIDs')}
                 boundary=row.evidence.accept_label(message.kind,payload,period_ms=self.spec.period_ms,watermark=episode.watermark,
                     maximum_interval_nanos=self.spec.period_ms*1000000+self.limits.maximum_cadence_delay_nanos)
                 if episode.rows and row.evidence.end-episode.rows[0].record.cutoff_nanos>self.spec.maximum_episode_ms*1000000+self.limits.maximum_cadence_delay_nanos:
@@ -569,8 +589,8 @@ class AsyncRolloutAssembler:
         if observed.cutoff_nanos<=row.record.cutoff_nanos: raise EnvironmentError('Bootstrap must follow its actor decision')
         if observed.cutoff_nanos-row.record.cutoff_nanos>self.spec.period_ms*1000000+self.limits.maximum_cadence_delay_nanos:
             raise EnvironmentError('Bootstrap interval exceeds the cadence delay bound')
-        if not observed.control_state['valid'] or observed.cutoff_nanos-observed.control_state['observedNanos']>self.spec.maximum_frame_age_ms*1000000:
-            raise EnvironmentError('Bootstrap controls are unavailable or stale')
+        control_observation(observed.control_state,observed.cutoff_nanos,observed.control_coverage_nanos,
+                            maximum_age_ms=self.spec.maximum_frame_age_ms)
         if packet_id in episode.bootstraps: raise EnvironmentError('Bootstrap actor evidence was duplicated')
         if (observed.geometry_revision,tuple(json_geometry(frame.metadata['surface']) for frame in observed.frames))!=episode.geometry:
             raise EnvironmentError('Bootstrap geometry is not the pre-reset episode geometry')
@@ -597,13 +617,13 @@ class AsyncRolloutAssembler:
         for episode in self._episodes.values():
             for index,row in enumerate(episode.rows):
                 evidence=row.evidence
-                suffix=self.audit_only or (episode.boundary is not None and row.record.cutoff_nanos>=episode.boundary)
+                suffix=self.audit_only or episode.id in self._retrospective_excluded or (episode.boundary is not None and row.record.cutoff_nanos>=episode.boundary)
                 if not suffix and evidence.end is None:
                     expected_end=episode.rows[index+1].record.cutoff_nanos if index+1<len(episode.rows) else episode.boundary
                     if expected_end is not None and expected_end<=episode.watermark:
                         raise EnvironmentError('Watermark sealed a missing actor reward/outcome window')
                 labels=suffix or (evidence.end is not None and evidence.end<=episode.watermark and evidence.reward is not None and evidence.outcome in OUTCOMES)
-                missing_bootstrap=(not suffix and evidence.outcome=='truncated' and
+                missing_bootstrap=(not suffix and (evidence.outcome=='truncated' or self.retrospective_program is not None and evidence.outcome in OUTCOMES) and
                     not any(other.record.cutoff_nanos==evidence.end for other in episode.rows) and
                     uuid_key(evidence.context.packet_id) not in episode.bootstraps)
                 if not labels or evidence.receipt is None or (not suffix and not evidence.admission_seen) or missing_bootstrap:
@@ -622,8 +642,17 @@ class AsyncRolloutAssembler:
             return
         if self.audit_only:
             self._try_seal_audit();return
+        if self.retrospective_program is not None and self._retrospective_excluded==set(self._episodes):
+            self._try_seal_audit();return
         decisions=[]; audit=[]
         for episode in self._episodes.values():
+            if episode.id in self._retrospective_excluded:
+                if episode.closed_nanos is None or not episode.rows or episode.rows[-1].evidence.sequence!=episode.last_actor_sequence or any(row.evidence.receipt is None for row in episode.rows):return
+                audit.append({'episodeID':episode.id,'stoppedNanos':episode.closed_nanos,'excludedEpisode':True,
+                    'reason':'Operator stopped before a completed joined semantic episode',
+                    'decisions':[{'packetID':row.evidence.context.packet_id,'observationID':row.record.observation_id,
+                        'decisionNanos':row.record.cutoff_nanos,'receipt':row.evidence.receipt,'commands':row.evidence.commands} for row in episode.rows]})
+                continue
             if episode.closed_nanos is None or not episode.rows or episode.boundary is None: return
             if episode.rows[-1].evidence.sequence!=episode.last_actor_sequence: return
             if episode.boundary>episode.closed_nanos: raise EnvironmentError('Semantic outcome lies after joined episode stop')
@@ -639,21 +668,31 @@ class AsyncRolloutAssembler:
                 if evidence.end!=expected_end or (index+1<len(prefix) and evidence.outcome!='continuing') or (index+1==len(prefix) and evidence.outcome=='continuing'):
                     raise EnvironmentError('Reward/outcome windows do not partition the actual actor cutoffs')
                 outcome=Outcome(OUTCOMES[evidence.outcome]); bootstrap_record=None; bootstrap=None
-                if outcome in (Outcome.CONTINUING,Outcome.TRUNCATED):
+                endpoint_record=None
+                if outcome in (Outcome.CONTINUING,Outcome.TRUNCATED) or self.retrospective_program is not None:
                     next_row=next((item for item in episode.rows if item.record.cutoff_nanos==evidence.end),None)
                     supplied=episode.bootstraps.get(uuid_key(evidence.context.packet_id))
                     if next_row is not None: bootstrap_record,bootstrap_value=replace(next_row.record,reset=False),next_row.collection['value']
                     elif supplied is not None: bootstrap_record,bootstrap_value=supplied
                     else: return
                     if bootstrap_record.cutoff_nanos!=evidence.end: raise EnvironmentError('Bootstrap cutoff is not the original pre-reset outcome cutoff')
-                    bootstrap=BootstrapObservation(episode.id,self.policy_id,bootstrap_record.observation_id,evidence.end,bootstrap_value)
+                    endpoint_record=bootstrap_record
+                    if outcome in (Outcome.CONTINUING,Outcome.TRUNCATED):
+                        if bootstrap_value is None:raise EnvironmentError('Truncation/continuation requires its original behavior value')
+                        bootstrap=BootstrapObservation(episode.id,self.policy_id,bootstrap_record.observation_id,evidence.end,bootstrap_value)
+                    else:bootstrap_record=None
                 scalar=Transition(self.run_id,episode.id,self.policy_id,index,row.record.observation_id,evidence.context.packet_id,
                     row.record.cutoff_nanos,evidence.end,RewardWindow(row.record.cutoff_nanos,evidence.end,evidence.reward),
                     row.collection['logProbability'],row.collection['value'],bootstrap,outcome,index==0)
                 tokens=tuple(tuple(row.collection['packetFields'][name]) for name in PacketBatch.__dataclass_fields__)
                 states=tuple(_frozen_array([values],np.float32) for values in row.collection['stateBefore'])
                 decisions.append(CollectedDecision(scalar,replace(row.record,episode_id=episode.id),tokens,states,bootstrap_record,
-                    evidence.outcome,json.dumps(evidence.commands,separators=(',',':'),allow_nan=False).encode()))
+                    evidence.outcome,json.dumps(evidence.commands,separators=(',',':'),allow_nan=False).encode(),
+                    endpoint_record if self.retrospective_program is not None else None,
+                    None if self.retrospective_program is None else json.dumps({
+                        'packetSequence':evidence.sequence,'drawIndex':row.collection['sampler']['drawIndex'],
+                        'execution':'semanticBoundaryPrefix' if evidence.receipt['status']=='cancelled' else 'executed',
+                        'receipt':evidence.receipt,**row.retrospective},separators=(',',':'),allow_nan=False).encode()))
             suffix=[]; post_terminal=[]
             for row in episode.rows:
                 receipt=copy.deepcopy(row.evidence.receipt)
@@ -672,7 +711,7 @@ class AsyncRolloutAssembler:
                   'drawIndex':self._sampler[1],'rngState':list(self._sampler[2]),
                   'actorResetGeneration':self._sampler[3]}
         report['actorProgress']=progress
-        if len(decisions)<self.training.rollout_decisions:
+        if len(decisions)<self.training.rollout_decisions and self.retrospective_program is None:
             raise EnvironmentError('Complete learning episodes have not reached the configured rollout minimum')
         encoded=json.dumps(report,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
         if len(encoded)>self.limits.maximum_audit_bytes: raise EnvironmentError('Rollout audit exceeds its explicit byte budget')
@@ -686,7 +725,7 @@ class AsyncRolloutAssembler:
             os.link(temporary,self.audit_path)
         finally: Path(temporary).unlink(missing_ok=True)
         self._spool.seal()
-        rollout=CollectedRollout(str(uuid.uuid4()),Rollout(tuple(item.transition for item in decisions)),tuple(decisions),
+        rollout=CollectedRollout(self.behavior_batch_id or str(uuid.uuid4()),Rollout(tuple(item.transition for item in decisions)),tuple(decisions),
             self.model.signature,self.spec.signature,self.context_ids,self._spool.disk_bytes+self._spool.metadata_bytes,
             time.monotonic()-self._started,0,self._spool,('categorical',1.0,'none',1),
             json.dumps(progress,sort_keys=True,separators=(',',':')).encode())

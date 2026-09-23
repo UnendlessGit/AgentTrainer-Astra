@@ -481,7 +481,10 @@ def test_actor_releases_owned_frames_on_processing_failure_and_requires_reset(na
         actor.prepare(_prepare(checkpoint, report), run_id=run_id)
         state = actor.reset({"confirmed": True, "episodeID": str(uuid.uuid4()), "contextIDs": []}, run_id=run_id)
         request = _step(report, state)
-        request["controlState"]["observedNanos"] += 1  # Future physical state cannot reach the policy.
+        # Control authority is checked before copying now. A future frame's
+        # availability still exercises failure after a completed owned copy.
+        request["cutoffNanos"] -= 1
+        request["controlState"]["observedNanos"] = request["cutoffNanos"]
         with pytest.raises(InferenceError) as failure:
             actor.step(request, run_id=run_id)
         assert len(failure.value.released_frames) == 1 and actor._needs_reset
@@ -597,7 +600,8 @@ def test_worker_actor_role_runs_real_ring_checkpoint_and_returns_release_on_erro
     reset = actor_worker.request("inference.reset", {"confirmed": True, "episodeID": str(uuid.uuid4()), "contextIDs": []}, run_id=run_id)
     assert reset["kind"] == "ack", reset
     request = _step(report, reset["payload"])
-    request["controlState"]["observedNanos"] += 1
+    request["cutoffNanos"] -= 1  # Owned pixels precede frame-availability validation.
+    request["controlState"]["observedNanos"] = request["cutoffNanos"]
     failed = actor_worker.request("inference.step", request, run_id=run_id)
     assert failed["kind"] == "error" and failed["payload"]["needsReset"]
     assert len(failed["payload"]["releasedFrames"]) == 1

@@ -20,7 +20,7 @@ from astra.model.config import ModelConfig
 from astra.protocol import Message, MAX_MESSAGE_BYTES
 
 COLLECTOR_OPERATIONS=tuple('collector.'+name for name in
-    ('prepare','begin','actor','evidence','bootstrap','end','abort','finish','status'))
+    ('prepare','begin','actor','evidence','bootstrap','endpoint','end','abort','finish','status'))
 
 
 def _wire(message):
@@ -79,15 +79,26 @@ class CollectorManager:
 
     def _validate_prepare(self,request):
         value=request.payload
+        version=integer(value.get('schemaVersion'),2,1)
+        extras=('retrospective','behaviorBatchID','continuationSource') if version==2 else ()
         fields(value,('schemaVersion','clockID','environment','model','training','policyID','policySignature','actorSourceID',
-            'environmentSourceID','contextIDs','destination','rings','purpose'),('limits','previousActorProgress'))
-        integer(value['schemaVersion'],1,1)
+            'environmentSourceID','contextIDs','destination','rings','purpose'),('limits','previousActorProgress',*extras))
+        if version==2:
+            if value['purpose']!='retrospective' or 'retrospective' not in value:raise EnvironmentError('Collector schema2 requires explicit retrospective collection')
+            from astra.learning.feedback_program import program_binding
+            program_binding(value['retrospective'])
+            if 'behaviorBatchID' in value:uuid_key(value['behaviorBatchID'])
+            if value.get('continuationSource') is not None:
+                from astra.learning.review_pipeline import continuation_binding
+                continuation_binding(value)
         for name in ('clockID','policyID','actorSourceID','environmentSourceID'):uuid_key(value[name])
         spec=EnvironmentSpec.from_dict(value['environment']);model=ModelConfig.from_dict(value['model'])
+        if version==2 and spec.reward_signature!=value['retrospective']['programSHA256']:
+            raise EnvironmentError('Frozen program differs from environment reward identity')
         _reinforcement_config(value['training']);AssemblyLimits(**value.get('limits',{})).validate()
         _path(value['destination'],destination=True)
         if not Path(value['destination']).parent.is_dir():raise EnvironmentError('Collector destination parent must exist')
-        if value['purpose'] not in ('learning','audit') or type(value['contextIDs']) is not list:
+        if value['purpose'] not in (('retrospective',) if version==2 else ('learning','audit')) or type(value['contextIDs']) is not list:
             raise EnvironmentError('Invalid collector purpose or contexts')
         if type(value['rings']) is not list or not 1<=len(value['rings'])<=16:raise EnvironmentError('Collector requires bounded prebound rings')
         ids=set()
@@ -95,7 +106,7 @@ class CollectorManager:
             fields(ring,('path','ringID'));_path(ring['path']);key=uuid_key(ring['ringID'])
             if key in ids:raise EnvironmentError('Duplicate collector ring identity')
             ids.add(key)
-        if value.get('previousActorProgress') is not None:progress(value['previousActorProgress'],request.run_id)
+        if value.get('previousActorProgress') is not None:progress(value['previousActorProgress'],request.run_id if version==1 else None)
         if model.period_ms!=spec.period_ms or model.lead_ms!=spec.lead_ms:raise EnvironmentError('Collector model/environment timing differs')
 
     def status(self):
@@ -128,6 +139,14 @@ class CollectorManager:
         self._binding={name:copy.deepcopy(value[name]) for name in ('clockID','policyID','policySignature','actorSourceID',
             'environmentSourceID','environment','model','training','contextIDs','purpose')}
         self._binding.update(runID=self._run_id,previousActorProgress=value.get('previousActorProgress'))
+        program=None
+        if value['schemaVersion']==2:
+            from astra.learning.feedback_program import program_binding
+            _,program=program_binding(value['retrospective'])
+            self._binding.update(retrospective=copy.deepcopy(value['retrospective']),behaviorBatchID=value.get('behaviorBatchID',self._collection),continuationSource=value.get('continuationSource'))
+            if value.get('continuationSource') is not None:
+                from astra.learning.review_pipeline import continuation_binding
+                self._binding['previousActorProgress']=continuation_binding(value)
         for name in ('clockID','policyID','actorSourceID','environmentSourceID'):self._binding[name]=uuid_key(self._binding[name])
         for ring in value['rings']:
             key=uuid_key(ring['ringID']);self._rings[key]=FrameRingReader(Path(ring['path']),run_id=self._run_id,ring_id=key)
@@ -136,7 +155,8 @@ class CollectorManager:
             training=_reinforcement_config(value['training']),run_id=self._run_id,clock_id=value['clockID'],policy_id=value['policyID'],
             policy_signature=value['policySignature'],actor_source_id=value['actorSourceID'],environment_source_id=value['environmentSourceID'],
             audit_path=self._working/'audit.json',context_ids=tuple(value['contextIDs']),limits=AssemblyLimits(**value.get('limits',{})),
-            scratch_directory=self._working,audit_only=value['purpose']=='audit',previous_actor_progress=value.get('previousActorProgress'))
+            scratch_directory=self._working,audit_only=value['purpose']=='audit',previous_actor_progress=self._binding['previousActorProgress'],
+            retrospective_program=program,behavior_batch_id=self._binding.get('behaviorBatchID'))
         self._append(request);self._status='collecting'
         self._send('ack',{'collectionID':self._collection,'status':'ready','journalPath':str(self._working/'journal.ndjson'),
             'destination':str(self._destination),'collectionVersion':1},request=request)
@@ -185,12 +205,15 @@ class CollectorManager:
         elif kind=='collector.evidence':
             fields(value,('sourceID','message'))
             if not self._aborted or self._validated_abort:self._assembler.submit_evidence(_message(value['message']),source_id=value['sourceID'])
-        elif kind=='collector.bootstrap':
-            fields(value,('sourceID','episodeID','policyID','precedingPacketID','value','observation'))
+        elif kind in ('collector.bootstrap','collector.endpoint'):
+            endpoint=kind=='collector.endpoint'
+            if endpoint and self._binding['purpose']!='retrospective':raise EnvironmentError('Endpoint retention requires retrospective collection')
+            if endpoint:fields(value,('sourceID','episodeID','policyID','precedingPacketID','observation'),('value',))
+            else:fields(value,('sourceID','episodeID','policyID','precedingPacketID','value','observation'))
             if not self._aborted or self._validated_abort:
-                self._assembler.submit_bootstrap_wire(episode_id=value['episodeID'],snapshot=value['observation'],value=value['value'],
+                self._assembler.submit_bootstrap_wire(episode_id=value['episodeID'],snapshot=value['observation'],value=value.get('value'),
                     policy_id=value['policyID'],preceding_packet_id=value['precedingPacketID'],source_id=value['sourceID'],
-                    resolve_frame=self._resolver,on_consumed=self._consumed)
+                    resolve_frame=self._resolver,on_consumed=self._consumed,endpoint=endpoint)
             else:
                 self._assembler.wire_byte_count({},value['observation'])
                 SnapshotDecoder(self._assembler.spec,self._resolver,self._consumed).decode(value['observation'],episode=value['episodeID'])
@@ -234,12 +257,14 @@ class CollectorManager:
         self._journal.flush();os.fsync(self._journal.fileno());self._journal.close();self._journal=None
         if self._assembler is not None:self._assembler.close()
         closure=bool(self._episodes) and all(self._episodes.values())
+        if status=='sealed' and self._binding['purpose']=='retrospective':status='awaiting_manual_review'
         self._manifest=publish_package(self._working,self._destination,binding=self._binding,status=status,
             actor_progress=actor_progress,control_closure_known=closure,rollout=rollout,
             reason=None if self._failure is None else str(self._failure)[:2048])
         self._finalized=True;self._status=status
         self._event('collector.sealed' if status=='sealed' else 'collector.audited',{'path':str(self._destination),'manifest':self._manifest,
-            'actorProgress':actor_progress,'learningEligible':status=='sealed','controlClosureKnown':closure})
+            'actorProgress':actor_progress,'learningEligible':status=='sealed','controlClosureKnown':closure,
+            'manifestSHA256':__import__('hashlib').sha256((self._destination/'manifest.json').read_bytes()).hexdigest()})
 
     def _poll(self):
         if self._failure is not None and not self._aborted:self._abort(self._failure)

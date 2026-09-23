@@ -23,6 +23,7 @@ from astra.data.actions import decode_commands
 from astra.data.observations import make_observation
 from astra.data.preprocessing import MEAN, STD
 from astra.frame_ring import FrameRingReader
+from astra.environments.interface import control_observation, EnvironmentError
 from astra.model.actions import PacketBatch, flatten_visual
 from astra.model.observation import ObservationBatch, SurfaceBatch
 from astra.model.vision import VisualFeatures
@@ -35,6 +36,7 @@ class InferenceError(ValueError):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+        self.released_frames = []
 
 
 def _fields(value, required, optional=()):
@@ -302,7 +304,7 @@ class InferenceSession:
         self._assert_owner()
         if self._reader is not None:
             raise InferenceError("inference.active", "Close this actor run before preparing another stream")
-        _fields(payload, ("checkpointPath", "ring"), ("seed", "deterministic", "collection", "resumeActor"))
+        _fields(payload, ("checkpointPath", "ring"), ("seed", "deterministic", "collection", "resumeActor", "resumeCollection"))
         _fields(payload["ring"], ("path", "ringID"))
         run_id = _uuid(run_id)
         ring_id = _uuid(payload["ring"]["ringID"])
@@ -310,14 +312,21 @@ class InferenceSession:
         deterministic = payload.get("deterministic", True)
         collection = payload.get("collection", False)
         resume = payload.get("resumeActor", False)
+        resume_collection = payload.get("resumeCollection")
         if type(deterministic) is not bool or type(collection) is not bool or type(resume) is not bool:
             raise InferenceError("inference.configuration", "Inference mode must be Boolean")
         if collection and deterministic:
             raise InferenceError("inference.collectionMode", "On-policy collection requires categorical sampling, not greedy actions")
-        if resume and (not collection or 'seed' in payload):
+        if resume_collection is not None and resume:
+            raise InferenceError('inference.resumeMode','Choose one authenticated actor cursor source')
+        if (resume or resume_collection is not None) and (not collection or 'seed' in payload):
             raise InferenceError("inference.resumeMode", "Actor resumption requires categorical collection and cannot replace its saved random stream with a seed")
         checkpoint = load_checkpoint(_path(payload["checkpointPath"]))
-        progress = load_checkpoint_actor_progress(_path(payload['checkpointPath']), checkpoint.manifest) if resume else None
+        if resume_collection is not None:
+            from astra.learning.review_pipeline import collection_cursor
+            try:progress=collection_cursor(resume_collection,checkpoint.manifest)
+            except ValueError as error:raise InferenceError('inference.resumeCollection',str(error)) from error
+        else:progress = load_checkpoint_actor_progress(_path(payload['checkpointPath']), checkpoint.manifest) if resume else None
         if progress is not None and (progress['drawIndex'] >= 2**64 - 2 or progress['actorResetGeneration'] >= 2**64 - 1):
             raise InferenceError('inference.counterExhausted', 'The saved actor stream has exhausted its sequence or reset counters')
         if checkpoint.policy.config.control_width != 178:
@@ -340,7 +349,7 @@ class InferenceSession:
         return {**self._identity(), "model": checkpoint.manifest["model"], "actions": checkpoint.manifest["actions"],
                 "ringID": ring_id, "deterministic": deterministic, "collection": collection,
                 "collectionVersion": 1 if collection else None, "rngStreamID": self._rng_stream_id if collection else None,
-                "resumedActor": resume, "nextPacketSequence": self._sequence, "nextDrawIndex": self._draw_index,
+                "resumedActor": resume or resume_collection is not None, "resumedCollection": resume_collection is not None, "nextPacketSequence": self._sequence, "nextDrawIndex": self._draw_index,
                 "actorResetGeneration": self._environment_resets}
 
     def _run(self, run_id):
@@ -420,7 +429,7 @@ class InferenceSession:
         if self._needs_reset:
             raise InferenceError("inference.resetRequired", "A confirmed environment reset is required before inference")
         _fields(payload, ("observationID", "episodeID", "previousStateID", "cutoffNanos", "geometryRevision",
-                          "frames", "controlState", "executedEvents", "intervalCovered", "contextIDs"))
+                          "frames", "controlState", "executedEvents", "intervalCovered", "contextIDs"), ("controlCoverageNanos",))
         if _uuid(payload["previousStateID"]) != self._state_id or _uuid(payload["episodeID"]) != self._episode_id:
             raise InferenceError("inference.staleState", "This observation does not continue the current actor state")
         observation_id = _uuid(payload["observationID"])
@@ -444,6 +453,12 @@ class InferenceSession:
         if payload["intervalCovered"] is not True or type(payload["controlState"]) is not dict or payload["controlState"].get("valid") is not True:
             self._needs_reset = True
             raise InferenceError("inference.discontinuity", "Input state/coverage is unavailable; restore it and confirm an environment reset")
+        try:
+            control_observation(payload["controlState"],cutoff,payload.get("controlCoverageNanos"),
+                                interval_covered=payload["intervalCovered"])
+        except EnvironmentError as error:
+            self._needs_reset=True
+            raise InferenceError("inference.controlCoverage",str(error)) from error
         frames, events = payload["frames"], payload["executedEvents"]
         if type(frames) is not list or not 1 <= len(frames) <= config.maximum_surfaces:
             raise InferenceError("inference.frames", "Inference requires bounded observed frame references")
@@ -520,6 +535,8 @@ class InferenceSession:
                         "stateAfter": np.asarray(output["key"]).tolist()},
                     "environmentResets": self._environment_resets,
                 }
+                if payload.get("controlCoverageNanos") is not None:
+                    result["collectionRecord"]["controlCoverageNanos"] = payload["controlCoverageNanos"]
             self._state, self._key, self._state_id = output["state"], output["key"], next_state_id
             self._last_cutoff, self._last_event_sequence, self._geometry_revision = cutoff, last_event, geometry
             self._last_input_nanos = last_input_nanos

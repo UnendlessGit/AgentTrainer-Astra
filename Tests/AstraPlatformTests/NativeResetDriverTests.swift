@@ -155,3 +155,29 @@ func nativeResetRejectsUnjoinedOwnersAndUntrustworthyScopeBeforeArm(mode: String
     let again = await driver.release(context: fixture.context)
     #expect(!again.confirmed && again.observedNanos == proof.observedNanos && again.issue == proof.issue)
 }
+
+@Test func nativeResetManualAcknowledgementUsesTheExactFailedAttemptAndPreservesItsProof() async throws {
+    let fixture = try ResetDriverSetup(runtime: .init(exitStatus: 7)), driver = fixture.driver()
+    _ = try await driver.prepare(context: fixture.context, capabilities: .init(keyCodes: [36]))
+    let original = await driver.release(context: fixture.context)
+    let warning = try #require(driver.unconfirmedControlCleanup(resetID: fixture.context.resetID))
+    #expect(!original.confirmed && !warning.cleanupConfirmed && !fixture.owner.priorCleanupJoined)
+    #expect(driver.unconfirmedControlCleanup(resetID: UUID()) == nil)
+    #expect(throws: AstraError.self) { try driver.acknowledgeManualControlCleanup(resetID: UUID(), sessionID: warning.sessionID) }
+    #expect(throws: AstraError.self) { try driver.acknowledgeManualControlCleanup(resetID: fixture.context.resetID, sessionID: UUID()) }
+    await #expect(throws: AstraError.self) { try await driver.prepare(context: fixture.context, capabilities: .init(keyCodes: [36])) }
+    try driver.acknowledgeManualControlCleanup(resetID: fixture.context.resetID, sessionID: warning.sessionID)
+    let repeated = await driver.release(context: fixture.context)
+    #expect(fixture.owner.priorCleanupJoined && !repeated.confirmed && repeated.observedNanos == original.observedNanos)
+    #expect(driver.unconfirmedControlCleanup(resetID: fixture.context.resetID) == nil)
+    #expect(throws: AstraError.self) { try driver.acknowledgeManualControlCleanup(resetID: fixture.context.resetID, sessionID: warning.sessionID) }
+    // Even a reused ResetContext has a fresh physical helper and warning ID.
+    _ = try await driver.prepare(context: fixture.context, capabilities: .init(keyCodes: [36]))
+    _ = await driver.release(context: fixture.context)
+    let next = try #require(driver.unconfirmedControlCleanup(resetID: fixture.context.resetID))
+    #expect(next.sessionID != warning.sessionID)
+    #expect(throws: AstraError.self) { try driver.acknowledgeManualControlCleanup(resetID: fixture.context.resetID, sessionID: warning.sessionID) }
+    #expect(!fixture.owner.priorCleanupJoined)
+    try driver.acknowledgeManualControlCleanup(resetID: fixture.context.resetID, sessionID: next.sessionID)
+    #expect(fixture.owner.priorCleanupJoined && !original.confirmed)
+}

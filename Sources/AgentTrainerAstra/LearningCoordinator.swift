@@ -82,6 +82,7 @@ struct BehaviorEvaluation: Sendable {
     var meanNLL: Double?
     var reason: String?
     var savedAt: URL
+    var document: EvaluationDocument? = nil
 }
 
 /// The app owns lifecycle and catalog publication; the child owns model state.
@@ -108,6 +109,7 @@ struct BehaviorEvaluation: Sendable {
     private let changed: @MainActor () async -> Void
     private var process: ComputeProcess?
     private var work: Task<Void, Never>?
+    private var workGeneration = UUID()
     private var persistTask: Task<Void, Never>?
     private var lastPersist = Date.distantPast
     private var cancelRequested = false
@@ -119,6 +121,9 @@ struct BehaviorEvaluation: Sendable {
     private var earlyCompletion: WireMessage?
     private var processFailure: AstraError?
     private var processGeneration: UUID?
+    private var externalBoundary: URL?
+    private var externalBoundaryCheck: (@Sendable () async throws -> Void)?
+    private var externalBoundaryWork: Task<Void, Never>?
 
     init(store: LibraryStore, root: URL, bundle: Bundle = .main, changed: @escaping @MainActor () async -> Void) {
         self.store = store; self.root = root; self.changed = changed
@@ -244,9 +249,9 @@ struct BehaviorEvaluation: Sendable {
                     name: trained.cancelled ? "Reinforcement · Stopped" : "Reinforcement · \(options.iterations) iterations")
                 activeRun?.checkpointID = finalID
                 if let fields = trained.result.fields?["manifest"]?.fields?["metrics"]?.fields {
-                    activeRun?.epoch = fields["iteration"]?.int ?? activeRun?.epoch ?? 0
-                    activeRun?.updates = fields["optimizer_updates"]?.int ?? activeRun?.updates ?? 0
-                    activeRun?.decisions = fields["decisions"]?.int ?? activeRun?.decisions ?? 0
+                    if let value = fields["iteration"]?.int { activeRun?.epoch = value }
+                    if let value = fields["optimizer_updates"]?.int { activeRun?.updates = value }
+                    if let value = fields["decisions"]?.int { activeRun?.decisions = value }
                     elapsedSeconds = fields["elapsed_seconds"]?.double
                 }
             }
@@ -278,12 +283,17 @@ struct BehaviorEvaluation: Sendable {
     }
 
     func evaluate(checkpoint: CheckpointDocument, agentID: UUID? = nil, split: String) throws {
-        guard !isBusy, ["validation", "test", "train"].contains(split), let sourceRunID = checkpoint.runID else {
-            throw AstraError("evaluation.source", "Choose a checkpoint with a saved demonstration dataset and finish any active job.")
+        try evaluate(checkpoints: [checkpoint], agentID: agentID ?? checkpoint.agentID,
+                     datasetCheckpoint: checkpoint, split: split)
+    }
+
+    func evaluate(checkpoints: [CheckpointDocument], agentID: UUID, datasetCheckpoint: CheckpointDocument, split: String) throws {
+        guard !isBusy, ["validation", "test", "train"].contains(split), datasetCheckpoint.runID != nil,
+              !checkpoints.isEmpty, checkpoints.count <= 64, Set(checkpoints.map(\.id)).count == checkpoints.count else {
+            throw AstraError("evaluation.source", "Choose up to 64 checkpoints, one saved demonstration dataset, and finish any active job.")
         }
-        let owner = agentID ?? checkpoint.agentID
-        begin(agentID: owner); activeRun = nil
-        work = Task { await performEvaluation(checkpoint: checkpoint, agentID: owner, sourceRunID: sourceRunID, split: split) }
+        begin(agentID: agentID); activeRun = nil
+        work = Task { await performEvaluation(checkpoints: checkpoints, agentID: agentID, datasetCheckpoint: datasetCheckpoint, split: split) }
     }
 
     func requestStop() async {
@@ -309,6 +319,7 @@ struct BehaviorEvaluation: Sendable {
     }
 
     private func begin(agentID: UUID) {
+        workGeneration = UUID()
         isBusy = true; isStopping = false; cancelRequested = false; failure = nil; activeAgentID = agentID
         resultAgentID = agentID; evaluation = nil
         metrics = []; reinforcementMetrics = []; rolloutDecisions = nil; rolloutTarget = nil; elapsedSeconds = nil
@@ -445,9 +456,9 @@ struct BehaviorEvaluation: Sendable {
                 activeRun?.checkpointID = finalID
                 if let dataID = trained.result.fields?["manifest"]?.fields?["datasetID"]?.text.flatMap(UUID.init(uuidString:)) { activeRun?.datasetID = dataID }
                 if let metricFields = trained.result.fields?["manifest"]?.fields?["metrics"]?.fields {
-                    activeRun?.epoch = metricFields["epoch"]?.int ?? activeRun?.epoch ?? 0
-                    activeRun?.updates = metricFields["updates"]?.int ?? activeRun?.updates ?? 0
-                    activeRun?.decisions = metricFields["decisions"]?.int ?? activeRun?.decisions ?? 0
+                    if let value = metricFields["epoch"]?.int { activeRun?.epoch = value }
+                    if let value = metricFields["updates"]?.int { activeRun?.updates = value }
+                    if let value = metricFields["decisions"]?.int { activeRun?.decisions = value }
                 }
             }
             var savedResult = trained.result.fields ?? [:]
@@ -470,38 +481,87 @@ struct BehaviorEvaluation: Sendable {
         await finish()
     }
 
-    private func performEvaluation(checkpoint: CheckpointDocument, agentID: UUID, sourceRunID: UUID, split: String) async {
-        let destination = artifact("Jobs", UUID())
+    private func performEvaluation(checkpoints: [CheckpointDocument], agentID: UUID,
+                                   datasetCheckpoint: CheckpointDocument, split: String) async {
+        let comparisonID = UUID()
         do {
-            guard try await store.snapshot().checkpoints.contains(where: { $0.matchesIdentity(of: checkpoint) }) else {
-                throw AstraError("evaluation.checkpoint", "This checkpoint is no longer available in the workspace catalog.")
+            let snapshot = try await store.snapshot()
+            let linked = try await store.checkpointIDs(for: agentID)
+            for checkpoint in checkpoints + [datasetCheckpoint] {
+                guard snapshot.checkpoints.contains(where: { $0.matchesIdentity(of: checkpoint) }) else {
+                    throw AstraError("evaluation.checkpoint", "A selected checkpoint is no longer available in the workspace catalog.")
+                }
+                guard linked.contains(checkpoint.id) else {
+                    throw AstraError("evaluation.checkpointOwner", "A selected checkpoint is not linked to this agent.")
+                }
             }
-            guard try await store.checkpointIDs(for: agentID).contains(checkpoint.id) else {
-                throw AstraError("evaluation.checkpointOwner", "This checkpoint is not linked to the selected agent.")
+            let definition = try await SavedEvaluationProtocol.resolve(checkpoint: datasetCheckpoint, root: root, split: split)
+            if cancelRequested { throw CancellationError() }
+            var failed = 0
+            for (index, checkpoint) in checkpoints.enumerated() {
+                if cancelRequested { throw CancellationError() }
+                var document = EvaluationDocument(comparisonID: comparisonID, agentID: agentID,
+                                                  checkpoint: checkpoint, protocolDefinition: definition)
+                let destination = artifact("Jobs", document.id)
+                try await store.saveEvaluation(document)
+                await changed()
+                do {
+                    guard checkpoint.policySignature == definition.policySignature else {
+                        throw AstraError("evaluation.incompatible", "This checkpoint uses a different model, action vocabulary, or observation/action timing from the selected dataset. Its loss cannot be compared.")
+                    }
+                    // Recheck saved source identity before every candidate. An altered
+                    // revision must not silently divide one comparison into two tasks.
+                    let current = try await SavedEvaluationProtocol.resolve(checkpoint: datasetCheckpoint, root: root, split: split)
+                    guard current == definition else { throw AstraError("evaluation.datasetChanged", "The selected dataset or its saved configuration changed during evaluation.") }
+                    let manifest = try await LearningFiles.read(artifact("Models", checkpoint.id).appendingPathComponent("manifest.json"))
+                    guard manifest.fields?["id"]?.text.flatMap(UUID.init(uuidString:)) == checkpoint.id,
+                          manifest.fields?["policySignature"]?.text == checkpoint.policySignature else {
+                        throw AstraError("evaluation.checkpoint", "The checkpoint no longer matches its catalog identity.")
+                    }
+                    let payload: JSONValue = .object(["checkpointPath": .string(artifact("Models", checkpoint.id).path),
+                        "dataset": definition.dataset, "verificationMode": .bool(definition.verificationMode),
+                        "split": .string(split), "sequenceLength": .integer(Int64(definition.sequenceLength))])
+                    try await LearningFiles.write(payload, to: destination.appendingPathComponent("configuration.json"), exclusive: true)
+                    phase = "Evaluating \(index + 1) of \(checkpoints.count) · \(checkpoint.name)…"
+                    if process == nil { try await openProcess() }
+                    let response = try await job("evaluate.behavioral", payload)
+                    try response.requireComplete()
+                    guard response.result.fields?["checkpointID"]?.text.flatMap(UUID.init(uuidString:)) == checkpoint.id,
+                          response.result.fields?["provenance"]?.text == definition.provenance,
+                          let datasetID = response.result.fields?["datasetID"]?.text.flatMap(UUID.init(uuidString:)) else {
+                        throw AstraError("evaluation.resultIdentity", "The evaluator returned missing or mismatched checkpoint/dataset provenance.")
+                    }
+                    let result = try response.result.required("evaluation")
+                    guard result.fields?["split"]?.text == split, case .bool(let available) = result.fields?["available"] else {
+                        throw AstraError("evaluation.result", "The evaluator returned an invalid scoring result.")
+                    }
+                    document.datasetID = datasetID
+                    document.status = available ? .completed : .unavailable
+                    document.decisions = result.fields?["decisions"]?.int
+                    document.meanNLL = result.fields?["meanNLL"]?.double
+                    document.issue = result.fields?["reason"]?.text
+                    document.finishedAt = Date()
+                    _ = try document.validated()
+                    try await LearningFiles.write(response.result, to: destination.appendingPathComponent("results.json"), exclusive: true)
+                } catch {
+                    document.status = error is CancellationError ? .cancelled : .failed
+                    document.finishedAt = Date(); document.datasetID = nil; document.decisions = nil; document.meanNLL = nil
+                    document.issue = error.localizedDescription
+                    if document.status == .failed { failed += 1; failure = error.localizedDescription }
+                }
+                try await store.saveEvaluation(document)
+                let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .millisecondsSince1970
+                let artifactDocument = try JSONDecoder().decode(JSONValue.self, from: encoder.encode(document))
+                let saved = destination.appendingPathComponent("evaluation.json")
+                try await LearningFiles.write(artifactDocument, to: saved, exclusive: true)
+                evaluation = BehaviorEvaluation(checkpointID: checkpoint.id, split: split,
+                    available: document.status == .completed, decisions: document.decisions ?? 0,
+                    meanNLL: document.meanNLL, reason: document.issue, savedAt: saved, document: document)
+                await changed()
+                if document.status == .cancelled || cancelRequested { throw CancellationError() }
+                if processFailure != nil { break }
             }
-            let source = try await LearningFiles.read(artifact("Jobs", sourceRunID).appendingPathComponent("configuration.json"))
-            guard source.fields?["agentID"]?.text.flatMap(UUID.init(uuidString:)) == checkpoint.agentID,
-                  source.fields?["runID"]?.text.flatMap(UUID.init(uuidString:)) == sourceRunID else {
-                throw AstraError("evaluation.sourceIdentity", "The saved demonstration configuration belongs to a different agent or run.")
-            }
-            guard source.fields?["operation"] == .string("train.behavioral"), source.fields?["dataset"] != nil else {
-                throw AstraError("evaluation.dataset", "This checkpoint has no saved demonstration dataset to evaluate.")
-            }
-            let payload: JSONValue = .object(["checkpointPath": .string(artifact("Models", checkpoint.id).path),
-                "dataset": try source.required("dataset"), "verificationMode": source.fields?["verificationMode"] ?? .bool(false),
-                "split": .string(split), "sequenceLength": .integer(64)])
-            try await LearningFiles.write(payload, to: destination.appendingPathComponent("configuration.json"), exclusive: true)
-            phase = "Evaluating \(checkpoint.name)…"
-            try await openProcess()
-            let response = try await job("evaluate.behavioral", payload)
-            try response.requireComplete()
-            let result = try response.result.required("evaluation")
-            let path = destination.appendingPathComponent("results.json")
-            try await LearningFiles.write(response.result, to: path, exclusive: true)
-            evaluation = BehaviorEvaluation(checkpointID: checkpoint.id, split: split,
-                available: result.fields?["available"] == .bool(true), decisions: result.fields?["decisions"]?.int ?? 0,
-                meanNLL: result.fields?["meanNLL"]?.double, reason: result.fields?["reason"]?.text, savedAt: path)
-            phase = "Evaluation complete"
+            phase = failed == 0 ? "Evaluation complete" : "Evaluation complete · \(failed) need attention"
         } catch is CancellationError { phase = "Evaluation stopped" }
         catch { failure = error.localizedDescription; phase = "Evaluation needs attention" }
         await finish()
@@ -513,12 +573,14 @@ struct BehaviorEvaluation: Sendable {
         func requireComplete() throws { if cancelled { throw CancellationError() } }
     }
 
-    private func job(_ kind: String, _ payload: JSONValue) async throws -> JobResult {
+    private func job(_ kind: String, _ payload: JSONValue, externalBoundary: URL? = nil,
+                     checkBoundary: (@Sendable () async throws -> Void)? = nil) async throws -> JobResult {
         guard !cancelRequested else { throw CancellationError() }
         guard let process else { throw AstraError("learning.runtime", "The learning runtime is not running.") }
         if let processFailure { throw processFailure }
         let identifier = UUID(); jobRunID = identifier; jobID = nil; jobRequestID = nil; earlyCompletion = nil; earlyProgress = nil
-        defer { jobRunID = nil; jobID = nil; jobRequestID = nil; completion = nil; earlyCompletion = nil; earlyProgress = nil }
+        self.externalBoundary = externalBoundary; externalBoundaryCheck = checkBoundary; externalBoundaryWork = nil
+        defer { jobRunID = nil; jobID = nil; jobRequestID = nil; completion = nil; earlyCompletion = nil; earlyProgress = nil; self.externalBoundary = nil; externalBoundaryCheck = nil }
         let accepted = try await process.request(kind: kind, payload: payload, runID: identifier)
         guard let acceptedID = accepted.payload.fields?["jobID"]?.text, UUID(uuidString: acceptedID) != nil,
               accepted.requestID != nil, accepted.runID == identifier else {
@@ -534,13 +596,21 @@ struct BehaviorEvaluation: Sendable {
             if let processFailure { throw processFailure }
             ended = try await withCheckedThrowingContinuation { completion = $0 }
         }
+        // A fast child can complete before the boundary acknowledgement is
+        // delivered. Join and validate that request before catalog publication.
+        await externalBoundaryWork?.value
+        if let processFailure { throw processFailure }
         guard ended.payload.fields?["jobID"]?.text == acceptedID, ended.requestID == accepted.requestID else {
             throw AstraError("learning.jobIdentity", "The runtime completed a different job than the one it acknowledged.")
         }
         if ended.kind == "job.failed" {
             throw AstraError("learning.jobFailed", ended.payload.fields?["error"]?.fields?["message"]?.text ?? "The learning job failed.")
         }
-        return JobResult(result: try ended.payload.required("result"), cancelled: ended.kind == "job.cancelled")
+        let result = try ended.payload.required("result")
+        guard externalBoundary == nil || result.fields?["checkpointPublished"] != .bool(true) || externalBoundaryWork != nil else {
+            throw AstraError("learning.boundaryMissing", "The learner published without requesting the held actor boundary.")
+        }
+        return JobResult(result: result, cancelled: ended.kind == "job.cancelled")
     }
 
     private func receive(_ message: WireMessage) {
@@ -558,8 +628,28 @@ struct BehaviorEvaluation: Sendable {
             return
         }
         guard let fields = message.payload.fields else { return }
+        if fields["phase"] == .string("waiting_for_actor_boundary"), let externalBoundary,
+           externalBoundaryWork == nil, let process, let jobRunID {
+            let generation = processGeneration
+            let checkBoundary = externalBoundaryCheck
+            externalBoundaryWork = Task { [weak self] in
+                do {
+                    try await checkBoundary?()
+                    let response = try await process.request(kind: "job.externalBoundary", payload: .object([
+                        "jobID": .string(jobID), "auditPath": .string(externalBoundary.path)]), runID: jobRunID)
+                    guard response.kind == "ack", response.runID == jobRunID,
+                          response.payload.fields?["jobID"] == .string(jobID),
+                          response.payload.fields?["status"] == .string("boundary_queued") else {
+                        throw AstraError("learning.boundaryAcknowledgement", "The learner did not acknowledge this job's joined actor boundary.")
+                    }
+                } catch {
+                    guard let self, self.processGeneration == generation, self.jobRunID == jobRunID else { return }
+                    self.processFailed((error as? AstraError) ?? AstraError("learning.boundary", error.localizedDescription))
+                }
+            }
+        }
         if fields["phase"]?.text == "checkpointing", !isStopping { phase = "Saving checkpoint…" }
-        if fields["sourceKind"] == .string("practice_rollout") {
+        if fields["sourceKind"] == .string("practice_rollout") || fields["sourceKind"] == .string("external_rollout") {
             if !isStopping {
                 switch fields["phase"]?.text {
                 case "collecting": phase = "Collecting practice experience…"
@@ -567,14 +657,15 @@ struct BehaviorEvaluation: Sendable {
                 case "updating": phase = "Updating the learner…"
                 case "validating_update": phase = "Checking the proposed policy update…"
                 case "waiting_for_reset": phase = "Finishing the current episode before switching policies…"
+                case "waiting_for_actor_boundary": phase = "Confirming the released-control boundary…"
                 case "iteration": phase = "Iteration complete · next policy waits for reset"
                 case "checkpointing": phase = "Saving reinforcement checkpoint…"
                 default: break
                 }
             }
-            activeRun?.epoch = fields["iteration"]?.int ?? activeRun?.epoch ?? 0
-            activeRun?.updates = fields["optimizer_updates"]?.int ?? activeRun?.updates ?? 0
-            activeRun?.decisions = fields["decisions"]?.int ?? activeRun?.decisions ?? 0
+            if let value = fields["iteration"]?.int { activeRun?.epoch = value }
+            if let value = fields["optimizer_updates"]?.int { activeRun?.updates = value }
+            if let value = fields["decisions"]?.int { activeRun?.decisions = value }
             elapsedSeconds = fields["elapsed_seconds"]?.double
             rolloutDecisions = fields["rollout_decisions"]?.int
             rolloutTarget = fields["rollout_target"]?.int
@@ -587,7 +678,7 @@ struct BehaviorEvaluation: Sendable {
             if let index = metrics.firstIndex(where: { $0.epoch == sample.epoch }) { metrics[index] = sample }
             else { metrics.append(sample); if metrics.count > 1000 { metrics.removeFirst() } }
             activeRun?.epoch = epoch; activeRun?.meanNLL = nll
-            activeRun?.updates = fields["updates"]?.int ?? activeRun?.updates ?? 0
+            if let value = fields["updates"]?.int { activeRun?.updates = value }
             activeRun?.decisions = sample.decisions
             decisionsPerSecond = fields["decisions_per_second"]?.double
             peakMemoryBytes = fields["peak_memory_bytes"]?.int
@@ -618,7 +709,7 @@ struct BehaviorEvaluation: Sendable {
         await changed()
     }
 
-    private func publishCheckpoint(_ value: JSONValue, agent: AgentDocument, runID: UUID, expectedID: UUID, name: String) async throws {
+    private func publishCheckpoint(_ value: JSONValue, agent: AgentDocument, runID: UUID?, expectedID: UUID, name: String) async throws {
         let manifest = try value.required("manifest")
         guard let id = manifest.fields?["id"]?.text.flatMap(UUID.init(uuidString:)),
               let kind = manifest.fields?["kind"]?.text, let signature = manifest.fields?["policySignature"]?.text,
@@ -640,6 +731,7 @@ struct BehaviorEvaluation: Sendable {
 
     private func finish() async {
         await persistTask?.value
+        await externalBoundaryWork?.value; externalBoundaryWork = nil
         processGeneration = nil // Closing-child callbacks cannot affect the next session.
         await process?.shutdown(); process = nil
         isBusy = false; isStopping = false; activeAgentID = nil; work = nil
@@ -648,6 +740,220 @@ struct BehaviorEvaluation: Sendable {
 
     private func artifact(_ folder: String, _ id: UUID) -> URL {
         root.appendingPathComponent(folder, isDirectory: true).appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
+    }
+}
+
+extension LearningCoordinator {
+    func feedbackOperation(agentID: UUID, kind: String, payload: JSONValue) async throws -> JSONValue {
+        guard ["feedback.inspect", "feedback.materialize", "feedback.combine"].contains(kind), !isBusy else {
+            throw AstraError("feedback.job", "Finish the current learning operation before inspecting or publishing feedback.")
+        }
+        try Task.checkCancellation()
+        begin(agentID: agentID); activeRun = nil
+        let generation = workGeneration
+        let operation = Task { () throws -> JSONValue in
+            do {
+                self.phase = kind == "feedback.inspect" ? "Opening original episode observations…" : "Preparing reviewed experience…"
+                try await self.openProcess()
+                let result = try await self.job(kind, payload)
+                try result.requireComplete()
+                await self.finish(); return result.result
+            } catch {
+                await self.finish(); throw error
+            }
+        }
+        work = Task { _ = try? await operation.value }
+        return try await withTaskCancellationHandler { try await operation.value } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, workGeneration == generation else { return }
+                await requestStop()
+            }
+        }
+    }
+
+    func prepareDesktopPolicy(agent: AgentDocument, checkpoint: CheckpointDocument?, model: JSONValue,
+                              actions: ActionCapabilities, seed: Int) async throws -> PreparedDesktopPolicy {
+        guard !isBusy else { throw AstraError("learning.busy", "Finish or stop the current learning job first.") }
+        if checkpoint == nil {
+            _ = try actions.validated()
+            guard !actions.isEmpty, (0...1_000_000_000).contains(seed) else {
+                throw AstraError("learning.configuration", "Choose action capabilities and a valid model seed.")
+            }
+        }
+        try Task.checkCancellation()
+        begin(agentID: agent.id); activeRun = nil
+        let generation = workGeneration
+        let operation = Task { () throws -> PreparedDesktopPolicy in
+            do {
+                let id = checkpoint?.id ?? UUID()
+                if let checkpoint {
+                    guard try await self.store.checkpointIDs(for: agent.id).contains(id),
+                          try await self.store.snapshot().checkpoints.contains(where: { $0.matchesIdentity(of: checkpoint) }) else {
+                        throw AstraError("learning.checkpointOwner", "Choose a checkpoint linked to this agent.")
+                    }
+                }
+                try await self.openProcess()
+                let result: JobResult
+                if checkpoint != nil {
+                    self.phase = "Checking the desktop policy…"
+                    result = try await self.job("checkpoint.inspect", .object(["path": .string(self.artifact("Models", id).path)]))
+                } else {
+                    self.phase = "Preparing the desktop policy…"
+                    guard FileManager.default.fileExists(atPath: self.weights.path) else {
+                        throw AstraError("learning.weights", "The bundled visual weights are missing. Rebuild or reinstall AgentTrainer Astra.")
+                    }
+                    result = try await self.job("checkpoint.create", .object([
+                        "destination": .string(self.artifact("Models", id).path), "model": model,
+                        "actions": try actions.policyVocabulary(), "seed": .integer(Int64(seed)), "pretrainedPath": .string(self.weights.path)]))
+                }
+                try result.requireComplete()
+                if checkpoint == nil {
+                    try await self.publishCheckpoint(result.result, agent: agent, runID: nil, expectedID: id, name: "Starting desktop policy")
+                }
+                guard let document = try await self.store.snapshot().checkpoints.first(where: { $0.id == id }) else {
+                    throw AstraError("learning.checkpoint", "The prepared policy is missing from the workspace catalog.")
+                }
+                let manifest = try result.result.required("manifest")
+                guard manifest.fields?["id"]?.uuid == id, manifest.fields?["kind"] == .string(document.kind),
+                      manifest.fields?["policySignature"] == .string(document.policySignature),
+                      manifest.fields?["step"]?.int == document.trainingStep,
+                      result.result.fields?["parameterCount"]?.int == document.parameterCount,
+                      checkpoint == nil || result.result.fields?["integrityVerified"] == .bool(true) else {
+                    throw AstraError("learning.policyIdentity", "The inspected policy does not match its saved catalog identity.")
+                }
+                let prepared = PreparedDesktopPolicy(checkpoint: .init(document: document, directory: self.artifact("Models", id)), manifest: manifest)
+                self.phase = "Desktop policy ready"
+                await self.finish(); return prepared
+            } catch {
+                self.phase = error is CancellationError ? "Policy preparation stopped" : "Policy preparation needs attention"
+                if !(error is CancellationError) { self.failure = error.localizedDescription }
+                await self.finish(); throw error
+            }
+        }
+        work = Task { _ = try? await operation.value }
+        return try await withTaskCancellationHandler { try await operation.value } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, self.workGeneration == generation else { return }
+                await self.requestStop()
+            }
+        }
+    }
+
+    /// One desktop update uses the same job transport, cancellation and catalog
+    /// publication as imitation/practice learning. The parent keeps the actor
+    /// paused and controls released until this operation has completely joined.
+    func updateExternal(agent: AgentDocument, batch: DesktopLearningBatch, resume: Bool,
+                        validateBoundary: @escaping @Sendable () async throws -> Void) async throws -> ExternalLearningResult {
+        try await runExternalOperation(agent: agent, boundary: batch.boundary, rolloutID: batch.rolloutID,
+            learningPath: batch.path, resume: resume, validateBoundary: validateBoundary)
+    }
+
+    func preserveExternalBoundary(agent: AgentDocument, boundary: DesktopCollectionBoundary, resume: Bool,
+                                  validateBoundary: @escaping @Sendable () async throws -> Void) async throws -> ExternalLearningResult {
+        try await runExternalOperation(agent: agent, boundary: boundary, rolloutID: nil, resume: resume, validateBoundary: validateBoundary)
+    }
+
+    private func runExternalOperation(agent: AgentDocument, boundary: DesktopCollectionBoundary, rolloutID: UUID?, learningPath: URL? = nil, resume: Bool,
+                                     validateBoundary: @escaping @Sendable () async throws -> Void) async throws -> ExternalLearningResult {
+        guard !isBusy else { throw AstraError("learning.busy", "Finish or stop the current learning job first.") }
+        try Task.checkCancellation()
+        begin(agentID: agent.id)
+        let run = LearningRunDocument(agentID: agent.id, kind: .reinforcement,
+            name: "\(String(agent.name.prefix(116))) · \(rolloutID == nil ? "Desktop checkpoint" : "Desktop reinforcement")", sourceKind: "desktop_rollout")
+        activeRun = run
+        let operation = Task { try await self.performExternal(agent: agent, batch: boundary, rolloutID: rolloutID,
+            learningPath: learningPath, resume: resume, runID: run.id, validateBoundary: validateBoundary) }
+        work = Task { _ = try? await operation.value }
+        return try await withTaskCancellationHandler { try await operation.value } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, self.activeRun?.id == run.id else { return }
+                await self.requestStop()
+            }
+        }
+    }
+
+    private func performExternal(agent: AgentDocument, batch: DesktopCollectionBoundary, rolloutID: UUID?, learningPath: URL?, resume: Bool, runID: UUID,
+                                 validateBoundary: @escaping @Sendable () async throws -> Void) async throws -> ExternalLearningResult {
+        let directory = artifact("Jobs", runID), finalID = UUID()
+        let operation = rolloutID == nil ? "checkpoint.externalBoundary" : "train.reinforcement.external"
+        do {
+            try await validateBoundary()
+            let snapshot = try await store.snapshot()
+            guard snapshot.checkpoints.contains(where: { $0.matchesIdentity(of: batch.checkpoint) }),
+                  try await store.checkpointIDs(for: agent.id).contains(batch.checkpoint.id) else {
+                throw AstraError("learning.checkpointOwner", "The collection's behavior checkpoint is no longer linked to this agent.")
+            }
+            activeRun?.initialCheckpointID = batch.checkpoint.id
+            try await saveRun()
+            let binding = try batch.manifest.required("binding")
+            let configuration: JSONValue = .object(["schemaVersion": .integer(1),
+                "runID": .string(runID.uuidString.lowercased()), "agentID": .string(agent.id.uuidString.lowercased()),
+                "operation": .string(operation), "sourceKind": .string("desktop_rollout"),
+                "actorRunID": .string(batch.identity.runID.uuidString.lowercased()),
+                "collectionID": .string(batch.collectionID.uuidString.lowercased()),
+                "rolloutID": rolloutID.map { .string($0.uuidString.lowercased()) } ?? .null, "rolloutPath": .string((learningPath ?? batch.path).path),
+                "boundaryPath": .string(batch.path.path),
+                "environment": try binding.required("environment"), "training": try binding.required("training"),
+                "model": try binding.required("model"), "contextIDs": try binding.required("contextIDs"),
+                "actorProgress": batch.actorProgress, "resume": .bool(resume),
+                "initialCheckpointID": .string(batch.checkpoint.id.uuidString.lowercased()),
+                "destinationCheckpointID": .string(finalID.uuidString.lowercased())])
+            try await LearningFiles.write(configuration, to: directory.appendingPathComponent("configuration.json"), exclusive: true)
+            try await validateBoundary()
+            try await openProcess()
+            phase = rolloutID == nil ? "Saving the stopped actor boundary…" : "Learning from the completed desktop episodes…"
+            activeRun?.status = .running; rolloutDecisions = batch.decisions; try await saveRun()
+            let result = try await job(operation, .object([
+                "checkpointPath": .string(artifact("Models", batch.checkpoint.id).path),
+                rolloutID == nil ? "auditPath" : "rolloutPath": .string((learningPath ?? batch.path).path), "destination": .string(artifact("Models", finalID).path),
+                "resume": .bool(resume)]), externalBoundary: rolloutID == nil ? nil : batch.path, checkBoundary: validateBoundary)
+            var checkpoint: CheckpointDocument?
+            if result.result.fields?["checkpointPublished"] == .bool(true) {
+                let manifest = try result.result.required("manifest")
+                guard result.result.fields?["sourceKind"] == .string("external_rollout"),
+                      result.result.fields?["provenance"] == .string("external_rollout"),
+                      result.result.fields?["resumable"] == .bool(true),
+                      result.result.fields?["requiresEnvironmentReset"] == .bool(true),
+                      result.result.fields?["cancelled"] == .bool(result.cancelled),
+                      rolloutID != nil || result.result.fields?["boundaryOnly"] == .bool(true),
+                      result.result.fields?["boundaryCollectionID"]?.uuid == batch.collectionID,
+                      result.result.fields?["rolloutID"]?.uuid == rolloutID,
+                      try JSONValue.encode(result.result.required("actorProgress")) == batch.actorProgress,
+                      manifest.fields?["parentID"]?.uuid == batch.checkpoint.id,
+                      manifest.fields?["policySignature"] == .string(batch.checkpoint.policySignature),
+                      manifest.fields?["kind"] == .string("reinforcement") else {
+                    throw AstraError("learning.externalResult", "The saved desktop checkpoint does not match the joined collection and actor progress.")
+                }
+                try await validateBoundary()
+                try await publishCheckpoint(result.result, agent: agent, runID: runID, expectedID: finalID,
+                    name: rolloutID == nil ? "Desktop · Stopped" : (result.cancelled ? "Desktop reinforcement · Stopped" : "Desktop reinforcement"))
+                checkpoint = try await store.snapshot().checkpoints.first { $0.id == finalID }
+                activeRun?.checkpointID = finalID
+                if let fields = manifest.fields?["metrics"]?.fields {
+                    activeRun?.epoch = fields["iteration"]?.int ?? 0
+                    activeRun?.updates = fields["optimizer_updates"]?.int ?? 0
+                }
+                if let fields = result.result.fields?["metrics"]?.fields { recordReinforcementMetric(fields) }
+            } else if !result.cancelled {
+                throw AstraError("learning.externalPublication", "The desktop update finished without publishing a resumable checkpoint.")
+            }
+            let recordedDecisions = max(activeRun?.decisions ?? 0, batch.decisions)
+            activeRun?.decisions = recordedDecisions
+            try await LearningFiles.write(result.result, to: directory.appendingPathComponent("results.json"), exclusive: true)
+            activeRun?.status = result.cancelled ? .cancelled : .completed
+            phase = result.cancelled ? (checkpoint == nil ? "Training stopped before a checkpoint was saved" : "Training stopped · checkpoint saved; a fresh reset is required")
+                : (rolloutID == nil ? "Desktop checkpoint saved · ready for a fresh reset" : "Desktop update complete · ready for a fresh reset")
+            try await saveRun()
+            await finish()
+            return .init(runID: runID, checkpoint: checkpoint, cancelled: result.cancelled,
+                         actorProgress: checkpoint == nil ? nil : batch.actorProgress)
+        } catch {
+            if error is CancellationError { activeRun?.status = .cancelled; phase = "Training stopped" }
+            else { activeRun?.status = .failed; activeRun?.issue = error.localizedDescription; failure = error.localizedDescription; phase = "Training needs attention" }
+            do { try await saveRun() } catch { failure = "\(failure ?? "")\nRun metadata could not be saved: \(error.localizedDescription)" }
+            await finish()
+            throw error
+        }
     }
 }
 

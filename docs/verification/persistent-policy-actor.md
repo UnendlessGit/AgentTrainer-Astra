@@ -1,6 +1,8 @@
 # Persistent policy actor — September 19, 2026
 
-`PolicyActorSession` is a reusable native compute/transport owner. It is not yet adopted by `InferenceCoordinator` or a desktop RL loop. It posts no controls and owns no capture stream, reset helper, reward detector or learner. The existing production model, full visual paths, FP32 computation, categorical distribution, packet capacity and checkpoint timing are unchanged.
+`PolicyActorSession` is the shared native compute/transport owner for ordinary inference and the desktop RL loop. It posts no controls and owns no capture stream, reset helper, reward detector or learner. The existing production model, full visual paths, FP32 computation, categorical distribution, packet capacity and checkpoint timing are unchanged.
+
+September23: ordinary inference adopted this owner, removing duplicate actor/ring/result validation. Capture, warmup timing, countdown, source/deadline gates and protected control remain with the coordinator. Whole-run Stop disarms first and interrupts/joins the actor; collection additionally compares retained result sequence against produced sequence. Ordinary reset retains its20-second timeout. The focused coordinator/actor run passed45 tests without warnings (`.local/inference-session-adoption.log`). Broader regression is deferred to the later integration/release pass.
 
 ## Ownership and API
 
@@ -31,4 +33,14 @@ swift test --filter PolicyActorSessionTests
 
 Results: the Python suite passed 31 tests in 7.95 seconds. The final native focus passed 11 tests / 17 cases; the log is `.local/policy-actor-session-native.log`. These checks establish the reusable boundary, not live desktop continuity, production learning quality, installed permission behavior or a release gate. Coordinator adoption, complete episode/collector orchestration and installed physical qualification remain pending.
 
-Independent read-only review identified and verified fixes for the previous-episode drain ticket, pre-control collection history, and last-legal-counter boundary. No unresolved actor ownership blocker was reported. Collector integration must still reconcile its freshness rule for control timestamps with the control helper’s intentional preservation of observed timestamps during silence; this increment never fabricates a new observation time.
+Independent read-only review identified and verified fixes for the previous-episode drain ticket, pre-control collection history, and last-legal-counter boundary. No unresolved actor ownership blocker was reported. A subsequent coverage increment resolves idle control freshness using explicit `controlCoverageNanos` equal to the settled snapshot cutoff, preserving the original state timestamp. Legacy snapshots still require recent observed state; neither path fabricates a new observation time.
+
+## Binding, observation offer and learning pause increment
+
+`binding` now returns an atomic run/checkpoint/policy/collection/state snapshot and `isAvailable`. It is an authenticated read, not an episode reservation; the parent still serializes episode startup and learner ownership. The runner can reject a currently active learning pause before arming.
+
+`beginPrediction(_:onObservation:)` may synchronously offer the exact owned raw observation to bounded evidence/reward queues before compute starts. It copies source pixels once and carries `controlCoverageNanos` unchanged. A throwing offer returns only never-sent frame slots to the writer and leaves RNG progress known/unchanged. No actor result is fabricated.
+
+`acquireLearningPause` returns an opaque session-bound token containing the atomic binding. Acquisition requires a confirmed, idle actor with known progress. While held, prepare/reset/warmup/predict and a second acquisition are rejected before compute. `validateLearningPause` checks ownership and unchanged checkpoint/state; `releaseLearningPause` requires the matching live token. Stop/shutdown invalidate it without reopening admission. A known no-draw pause is allowed with nil progress; a learning batch must separately require its sealed real-result watermark. The parent holds the token from collector finalization through learner publication, validates it before GPU launch/publication, then releases before physical reset/activation.
+
+The focused native suite passed 18 tests / 27 cases after the coverage and pause/hook additions. New cases cover exact precompute copy/proof forwarding, rejected offers and unsent lease release, all-operation pause exclusion, foreign/stale tokens, no-draw progress, in-flight admission and Stop invalidation. Log: `.local/policy-actor-pause-native.log`. No Python/model change was made in this pause increment.

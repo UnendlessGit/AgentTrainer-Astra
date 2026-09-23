@@ -13,7 +13,7 @@ import numpy as np
 
 from astra.checkpoints import _publish, _sync
 from astra.actor_progress import validate_actor_progress
-from astra.environments.interface import EnvironmentError, EnvironmentSpec, fields, integer, uuid_key
+from astra.environments.interface import EnvironmentError, EnvironmentSpec, fields, integer, uuid_key, control_observation
 from astra.model.config import ModelConfig
 from .reinforcement import (CollectedDecision, CollectedRollout, ObservationImage, ObservationRecord,
                             _frozen_array)
@@ -66,14 +66,17 @@ def _observation(record):
     return {'images':images,'observation_id':record.observation_id,'episode_id':record.episode_id,
         'cutoff_nanos':record.cutoff_nanos,'geometry_revision':record.geometry_revision,
         'controls':json.loads(record.controls_json),'events':json.loads(record.events_json),
-        'elapsed_seconds':record.elapsed_seconds,'reset':record.reset,'last_input_nanos':record.last_input_nanos}
+        'elapsed_seconds':record.elapsed_seconds,'reset':record.reset,'last_input_nanos':record.last_input_nanos,
+        **({} if record.control_coverage_nanos is None else {'control_coverage_nanos':record.control_coverage_nanos})}
 
 
 def publish_package(working,destination,*,binding,status,actor_progress,control_closure_known,rollout=None,reason=None):
     """Publish once. Audit/journal remain durable even when learning aborted."""
     working,destination=Path(working),Path(destination)
+    retrospective=binding['purpose']=='retrospective'
     if rollout is not None:
-        if rollout.actor_sampling!=('categorical',1.0,'none',1) or status!='sealed' or binding['purpose']!='learning':
+        allowed=(status=='awaiting_manual_review') if retrospective else (status=='sealed' and binding['purpose']=='learning')
+        if rollout.actor_sampling!=('categorical',1.0,'none',1) or not allowed:
             raise EnvironmentError('Only explicit categorical external experience can be published for learning')
         os.link(rollout.spool.path,working/'frames.bgra')
         with (working/'decisions.ndjson').open('xb') as target:
@@ -82,36 +85,56 @@ def publish_package(working,destination,*,binding,status,actor_progress,control_
                     'packet_fields':item.packet_fields,'state_before':[row.tolist() for row in item.state_before],
                     'bootstrap_observation':_observation(item.bootstrap_observation),'outcome_detail':item.outcome_detail,
                     'commands':json.loads(item.commands_json)}
+                if retrospective:
+                    value.update(endpoint_observation=_observation(item.endpoint_observation),retrospective=json.loads(item.retrospective_json))
+                    value['automaticReward']=value['transition']['reward']['value']
+                    value['transition']['reward']['value']=None  # Unknown until the immutable manual revision is admitted.
                 target.write(encoded(value)+b'\n')
             target.flush();os.fsync(target.fileno())
+        if retrospective:
+            from .review_pipeline import publish_review_projection
+            publish_review_projection(working,destination,binding,rollout)
         rollout.close()
     for name in ('journal.ndjson','audit.json','frames.bgra','decisions.ndjson'):
         if (working/name).is_file():_sync(working/name)
-    artifacts={name:fingerprint(working/name) for name in ('journal.ndjson','audit.json','frames.bgra','decisions.ndjson')
+    artifact_names=('journal.ndjson','audit.json','frames.bgra','decisions.ndjson','source.json','program.json','review-frames.ndjson') if retrospective and rollout is not None else ('journal.ndjson','audit.json','frames.bgra','decisions.ndjson')
+    artifacts={name:fingerprint(working/name) for name in artifact_names
                if (working/name).is_file()}
     manifest={'schemaVersion':1,'id':uuid_key(destination.name),'status':status,'binding':binding,
         'actorProgress':actor_progress,'controlClosureKnown':control_closure_known,'artifacts':artifacts,
         'actorSampling':None if rollout is None else list(rollout.actor_sampling),
         'rolloutID':None if rollout is None else rollout.id,'decisions':0 if rollout is None else len(rollout.decisions),
         'collectionSeconds':0 if rollout is None else rollout.collection_seconds,'reason':reason}
+    if retrospective:
+        manifest.update(schemaVersion=2,behaviorBatchID=binding['behaviorBatchID'],reviewSource=None,revisionChain=[])
     (working/'manifest.json').write_bytes(encoded(manifest));_sync(working/'manifest.json')
     _sync(working);_publish(working,destination)
     return manifest
 
 
-def inspect_package(path):
+def inspect_package(path, *, expected_manifest_sha256=None):
     path=Path(path)
     if not path.is_absolute() or path.is_symlink() or not path.is_dir():raise EnvironmentError('Invalid rollout package path')
     fd,_=_file(path/'manifest.json',MAX_JSON)
-    with os.fdopen(fd,'rb') as source:manifest=_json(source.read())
+    with os.fdopen(fd,'rb') as source:manifest_bytes=source.read()
+    if expected_manifest_sha256 is not None and hashlib.sha256(manifest_bytes).hexdigest()!=expected_manifest_sha256:
+        raise EnvironmentError('Collector manifest expected digest mismatch')
+    manifest=_json(manifest_bytes)
+    version=integer(manifest.get('schemaVersion'),3,1)
+    if version==3:
+        from .review_batches import inspect_fragment_batch
+        return inspect_fragment_batch(path,manifest)
     fields(manifest,('schemaVersion','id','status','binding','actorProgress','controlClosureKnown','artifacts',
-                     'actorSampling','rolloutID','decisions','collectionSeconds','reason'))
-    if integer(manifest['schemaVersion'],1,1)!=1 or uuid_key(path.name)!=manifest['id']:
+                     'actorSampling','rolloutID','decisions','collectionSeconds','reason'),
+                     ('behaviorBatchID','reviewSource','revisionChain') if version==2 else ())
+    if uuid_key(path.name)!=manifest['id']:
         raise EnvironmentError('Rollout package identity/version mismatch')
-    if manifest['status'] not in ('sealed','audited','aborted') or type(manifest['controlClosureKnown']) is not bool:
+    if manifest['status'] not in (('sealed','audited','aborted','awaiting_manual_review') if version==2 else ('sealed','audited','aborted')) or type(manifest['controlClosureKnown']) is not bool:
         raise EnvironmentError('Invalid rollout package completion status')
     artifacts=manifest['artifacts']
-    if type(artifacts) is not dict or not {'journal.ndjson','audit.json'}<=artifacts.keys() or set(artifacts)-{'journal.ndjson','audit.json','frames.bgra','decisions.ndjson'}:
+    allowed_artifacts={'journal.ndjson','audit.json','frames.bgra','decisions.ndjson'}
+    if version==2:allowed_artifacts.update(('source.json','program.json','review-frames.ndjson','reward-revision.json'))
+    if type(artifacts) is not dict or not {'journal.ndjson','audit.json'}<=artifacts.keys() or set(artifacts)-allowed_artifacts:
         raise EnvironmentError('Unknown or missing rollout artifacts')
     total=0
     for name,expected in artifacts.items():
@@ -119,11 +142,16 @@ def inspect_package(path):
         if total>MAX_PACKAGE or fingerprint(path/name)!=expected:raise EnvironmentError('Rollout artifact integrity failed')
     binding=manifest['binding']
     fields(binding,('runID','clockID','policyID','policySignature','actorSourceID','environmentSourceID',
-                    'environment','model','training','contextIDs','purpose','previousActorProgress'))
+                    'environment','model','training','contextIDs','purpose','previousActorProgress'),
+                    ('retrospective','behaviorBatchID','continuationSource') if version==2 else ())
     for name in ('runID','clockID','policyID','actorSourceID','environmentSourceID'):uuid_key(binding[name])
     EnvironmentSpec.from_dict(binding['environment']);ModelConfig.from_dict(binding['model'])
+    if version==2:
+        from .review_pipeline import validate_manifest_extension
+        validate_manifest_extension(manifest)
+    elif binding['purpose'] not in ('learning','audit'):raise EnvironmentError('Unsupported schema1 collector purpose')
     if manifest['actorProgress'] is not None:progress(manifest['actorProgress'],binding['runID'])
-    if binding['previousActorProgress'] is not None:progress(binding['previousActorProgress'],binding['runID'])
+    if binding['previousActorProgress'] is not None:progress(binding['previousActorProgress'],binding['runID'] if version==1 else None)
     return manifest
 
 
@@ -141,6 +169,7 @@ class PackageFrames:
     def _evict(self,size):
         while self._cache and self.cache_bytes+self.metadata_bytes+size>self.memory_limit:
             _,item=self._cache.popitem(last=False);self.cache_bytes-=item.nbytes
+    def _bytes(self,offset,size):return os.pread(self._fd,size,offset)
     def read(self,frame):
         if self.closed or frame.owner is not self or frame.offset+frame.nbytes>self.disk_bytes:
             raise EnvironmentError('Retired or invalid rollout source range')
@@ -151,7 +180,7 @@ class PackageFrames:
                 raise EnvironmentError('Imported frame reference disagrees with its cached extent')
             data=memoryview(value).cast('B')
         else:
-            self._evict(frame.nbytes);data=os.pread(self._fd,frame.nbytes,frame.offset)
+            self._evict(frame.nbytes);data=self._bytes(frame.offset,frame.nbytes)
             if len(data)!=frame.nbytes:raise EnvironmentError('Imported frame was truncated')
             value=np.frombuffer(data,dtype=np.uint8).reshape(frame.shape)
         if hashlib.sha256(data).digest()!=frame.checksum:raise EnvironmentError('Imported frame checksum failed')
@@ -163,29 +192,34 @@ class PackageFrames:
         if fd is not None:os.close(fd)
 
 
-def load_rollout(path,manifest,training):
+def load_rollout(path,manifest,training,*,allow_partial=False,shared_store=None,frame_offset=0):
+    if manifest["schemaVersion"]==3:
+        from .review_batches import load_fragment_batch
+        return load_fragment_batch(path,manifest,training)
     if manifest['status']!='sealed' or not manifest['controlClosureKnown'] or not {'frames.bgra','decisions.ndjson'}<=manifest['artifacts'].keys():
         raise EnvironmentError('Only a sealed complete collection can enter PPO')
     if manifest['actorSampling']!=['categorical',1.0,'none',1]:raise EnvironmentError('Imported rollout does not certify categorical sampling')
-    count=integer(manifest['decisions'],training.maximum_rollout_decisions,training.rollout_decisions)
-    store=PackageFrames(Path(path)/'frames.bgra',memory_bytes=training.maximum_rollout_bytes,
+    count=integer(manifest['decisions'],training.maximum_rollout_decisions,1 if allow_partial else training.rollout_decisions)
+    store=shared_store or PackageFrames(Path(path)/'frames.bgra',memory_bytes=training.maximum_rollout_bytes,
                         disk_bytes=training.maximum_rollout_disk_bytes)
     model=ModelConfig.from_dict(manifest['binding']['model'])
     def observation(value):
         if value is None:return None
         fields(value,('images','observation_id','episode_id','cutoff_nanos','geometry_revision','controls','events',
-                      'elapsed_seconds','reset','last_input_nanos'))
+                      'elapsed_seconds','reset','last_input_nanos'),('control_coverage_nanos',))
+        control_observation(value['controls'],integer(value['cutoff_nanos']),value.get('control_coverage_nanos'),
+            maximum_age_ms=EnvironmentSpec.from_dict(manifest['binding']['environment']).maximum_frame_age_ms)
         if type(value['images']) is not list or not 1<=len(value['images'])<=model.maximum_surfaces:
             raise EnvironmentError('Invalid imported surface count')
         images=[]
         for image in value['images']:
             fields(image,('offset','bytes','shape','checksum','metadata'))
-            frame=StoredFrame(store,image['offset'],image['bytes'],tuple(image['shape']),bytes.fromhex(image['checksum']))
-            if frame.offset+frame.nbytes>store.disk_bytes:raise EnvironmentError('Imported frame extent exceeds artifact')
+            frame=StoredFrame(store,image['offset']+frame_offset,image['bytes'],tuple(image['shape']),bytes.fromhex(image['checksum']))
+            if image['offset']+frame.nbytes>manifest['artifacts']['frames.bgra']['bytes'] or frame.offset+frame.nbytes>store.disk_bytes:raise EnvironmentError('Imported frame extent exceeds artifact')
             images.append(ObservationImage(frame,encoded(image['metadata'])))
         return ObservationRecord(tuple(images),uuid_key(value['observation_id']),uuid_key(value['episode_id']),
             integer(value['cutoff_nanos']),integer(value['geometry_revision']),encoded(value['controls']),encoded(value['events']),
-            value['elapsed_seconds'],value['reset'],value['last_input_nanos'])
+            value['elapsed_seconds'],value['reset'],value['last_input_nanos'],value.get('control_coverage_nanos'))
     try:
         decisions=[]
         fd,_=_file(Path(path)/'decisions.ndjson',training.maximum_rollout_bytes)
@@ -193,7 +227,8 @@ def load_rollout(path,manifest,training):
             while line:=source.readline(MAX_JSON+1):
                 if len(decisions)>=count:raise EnvironmentError('Rollout decision count is inconsistent')
                 data=_json(line);store.reserve_metadata(len(line)*3)
-                fields(data,('transition','observation','packet_fields','state_before','bootstrap_observation','outcome_detail','commands'))
+                fields(data,('transition','observation','packet_fields','state_before','bootstrap_observation','outcome_detail','commands'),
+                       ('endpoint_observation','retrospective','automaticReward') if manifest['schemaVersion']==2 else ())
                 scalar=data['transition'];scalar['reward']=RewardWindow(**scalar['reward'])
                 scalar['bootstrap']=None if scalar['bootstrap'] is None else BootstrapObservation(**scalar['bootstrap'])
                 scalar['outcome']=Outcome(scalar['outcome']);scalar=Transition(**scalar)

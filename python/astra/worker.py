@@ -26,7 +26,8 @@ class OutputOverflow(RuntimeError):
 class BoundedSender:
     """One writer, bounded bytes, coalesced progress, reliable terminal replies.
 
-    Only progress can be replaced/dropped. An undeliverable control/terminal
+    Only ordinary metrics can be replaced/dropped. The actor-boundary phase
+    requests a required handshake and is reliable control traffic. An undeliverable control/terminal
     reply fails the channel so the input loop cancels work and exits. Writes
     bypass Python's stdout buffer to avoid a blocked flush at process exit.
     """
@@ -40,6 +41,10 @@ class BoundedSender:
         self._closing = False
         self._thread = threading.Thread(target=self._write, name="Astra protocol writer", daemon=True)
         self._thread.start()
+
+    @staticmethod
+    def _coalescible(message):
+        return message.kind == "job.progress" and message.payload.get("phase") != "waiting_for_actor_boundary"
 
     def send(self, kind, payload, *, request=None):
         # Round-trip creates an immutable owned snapshot before the producer
@@ -56,16 +61,16 @@ class BoundedSender:
         with self._condition:
             if self.failed.is_set() or self._closing:
                 raise OutputOverflow("Compute output channel is unavailable")
-            if kind == "job.progress":
+            if self._coalescible(owned):
                 for index, (old, cost) in enumerate(self._queue):
-                    if old.kind == kind and old.run_id == owned.run_id:
+                    if self._coalescible(old) and old.run_id == owned.run_id:
                         if self._bytes - cost + size <= self.maximum_bytes:
                             self._queue[index] = (owned, size); self._bytes += size - cost
                         return
             if len(self._queue) >= self.maximum_messages or self._bytes + size > self.maximum_bytes:
-                if kind == "job.progress": return
+                if self._coalescible(owned): return
                 # Reclaim progress before rejecting a terminal/control message.
-                retained = deque((item, cost) for item, cost in self._queue if item.kind != "job.progress")
+                retained = deque((item, cost) for item, cost in self._queue if not self._coalescible(item))
                 self._queue = retained; self._bytes = sum(cost for _, cost in retained)
                 if len(retained) >= self.maximum_messages or self._bytes + size > self.maximum_bytes:
                     self.failed.set(); self._condition.notify_all()
@@ -137,14 +142,14 @@ def capabilities(role="compute") -> dict:
         from astra.collector import COLLECTOR_OPERATIONS
         return {"role":"collector","protocolVersion":1,"runtimeVersion":__version__,
             "capabilities":["capabilities","ping","shutdown",*COLLECTOR_OPERATIONS],
-            "pythonVersion":platform.python_version(),"collectionVersion":1}
+            "pythonVersion":platform.python_version(),"collectionVersion":1,"retrospectiveCollectionVersion":1}
     if role == "actor":
         from astra.inference import INFERENCE_OPERATIONS
         # Liveness/control never enters the actor's MLX owner thread. Device
         # initialization and all tensors belong to inference operations there.
         return {"role": "actor", "protocolVersion": 1, "runtimeVersion": __version__,
                 "capabilities": ["capabilities", "ping", "shutdown", *INFERENCE_OPERATIONS],
-                "pythonVersion": platform.python_version()}
+                "pythonVersion": platform.python_version(), "resumeCollectionVersion": 1}
     return {
         "role": "compute", "protocolVersion": 1, "runtimeVersion": __version__,
         "capabilities": ["capabilities", "ping", "shutdown", "diagnose", *JOB_OPERATIONS, "cancel", "job.status", "job.externalBoundary"],

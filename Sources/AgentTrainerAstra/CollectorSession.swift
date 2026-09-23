@@ -227,6 +227,12 @@ final class CollectorSession: @unchecked Sendable {
                 throw AstraError("collector.observation", "The retained observation does not belong to this collector.")
             }
             let cutoff = try observation.actorInput.required("cutoffNanos").decode(UInt64.self)
+            let controlCoverage = try fields["controlCoverageNanos"].flatMap { value in
+                value == .null ? nil : try value.decode(UInt64.self)
+            }
+            try ControlObservation.validateControlCoverage(state: try observation.actorInput.required("controlState").decode(ControlState.self),
+                cutoffNanos: cutoff, coverageNanos: controlCoverage,
+                intervalCovered: fields["intervalCovered"] == .bool(true) || (controlCoverage == nil && fields["intervalCovered"] == nil))
             if let coverage = observation.coverage { try coverage.validated(frame: observation.frame, cutoffNanos: cutoff, maximumAgeMS: 250) }
             else {
                 guard observation.frame.eventNanos <= observation.frame.observedNanos, observation.frame.observedNanos <= cutoff,
@@ -238,12 +244,13 @@ final class CollectorSession: @unchecked Sendable {
             let frame: JSONValue = .object(["metadata": try .encode(published.metadata), "reference": reference,
                 "coverageNanos": .unsigned(observation.coverage?.throughNanos ?? observation.frame.observedNanos),
                 "coverageKind": .string(observation.coverage?.kind.rawValue ?? "frame")])
-            let snapshot: JSONValue = .object(["id": .string(id.uuidString.lowercased()),
+            var snapshot: [String: JSONValue] = ["id": .string(id.uuidString.lowercased()),
                 "episodeID": try observation.actorInput.required("episodeID"), "cutoffNanos": .unsigned(cutoff),
                 "geometryRevision": try observation.actorInput.required("geometryRevision"), "frames": .array([frame]),
                 "controlState": try observation.actorInput.required("controlState"),
-                "events": try observation.actorInput.required("executedEvents")])
-            return ("collector.actor", .object(["sourceID": .string(source.uuidString.lowercased()), "response": response, "observation": snapshot]))
+                "events": try observation.actorInput.required("executedEvents")]
+            if let controlCoverage { snapshot["controlCoverageNanos"] = .unsigned(controlCoverage) }
+            return ("collector.actor", .object(["sourceID": .string(source.uuidString.lowercased()), "response": response, "observation": .object(snapshot)]))
         }
     }
 }

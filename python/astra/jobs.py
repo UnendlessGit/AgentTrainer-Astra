@@ -32,7 +32,7 @@ from astra.model.config import ModelConfig
 from astra.model.policy import AgentPolicy
 from astra.protocol import Message
 
-JOB_OPERATIONS = ("checkpoint.inspect", "checkpoint.create", "dataset.prepare", "train.behavioral", "evaluate.behavioral", "train.reinforcement", "train.reinforcement.external")
+JOB_OPERATIONS = ("feedback.inspect", "feedback.materialize", "feedback.combine", "checkpoint.inspect", "checkpoint.create", "dataset.prepare", "train.behavioral", "evaluate.behavioral", "train.reinforcement", "train.reinforcement.external", "checkpoint.externalBoundary")
 TERMINAL = {"completed", "cancelled", "failed"}
 
 
@@ -162,6 +162,31 @@ def validate_request(request: Message) -> dict:
             for choice in selection.get("context_ids", []): _integer(choice, high=65535)
         if total_ranges > 100_000:
             raise JobError("job.invalidConfiguration", "Dataset selection exceeds its range budget")
+    elif request.kind=="feedback.combine":
+        _object(value,("fragments","destination"),("fragments","destination"));_path(value["destination"],destination=True)
+        if type(value["fragments"]) is not list or not 1<=len(value["fragments"])<=128:raise JobError("job.invalidConfiguration","Batch requires bounded fragment references")
+        from astra.retrospective_feedback import _digest
+        for reference in value["fragments"]:
+            _object(reference,("path","manifestSHA256"),("path","manifestSHA256"));_path(reference["path"]);_digest(reference["manifestSHA256"])
+    elif request.kind in ("feedback.inspect", "feedback.materialize"):
+        allowed=("sourcePath","manifestSHA256") if request.kind=="feedback.inspect" else ("sourcePath","manifestSHA256","revisionDirectory","revisionChain","destination")
+        _object(value,allowed,allowed)
+        _path(value["sourcePath"])
+        from astra.retrospective_feedback import _digest, _fields, _id
+        _digest(value["manifestSHA256"])
+        if request.kind=="feedback.materialize":
+            _path(value["revisionDirectory"]);_path(value["destination"],destination=True)
+            if type(value["revisionChain"]) is not list or not 1<=len(value["revisionChain"])<=4096:
+                raise JobError("job.invalidConfiguration","Review requires a bounded immutable revision chain")
+            for reference in value["revisionChain"]:
+                _fields(reference,("id","sha256"));_id(reference["id"]);_digest(reference["sha256"])
+    elif request.kind == "checkpoint.externalBoundary":
+        _object(value,("checkpointPath","auditPath","destination","resume"),("checkpointPath","auditPath","destination"))
+        _path(value["checkpointPath"]);_path(value["auditPath"])
+        destination=_path(value["destination"])
+        if str(uuid.UUID(destination.name))!=destination.name:
+            raise JobError("job.invalidPath","Boundary checkpoint destinations require a canonical UUID")
+        _boolean(value.get("resume",False))
     elif request.kind == "train.reinforcement.external":
         _object(value,("checkpointPath","rolloutPath","destination","resume","boundaryTimeoutSeconds"),
                 ("checkpointPath","rolloutPath","destination"))
@@ -369,6 +394,13 @@ class JobManager:
 
     def _execute(self, job):
         value, operation = job.configuration, job.request.kind
+        if operation=="feedback.combine":
+            from astra.learning.review_batches import combine
+            return combine(value["fragments"],value["destination"],job.cancel.is_set)
+        if operation in ("feedback.inspect","feedback.materialize"):
+            from astra.learning.review_pipeline import inspect_source,materialize
+            if operation=="feedback.inspect":return inspect_source(value["sourcePath"],value["manifestSHA256"])
+            return materialize(value["sourcePath"],value["manifestSHA256"],value["revisionDirectory"],value["revisionChain"],value["destination"],job.cancel.is_set)
         if operation == "checkpoint.inspect":
             loaded = load_checkpoint(Path(value["path"]))
             return {"manifest": loaded.manifest, "path": value["path"], "integrityVerified": True,
@@ -392,6 +424,9 @@ class JobManager:
                                      pointer_mode=value["pointerMode"], split_seed=value.get("splitSeed", 0), cancelled=job.cancel.is_set)
             return {"datasetPath": value["destination"], "manifest": manifest, "provenance": "recorded_demonstrations"}
         loaded = load_checkpoint(Path(value["checkpointPath"]), include_training=value.get("resume", False))
+        if operation == "checkpoint.externalBoundary":
+            from astra.learning.external_boundary import preserve_external_boundary
+            return preserve_external_boundary(self,job,loaded)
         if operation == "train.reinforcement.external":
             from astra.learning.external_job import run_external_job
             return run_external_job(self,job,loaded)
