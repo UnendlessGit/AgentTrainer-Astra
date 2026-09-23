@@ -22,6 +22,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private(set) var learningRuns: [LearningRunDocument] = []
     private(set) var checkpoints: [CheckpointDocument] = []
     private(set) var evaluations: [EvaluationDocument] = []
+    private(set) var closedLoopEvaluations: [ClosedLoopEvaluationDocument] = []
     private(set) var rewardPrograms: [RewardProgram] = []
     private(set) var learning: LearningCoordinator?
     private(set) var inference: InferenceCoordinator?
@@ -51,6 +52,12 @@ enum AgentSection: String, CaseIterable, Identifiable {
     var section: AgentSection = .demonstrations
     var errorMessage: String?
     var showingNewAgent = false
+    var showingArtifactTransfer: ArtifactTransferMode?
+    private(set) var storageRoutingNeedsReload = false
+    private(set) var artifactTransferBusy = false
+    private(set) var artifactTransferProgress: ArtifactTransferProgress?
+    private(set) var pendingArtifactTransfers: [ArtifactTransferRecord] = []
+    private var artifactControl: ArtifactOperationControl?
     private var store: LibraryStore?
     private let historyRoot: URL?
     private let controlOwner: NativeControlOwner
@@ -106,19 +113,9 @@ enum AgentSection: String, CaseIterable, Identifiable {
                 let lease = try LibraryLease(root: root)
                 return (lease, try LibraryStore(root: root))
             }.value
-            libraryLease = opened.0; store = opened.1
-            learning = LearningCoordinator(store: opened.1, root: root) { [weak self] in
-                do { try await self?.refresh() }
-                catch { self?.errorMessage = error.localizedDescription }
-            }
-            inference = InferenceCoordinator(store: opened.1, root: root)
-            if let learning {
-                desktopLearning = DesktopLearningHost(store: opened.1, root: root, learner: learning) { [weak self] in
-                    do { try await self?.refresh() }
-                    catch { self?.errorMessage = error.localizedDescription }
-                }
-            }
-            _ = try await store?.recoverInterruptedRecordings()
+            libraryLease = opened.0; installCoordinators(store: opened.1)
+            do { _ = try await store?.recoverInterruptedRecordings() }
+            catch { errorMessage = error.localizedDescription }
             try await store?.markAbandonedLearningRunsInterrupted()
             try await store?.inspectPriorInferenceRuns()
             try await refresh()
@@ -127,8 +124,29 @@ enum AgentSection: String, CaseIterable, Identifiable {
         loading = false
     }
 
+    var storageLayout: ArtifactStorageLayout { store?.layout ?? .defaults(catalogRoot: supportRoot) }
+    func recordingDirectory(_ id: UUID) -> URL {
+        storageLayout.recordingsRoot.appendingPathComponent(id.uuidString + ".astrarecord")
+    }
+    func checkpointDirectory(_ id: UUID) -> URL {
+        storageLayout.modelsRoot.appendingPathComponent(id.uuidString.lowercased())
+    }
+
+    private func installCoordinators(store opened: LibraryStore) {
+        store = opened
+        learning = LearningCoordinator(store: opened, root: supportRoot) { [weak self] in
+            do { try await self?.refresh() } catch { self?.errorMessage = error.localizedDescription }
+        }
+        inference = InferenceCoordinator(store: opened, root: supportRoot)
+        if let learning {
+            desktopLearning = DesktopLearningHost(store: opened, root: supportRoot, learner: learning) { [weak self] in
+                do { try await self?.refresh() } catch { self?.errorMessage = error.localizedDescription }
+            }
+        }
+    }
+
     func createAgent(name: String) async {
-        guard let store else { return }
+        guard let store, !saving, !isClosing else { return }
         saving = true
         defer { saving = false }
         do {
@@ -141,7 +159,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     func saveAgent(_ document: AgentDocument) async {
-        guard let store else { return }
+        guard let store, !saving, !isClosing else { return }
         saving = true
         defer { saving = false }
         do {
@@ -206,6 +224,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
         let manifest = RecordingManifest(name: name, environment: environment, recordedForAgentID: agentID)
         activeRecordingID = manifest.id
         do {
+            try store.layout.requireAvailable(.recordings)
             let directory = store.recordingDirectory(id: manifest.id)
             let progressHandler: @Sendable (RecordingProgress) -> Void = { [weak self] progress in
                 Task { @MainActor [weak self] in
@@ -299,7 +318,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
             guard try await store.checkpointIDs(for: agentID).contains(correction.checkpoint.id) else {
                 throw AstraError("correction.checkpoint", "The source checkpoint is no longer linked to this agent.")
             }
-            let sourceManifest = try await LearningFiles.read(supportRoot.appendingPathComponent("Models/\(correction.checkpoint.id.uuidString.lowercased())/manifest.json"))
+            let sourceManifest = try await LearningFiles.read(checkpointDirectory(correction.checkpoint.id).appendingPathComponent("manifest.json"))
             guard sourceManifest.fields?["id"]?.uuid == correction.checkpoint.id,
                   sourceManifest.fields?["policySignature"]?.text == correction.checkpoint.policySignature else {
                 throw AstraError("correction.checkpoint", "The source checkpoint is unavailable or its identity changed.")
@@ -311,12 +330,13 @@ enum AgentSection: String, CaseIterable, Identifiable {
     var isRecording: Bool { recorder != nil }
 
     var isLearning: Bool { learning?.isBusy == true || desktopLearning?.isBusy == true }
-    var isRunningAgent: Bool { inference?.isBusy == true || desktopLearning?.isBusy == true || controlHistoryBusy }
+    var isRunningAgent: Bool { inference?.isBusy == true || desktopLearning?.isBusy == true || controlHistoryBusy || storageRoutingNeedsReload }
     var pendingControlHistory: [ControlHistoryReview] { issues.compactMap(\.controlHistory) }
     var controlHistoryBlockReason: String? { issues.first(where: \.blocksLiveControl)?.message }
 
     var inferenceUnavailableReason: String? {
         if isClosing { return "The workspace is closing." }
+        if storageRoutingNeedsReload { return "Reload storage routing in Settings before starting another workflow." }
         if correctionStarting { return "Preparing the correction recording…" }
         if saving { return "Finish saving library changes before running an agent." }
         if controlHistoryBusy { return "Checking previous control cleanup…" }
@@ -340,7 +360,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
         let generation = UUID(); checkpointContextGeneration = generation; checkpointContextSizes = []; checkpointContextVocabulary = nil
         guard let id, checkpointLinks[agentID]?.contains(id) == true else { return }
         do {
-            let metadata = try await LearningFiles.read(supportRoot.appendingPathComponent("Models").appendingPathComponent(id.uuidString.lowercased()).appendingPathComponent("manifest.json"))
+            let metadata = try await LearningFiles.read(checkpointDirectory(id).appendingPathComponent("manifest.json"))
             guard case .array(let sizes) = metadata.fields?["model"]?.fields?["context_sizes"], sizes.count <= 32,
                   sizes.allSatisfy({ $0.int.map { (1...65_536).contains($0) } == true }) else {
                 throw AstraError("inference.contexts", "The selected checkpoint's context configuration is invalid.")
@@ -352,6 +372,14 @@ enum AgentSection: String, CaseIterable, Identifiable {
         } catch {
             if checkpointContextGeneration == generation { errorMessage = error.localizedDescription }
         }
+    }
+
+    func evaluateClosedLoop(checkpoints: [CheckpointDocument], agentID: UUID, definition: ClosedLoopProtocol) {
+        do {
+            guard !isClosing, !isRunningAgent, !saving, !correctionStarting else { throw AstraError("evaluation.busy", "Finish the current library operation or live run before evaluating.") }
+            guard let learning else { throw AstraError("evaluation.workspace", "The workspace is still opening.") }
+            try learning.evaluateClosedLoop(checkpoints: checkpoints, agentID: agentID, protocol: definition)
+        } catch { errorMessage = error.localizedDescription }
     }
 
     func startBehaviorTraining(agent: AgentDocument, options: BehaviorOptions) {
@@ -430,6 +458,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
 
     var checkpointManagementUnavailableReason: String? {
         if loading || isClosing || saving { return "Wait for the current library operation to finish." }
+        if storageRoutingNeedsReload { return "Reload storage routing in Settings before managing artifacts." }
         if correctionStarting { return "Finish the correction recording handoff before managing checkpoints." }
         if isLearning || isRunningAgent || controlStartupWork != nil { return "Stop training, evaluation and running agents before managing checkpoints." }
         if isRecording || recordingStarting || recordingStopping || correctionStarting { return "Finish recording before managing checkpoints." }
@@ -470,6 +499,123 @@ enum AgentSection: String, CaseIterable, Identifiable {
         }
     }
 
+    func refreshStorageAvailability() async {
+        guard let store, !saving, !artifactTransferBusy else { return }
+        saving = true; defer { saving = false }
+        do {
+            if storageRoutingNeedsReload {
+                let root = supportRoot
+                let reopened = try await Task.detached { try LibraryStore(root: root) }.value
+                installCoordinators(store: reopened); invalidateCheckpointContexts()
+                try await refresh()
+                if let agent = selectedAgent { await inspectCheckpointContexts(agent.selectedCheckpointID, agentID: agent.id) }
+                storageRoutingNeedsReload = false
+            } else {
+                if (try? store.layout.requireAvailable(.recordings)) != nil { _ = try await store.recoverInterruptedRecordings() }
+                try await refresh()
+            }
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    var artifactUnavailableReason: String? { checkpointManagementUnavailableReason }
+
+    func previewArtifactExport(agentID: UUID, recordingIDs: Set<UUID>, checkpointIDs: Set<UUID>) async throws -> ArtifactExportPlan {
+        guard let store, artifactUnavailableReason == nil else { throw AstraError("artifact.busy", artifactUnavailableReason ?? "The library is unavailable.") }
+        saving = true; defer { saving = false }
+        return try await store.previewArtifactExport(agentID: agentID, recordingIDs: recordingIDs, checkpointIDs: checkpointIDs)
+    }
+    func previewArtifactImport(from source: URL, linkToAgentID: UUID? = nil) async throws -> ArtifactImportPlan {
+        guard let store, artifactUnavailableReason == nil else { throw AstraError("artifact.busy", artifactUnavailableReason ?? "The library is unavailable.") }
+        saving = true; defer { saving = false }
+        return try await store.previewArtifactImport(from: source, linkToAgentID: linkToAgentID)
+    }
+    func exportArtifactArchive(_ plan: ArtifactExportPlan, to destination: URL) async throws {
+        guard let store else { throw AstraError("artifact.workspace", "The library is unavailable.") }
+        try await performArtifactTransfer { [self] control in
+            try await store.exportArtifactArchive(plan, to: destination, progress: { control.report($0) }, cancelled: { control.isCancelled })
+            await refreshAfterArtifactTransfer()
+        }
+    }
+    func importArtifactArchive(_ plan: ArtifactImportPlan) async throws -> ArtifactImportResult {
+        guard let store else { throw AstraError("artifact.workspace", "The library is unavailable.") }
+        return try await performArtifactTransfer { [self] control in
+            let result = try await store.importArtifactArchive(plan, progress: { control.report($0) }, cancelled: { control.isCancelled })
+            await refreshAfterArtifactTransfer()
+            return result
+        }
+    }
+    private func refreshAfterArtifactTransfer() async {
+        do { try await refresh() }
+        catch { errorMessage = "The transfer completed, but the library display could not refresh: \(error.localizedDescription)" }
+    }
+    func previewStorageMigration(kind: ArtifactStorageKind, destination: URL) async throws -> StorageMigrationPlan {
+        guard let store, artifactUnavailableReason == nil else { throw AstraError("artifact.busy", artifactUnavailableReason ?? "The library is unavailable.") }
+        saving = true; defer { saving = false }
+        return try await store.previewStorageMigration(kind: kind, destination: destination)
+    }
+    func applyStorageMigration(_ plan: StorageMigrationPlan) async throws {
+        guard let store else { throw AstraError("artifact.workspace", "The library is unavailable.") }
+        let root = supportRoot
+        try await performArtifactTransfer { [self] control in
+            await latchStorageRouting()
+            do {
+                _ = try await store.applyStorageMigration(plan, progress: { control.report($0) }, cancelled: { control.isCancelled })
+                try await store.checkpoint()
+                try await reopenStorageOwners(root: root)
+            } catch {
+                // Even an uncertain switch or cancelled copy is reconciled
+                // against durable routing. If that fails, admission stays closed
+                // until Settings reloads successfully or the app restarts.
+                try? await reopenStorageOwners(root: root)
+                throw error
+            }
+        }
+    }
+    private func reopenStorageOwners(root: URL) async throws {
+        let reopened = try await Task.detached { try LibraryStore(root: root) }.value
+        installCoordinators(store: reopened); invalidateCheckpointContexts()
+        try await refresh()
+        if let agent = selectedAgent { await inspectCheckpointContexts(agent.selectedCheckpointID, agentID: agent.id) }
+        confirmStorageRouting()
+    }
+    private func latchStorageRouting() { storageRoutingNeedsReload = true }
+    private func confirmStorageRouting() { storageRoutingNeedsReload = false }
+    private func invalidateCheckpointContexts() {
+        checkpointContextGeneration = UUID(); checkpointContextSizes = []; checkpointContextVocabulary = nil
+    }
+    func retryArtifactTransfer(_ record: ArtifactTransferRecord) async throws {
+        if let migration = record.migration { try await applyStorageMigration(migration) }
+        else if let importing = record.importPlan { _ = try await importArtifactArchive(importing) }
+        else if let exporting = record.exportPlan, let destination = record.exportDestination { try await exportArtifactArchive(exporting, to: destination) }
+        else { throw AstraError("artifact.retry", "This transfer has no resumable plan.") }
+    }
+
+    func cancelArtifactTransfer() async {
+        guard let control = artifactControl else { return }
+        control.cancel()
+        while artifactTransferBusy && artifactControl === control { try? await Task.sleep(for: .milliseconds(50)) }
+    }
+    private func performArtifactTransfer<T: Sendable>(_ body: @escaping @Sendable (ArtifactOperationControl) async throws -> T) async throws -> T {
+        guard artifactUnavailableReason == nil else { throw AstraError("artifact.busy", artifactUnavailableReason!) }
+        let control = ArtifactOperationControl(); artifactControl = control
+        artifactTransferBusy = true; saving = true; artifactTransferProgress = nil
+        let polling = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.artifactTransferProgress = control.progress
+                do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+            }
+        }
+        defer {
+            polling.cancel(); artifactTransferProgress = control.progress
+            artifactControl = nil; artifactTransferBusy = false; saving = false
+        }
+        do { return try await body(control) }
+        catch {
+            if let store { pendingArtifactTransfers = (try? await store.pendingArtifactTransfers()) ?? pendingArtifactTransfers }
+            throw error
+        }
+    }
+
     func stopLearningAndWait() async {
         if desktopLearning?.isBusy == true { await desktopLearning?.stopAndWait() }
         else { await learning?.stopAndWait() }
@@ -478,6 +624,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     @discardableResult
     func prepareForTermination() async -> Bool {
         isClosing = true
+        artifactControl?.cancel()
         let starting = controlStartupWork; starting?.cancel()
         // Both owners receive stop promptly. The application exits only after
         // capture is sealed and learning has published its terminal checkpoint.
@@ -669,8 +816,9 @@ enum AgentSection: String, CaseIterable, Identifiable {
         guard let store else { return }
         let snapshot = try await store.snapshot()
         agents = snapshot.agents; environments = snapshot.environments; recordings = snapshot.recordings; issues = snapshot.issues
-        learningRuns = snapshot.learningRuns; checkpoints = snapshot.checkpoints; evaluations = snapshot.evaluations
+        learningRuns = snapshot.learningRuns; checkpoints = snapshot.checkpoints; evaluations = snapshot.evaluations; closedLoopEvaluations = snapshot.closedLoopEvaluations
         pendingFeedback = snapshot.pendingFeedback
+        pendingArtifactTransfers = try await store.pendingArtifactTransfers()
         rewardPrograms = snapshot.rewardPrograms; contextFields = snapshot.contextFields
         recordingSelections = snapshot.recordingSelections
         var links: [UUID: Set<UUID>] = [:]

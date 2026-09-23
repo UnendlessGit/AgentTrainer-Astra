@@ -32,7 +32,7 @@ from astra.model.config import ModelConfig
 from astra.model.policy import AgentPolicy
 from astra.protocol import Message
 
-JOB_OPERATIONS = ("feedback.inspect", "feedback.materialize", "feedback.combine", "checkpoint.inspect", "checkpoint.create", "dataset.prepare", "train.behavioral", "evaluate.behavioral", "train.reinforcement", "train.reinforcement.external", "checkpoint.externalBoundary")
+JOB_OPERATIONS = ("feedback.inspect", "feedback.materialize", "feedback.combine", "checkpoint.inspect", "checkpoint.create", "dataset.prepare", "train.behavioral", "evaluate.behavioral", "evaluate.closedLoop", "train.reinforcement", "train.reinforcement.external", "checkpoint.externalBoundary")
 TERMINAL = {"completed", "cancelled", "failed"}
 
 
@@ -118,6 +118,11 @@ def validate_request(request: Message) -> dict:
     value = copy.deepcopy(request.payload)
     if request.kind == "checkpoint.inspect":
         _object(value, ("path",), ("path",)); _path(value["path"])
+    elif request.kind == "evaluate.closedLoop":
+        _object(value, ("checkpointPath", "protocol"), ("checkpointPath", "protocol"))
+        _path(value["checkpointPath"])
+        from astra.closed_loop import validate_protocol
+        validate_protocol(value["protocol"])
     elif request.kind == "checkpoint.create":
         _object(value, ("destination", "model", "actions", "seed", "pretrainedPath"), ("destination", "model", "actions"))
         _path(value["destination"], destination=True)
@@ -394,6 +399,10 @@ class JobManager:
 
     def _execute(self, job):
         value, operation = job.configuration, job.request.kind
+        if operation == "evaluate.closedLoop":
+            from astra.closed_loop import evaluate
+            return evaluate(value["checkpointPath"], value["protocol"], cancelled=job.cancel.is_set,
+                            progress=lambda update: self._progress(job, update))
         if operation=="feedback.combine":
             from astra.learning.review_batches import combine
             return combine(value["fragments"],value["destination"],job.cancel.is_set)

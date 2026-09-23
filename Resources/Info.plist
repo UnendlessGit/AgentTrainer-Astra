@@ -11,6 +11,15 @@
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>UTExportedTypeDeclarations</key>
+  <array><dict>
+    <key>UTTypeIdentifier</key><string>com.unendless.agenttrainer.astraarchive</string>
+    <key>UTTypeDescription</key><string>AgentTrainer Astra Archive</string>
+    <key>UTTypeConformsTo</key><array><string>com.apple.package</string></array>
+    <key>UTTypeTagSpecification</key><dict>
+      <key>public.filename-extension</key><array><string>astraarchive</string></array>
+    </dict>
+  </dict></array>
   <key>NSScreenCaptureUsageDescription</key><string>Astra observes the environment you select to record demonstrations and run local agents.</string>
   <key>NSInputMonitoringUsageDescription</key><string>Astra records your demonstrated controls and detects when you take back control.</string>
   <key>NSAccessibilityUsageDescription</key><string>Astra sends the keyboard and pointer actions you authorize for a local agent.</string>

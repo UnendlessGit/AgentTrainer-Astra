@@ -21,11 +21,15 @@ import AstraPlatform
                 Button("New Agent…") { model.showingNewAgent = true }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
                     .disabled(model.loading)
+                Button("Import Astra Archive…") { model.showingArtifactTransfer = .importArchive }
+                    .disabled(model.artifactUnavailableReason != nil)
+                Button("Export Astra Archive…") { model.showingArtifactTransfer = .exportArchive }
+                    .disabled(model.artifactUnavailableReason != nil || model.selectedAgent == nil)
                 Button("Duplicate Agent") { Task { await model.duplicateSelectedAgent() } }
                     .disabled(model.selectedAgent == nil)
             }
         }
-        Settings { SettingsView(root: model.supportRoot) }
+        Settings { StorageSettingsView(model: model) }
         MenuBarExtra("AgentTrainer Astra", systemImage: model.isRecording ? "record.circle.fill" : "cpu") {
             StatusMenu(model: model)
         }
@@ -45,7 +49,7 @@ import AstraPlatform
         terminationSignal = source; source.resume()
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model, model.isRecording || model.recordingStarting || model.recordingStopping || model.isLearning || model.isRunningAgent else { return .terminateNow }
+        guard let model, model.isRecording || model.recordingStarting || model.recordingStopping || model.isLearning || model.isRunningAgent || model.saving || model.correctionStarting else { return .terminateNow }
         guard !terminating else { return .terminateLater }
         terminating = true
         Task {
@@ -75,6 +79,10 @@ private struct StatusMenu: View {
         if let inference = model.inference, inference.isBusy {
             Text(inference.phase)
             Button("Stop Agent") { Task { await inference.stopAndWait() } }.disabled(inference.isStopping)
+        }
+        if model.artifactTransferBusy {
+            Text(model.artifactTransferProgress?.phase ?? "Transferring artifacts…")
+            Button("Cancel Transfer") { Task { await model.cancelArtifactTransfer() } }
         }
         Divider()
         Button("Show AgentTrainer Astra") { openWindow(id: "workspace"); NSApp.activate(ignoringOtherApps: true) }
@@ -115,6 +123,7 @@ struct WorkspaceView: View {
                 ProgressView("Opening your workspace…").frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 0) {
+                    if model.artifactTransferBusy { ArtifactTransferBanner(model: model) }
                     if model.isRecording || model.recordingStarting { RecordingBanner(model: model) }
                     if let desktop = model.desktopLearning, desktop.isBusy { DesktopLearningBanner(host: desktop) }
                     else if let learning = model.learning, learning.isBusy { LearningBanner(learning: learning) }
@@ -139,12 +148,12 @@ struct WorkspaceView: View {
                     .help("Create an agent").disabled(model.loading)
             }
         }
+        .sheet(item: $model.showingArtifactTransfer) { ArtifactTransferView(model: model, mode: $0) }
         .sheet(isPresented: $model.showingNewAgent) { NewAgentSheet(model: model) }
         .sheet(isPresented: $model.showingRecorder) { RecorderSheet(model: model) }
         .sheet(item: $model.recordingLinkRequest) { RecordingLinkSheet(model: model, request: $0) }
         .sheet(item: $model.recordingToInspect) { recording in
-            RecordingInspector(recording: recording, directory: model.supportRoot.appendingPathComponent("Recordings")
-                .appendingPathComponent(recording.id.uuidString + ".astrarecord"), workspace: model, agentID: model.recordingInspectionAgentID)
+            RecordingInspector(recording: recording, directory: model.recordingDirectory(recording.id), workspace: model, agentID: model.recordingInspectionAgentID)
         }
         .sheet(item: Binding(get: { model.desktopLearning?.reviewPresentation }, set: { value in
             if value == nil { model.desktopLearning?.cancelFeedbackReview() }
@@ -256,7 +265,7 @@ private struct AgentWorkspace: View {
                 case .training:
                     LearningTrainingView(agent: agent, model: model).id(agent.id)
                 case .evaluation:
-                    LearningEvaluationView(agent: agent, model: model).id(agent.id)
+                    AgentEvaluationView(agent: agent, model: model).id(agent.id)
                 case .run:
                     RunView(coordinator: model.inference, agentID: agent.id,
                             checkpoints: model.checkpoints.filter { model.checkpointLinks[agent.id]?.contains($0.id) == true },
@@ -329,22 +338,5 @@ private struct NewAgentSheet: View {
     private func create() {
         guard !model.saving, (try? DocumentNames.validated(name)) != nil else { return }
         Task { await model.createAgent(name: name) }
-    }
-}
-
-private struct SettingsView: View {
-    let root: URL
-    var body: some View {
-        Form {
-            Section("Local workspace") {
-                Text(root.path).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
-                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([root]) }
-            }
-            Section("About") {
-                LabeledContent("Application", value: "AgentTrainer Astra")
-                LabeledContent("Development build", value: "0.1.0")
-                Text("Recordings, training, and inference stay on your Mac.").foregroundStyle(.secondary)
-            }
-        }.formStyle(.grouped).frame(width: 520, height: 300)
     }
 }

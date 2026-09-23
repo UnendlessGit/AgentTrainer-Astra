@@ -248,7 +248,7 @@ struct BehaviorTrainingView: View {
         readingControls = true
         defer { if key == controlSelectionKey { readingControls = false } }
         do {
-            let result = try await LearningFiles.recordedCapabilities(recordings.filter { selected.contains($0.id) }, root: model.supportRoot, selections: key.selections)
+            let result = try await LearningFiles.recordedCapabilities(recordings.filter { selected.contains($0.id) }, root: model.supportRoot, layout: model.storageLayout, selections: key.selections)
             guard !Task.isCancelled, key == controlSelectionKey else { return }
             detected = result; options.keys = result.keyCodes; options.buttons = result.mouseButtons
             options.pointerEnabled = result.absolutePointer; options.scrollEnabled = result.scroll; controlsError = nil

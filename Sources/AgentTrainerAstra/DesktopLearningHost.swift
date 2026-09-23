@@ -197,12 +197,12 @@ import AstraPlatform
             _ = try await policyActor.prepare(checkpoint: prepared.checkpoint, collection: true, mode: mode)
             try signals.check()
             let observations = try await DesktopResetObservations.prepare(program: configuration.program, scope: scope,
-                assetRoot: root.appendingPathComponent("RewardAssets"), frames: {
+                assetRoot: root, frames: {
                     guard let images = try inbox.readAll() else { throw AstraError("desktop.capture", "The reset has no complete observation.") }
                     return images
                 }, detector: detector)
             let owner = dependencies.controlOwner, controlFactory = controlFactory, verify = verifyScope
-            let collectorFactory = collectorFactory, detector = detector, assetRoot = root.appendingPathComponent("RewardAssets")
+            let collectorFactory = collectorFactory, detector = detector, assetRoot = root
             var operations = DesktopLearningOperations(collector: { checkpoint, prior, id in
                 let destination = collectionsDirectory.appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
                 return try await CollectorSession.start(runID: runID,

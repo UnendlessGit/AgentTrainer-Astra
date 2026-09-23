@@ -198,7 +198,7 @@ private func makeRenderRecording(root: URL, environment: EnvironmentDocument, is
     return try writer.finish(at: 1_400_000_000, status: issue == nil ? .complete : .interrupted, issue: issue)
 }
 
-@MainActor private func renderOwnedView(_ view: AnyView, name: String, size: NSSize, scheme: ColorScheme, output: URL) async throws -> [String: Any] {
+@MainActor func renderOwnedView(_ view: AnyView, name: String, size: NSSize, scheme: ColorScheme, output: URL) async throws -> [String: Any] {
     let frame = NSRect(origin: .zero, size: size)
     let hosting = NSHostingView(rootView: view.environment(\.colorScheme, scheme).preferredColorScheme(scheme)
         .frame(width: size.width, height: size.height).background(Color(nsColor: .windowBackgroundColor)))

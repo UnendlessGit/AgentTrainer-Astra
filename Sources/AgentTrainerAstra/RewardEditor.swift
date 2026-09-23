@@ -68,7 +68,7 @@ struct RewardEditor: View {
             .task(id: recordingID) {
                 readings = []
                 guard let recordingID else { preview.close(); return }
-                await preview.open(model.supportRoot.appendingPathComponent("Recordings").appendingPathComponent(recordingID.uuidString + ".astrarecord"))
+                await preview.open(model.recordingDirectory(recordingID))
             }
     }
     private var sourceChooser: some View {
@@ -260,11 +260,12 @@ struct RewardEditor: View {
         testing = true; issue = nil; rehearsalReport = nil; rehearsalReportURL = nil; rehearsalProgress = 0
         let generation = UUID(); rehearsalGeneration = generation
         let frozen = program, start = preview.seconds, duration = rehearsalSeconds, root = model.supportRoot
+        let recordingDirectory = model.recordingDirectory(recordingID)
         rehearsalWork = Task {
             defer { testing = false; rehearsalWork = nil }
             do {
                 let work = Task.detached {
-                    try RewardRehearsal.run(program: frozen, directory: root.appendingPathComponent("Recordings").appendingPathComponent(recordingID.uuidString + ".astrarecord"),
+                    try RewardRehearsal.run(program: frozen, directory: recordingDirectory,
                         assetRoot: root, startSeconds: start, durationSeconds: duration, cancelled: { Task.isCancelled },
                         progress: { completed, total in
                             if completed % 10 == 0 || completed == total {

@@ -33,8 +33,8 @@ public struct CheckpointCleanupResult: Sendable {
 }
 
 enum CheckpointArtifactFiles {
-    static func directory(root: URL, id: UUID) throws -> URL {
-        let models = root.appendingPathComponent("Models", isDirectory: true)
+    static func directory(modelsRoot: URL, id: UUID) throws -> URL {
+        let models = modelsRoot
         let values = try models.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard values.isDirectory == true, values.isSymbolicLink != true else {
             throw AstraError("checkpoint.cleanupPath", "The Models folder is unavailable or resolves through a symbolic link.")
@@ -49,8 +49,8 @@ enum CheckpointArtifactFiles {
         return url
     }
 
-    static func bytes(root: URL, id: UUID) throws -> UInt64 {
-        let directory = try directory(root: root, id: id)
+    static func bytes(modelsRoot: URL, id: UUID) throws -> UInt64 {
+        let directory = try directory(modelsRoot: modelsRoot, id: id)
         guard FileManager.default.fileExists(atPath: directory.path) else { return 0 }
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
         var stack = [directory], count = 0, bytes: UInt64 = 0

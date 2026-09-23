@@ -123,6 +123,7 @@ struct BehaviorEvaluation: Sendable {
     private var earlyCompletion: WireMessage?
     private var processFailure: AstraError?
     private var processGeneration: UUID?
+    private var closedLoopCheckpointName: String?
     private var externalBoundary: URL?
     private var externalBoundaryCheck: (@Sendable () async throws -> Void)?
     private var externalBoundaryWork: Task<Void, Never>?
@@ -136,7 +137,9 @@ struct BehaviorEvaluation: Sendable {
     func start(agent: AgentDocument, options rawOptions: BehaviorOptions, recordings: [RecordingManifest],
                selections: [UUID: RecordingTrainingSelection]? = nil) throws {
         guard !isBusy else { throw AstraError("learning.busy", "Finish or stop the current learning job first.") }
+        try store.layout.requireAvailable(.models)
         let options = try rawOptions.validated()
+        if options.source == .recordings && !options.resume { try store.layout.requireAvailable(.recordings) }
         let selected = options.source == .recordings && !options.resume ? recordings.filter { options.recordingIDs.contains($0.id) } : []
         guard options.resume || options.source != .recordings || selected.count == options.recordingIDs.count,
               selected.allSatisfy({ $0.status != .recording && $0.frameCount > 0 }) else {
@@ -165,6 +168,7 @@ struct BehaviorEvaluation: Sendable {
 
     func startReinforcement(agent: AgentDocument, options rawOptions: ReinforcementOptions) throws {
         guard !isBusy else { throw AstraError("learning.busy", "Finish or stop the current learning job first.") }
+        try store.layout.requireAvailable(.models)
         let options = try rawOptions.validated()
         begin(agentID: agent.id)
         let run = LearningRunDocument(agentID: agent.id, kind: .reinforcement,
@@ -297,6 +301,7 @@ struct BehaviorEvaluation: Sendable {
               !checkpoints.isEmpty, checkpoints.count <= 64, Set(checkpoints.map(\.id)).count == checkpoints.count else {
             throw AstraError("evaluation.source", "Choose up to 64 checkpoints, one saved demonstration dataset, and finish any active job.")
         }
+        try store.layout.requireAvailable(.models)
         begin(agentID: agentID); activeRun = nil
         work = Task { await performEvaluation(checkpoints: checkpoints, agentID: agentID, datasetCheckpoint: datasetCheckpoint, split: split) }
     }
@@ -326,7 +331,7 @@ struct BehaviorEvaluation: Sendable {
     private func begin(agentID: UUID) {
         workGeneration = UUID()
         isBusy = true; isStopping = false; cancelRequested = false; failure = nil; activeAgentID = agentID
-        resultAgentID = agentID; evaluation = nil
+        resultAgentID = agentID; evaluation = nil; closedLoopCheckpointName = nil
         metrics = []; reinforcementMetrics = []; rolloutDecisions = nil; rolloutTarget = nil; elapsedSeconds = nil
         decisionsPerSecond = nil; peakMemoryBytes = nil; phase = "Preparing training…"
         processFailure = nil; earlyCompletion = nil; earlyProgress = nil; completion = nil; jobID = nil; jobRequestID = nil; jobRunID = nil
@@ -372,7 +377,7 @@ struct BehaviorEvaluation: Sendable {
                     "test": .array((0..<heldout).map { .integer(Int64(options.seed + 20000 + $0)) })])])
         } else if !options.resume {
             dataset = .object(["kind": .string("recordings"), "path": .string(artifact("Datasets", datasetID).path),
-                               "recordingRoot": .string(root.appendingPathComponent("Recordings").path)])
+                               "recordingRoot": .string(store.layout.recordingsRoot.path)])
         }
         do {
             activeRun?.sourceRecordingIDs = recordingIDs
@@ -402,7 +407,8 @@ struct BehaviorEvaluation: Sendable {
                           original.fields?["agentID"]?.text.flatMap(UUID.init(uuidString:)) == checkpoint.agentID else {
                         throw AstraError("behavioral.resumeIdentity", "The saved demonstration configuration belongs to another run.")
                     }
-                    dataset = try original.required("dataset")
+                    dataset = try SavedArtifactLocations.dataset(original.required("dataset"), checkpointManifest: manifest, layout: store.layout)
+                    if dataset.fields?["kind"] == .string("recordings") { try store.layout.requireAvailable(.recordings) }
                     training = try manifest.required("trainingConfig")
                     guard case .object = training, let target = training.fields?["epochs"]?.int, target > 0,
                           case .bool(let verified) = original.fields?["verificationMode"] else {
@@ -445,7 +451,7 @@ struct BehaviorEvaluation: Sendable {
             if options.source == .recordings && !options.resume {
                 phase = "Preparing demonstrations…"
                 let prepared = try await job("dataset.prepare", .object([
-                    "destination": .string(artifact("Datasets", datasetID).path), "recordingRoot": .string(root.appendingPathComponent("Recordings").path),
+                    "destination": .string(artifact("Datasets", datasetID).path), "recordingRoot": .string(store.layout.recordingsRoot.path),
                     "selections": .array(selections),
                     "model": model, "actions": actions,
                     "pointerMode": .string(actions.fields?["relativePointer"] == .bool(true) && actions.fields?["absolutePointer"] != .bool(true) ? "relative" : options.pointerMode),
@@ -514,7 +520,7 @@ struct BehaviorEvaluation: Sendable {
                     throw AstraError("evaluation.checkpointOwner", "A selected checkpoint is not linked to this agent.")
                 }
             }
-            let definition = try await SavedEvaluationProtocol.resolve(checkpoint: datasetCheckpoint, root: root, split: split)
+            let definition = try await SavedEvaluationProtocol.resolve(checkpoint: datasetCheckpoint, root: root, split: split, layout: store.layout)
             if cancelRequested { throw CancellationError() }
             var failed = 0
             for (index, checkpoint) in checkpoints.enumerated() {
@@ -530,7 +536,7 @@ struct BehaviorEvaluation: Sendable {
                     }
                     // Recheck saved source identity before every candidate. An altered
                     // revision must not silently divide one comparison into two tasks.
-                    let current = try await SavedEvaluationProtocol.resolve(checkpoint: datasetCheckpoint, root: root, split: split)
+                    let current = try await SavedEvaluationProtocol.resolve(checkpoint: datasetCheckpoint, root: root, split: split, layout: store.layout)
                     guard current == definition else { throw AstraError("evaluation.datasetChanged", "The selected dataset or its saved configuration changed during evaluation.") }
                     let manifest = try await LearningFiles.read(artifact("Models", checkpoint.id).appendingPathComponent("manifest.json"))
                     guard manifest.fields?["id"]?.text.flatMap(UUID.init(uuidString:)) == checkpoint.id,
@@ -667,6 +673,8 @@ struct BehaviorEvaluation: Sendable {
                 }
             }
         }
+        if fields["phase"] == .string("evaluating"), let complete = fields["completedTrials"]?.int,
+           let total = fields["totalTrials"]?.int, !isStopping { phase = "\(closedLoopCheckpointName ?? "Practice evaluation") · \(complete) of \(total) trials complete" }
         if fields["phase"]?.text == "checkpointing", !isStopping { phase = "Saving checkpoint…" }
         if fields["sourceKind"] == .string("practice_rollout") || fields["sourceKind"] == .string("external_rollout") {
             if !isStopping {
@@ -758,7 +766,8 @@ struct BehaviorEvaluation: Sendable {
     }
 
     private func artifact(_ folder: String, _ id: UUID) -> URL {
-        root.appendingPathComponent(folder, isDirectory: true).appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
+        if folder == "Models" { return store.checkpointDirectory(id: id) }
+        return root.appendingPathComponent(folder, isDirectory: true).appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
     }
 }
 
@@ -793,6 +802,7 @@ extension LearningCoordinator {
     func prepareDesktopPolicy(agent: AgentDocument, checkpoint: CheckpointDocument?, model: JSONValue,
                               actions: ActionCapabilities, seed: Int) async throws -> PreparedDesktopPolicy {
         guard !isBusy else { throw AstraError("learning.busy", "Finish or stop the current learning job first.") }
+        try store.layout.requireAvailable(.models)
         if checkpoint == nil {
             _ = try actions.validated()
             guard !actions.isEmpty, (0...1_000_000_000).contains(seed) else {
@@ -876,6 +886,7 @@ extension LearningCoordinator {
                                      validateBoundary: @escaping @Sendable () async throws -> Void) async throws -> ExternalLearningResult {
         guard !isBusy else { throw AstraError("learning.busy", "Finish or stop the current learning job first.") }
         try Task.checkCancellation()
+        try store.layout.requireAvailable(.models)
         begin(agentID: agent.id)
         let run = LearningRunDocument(agentID: agent.id, kind: .reinforcement,
             name: "\(String(agent.name.prefix(116))) · \(rolloutID == nil ? "Desktop checkpoint" : "Desktop reinforcement")", sourceKind: "desktop_rollout")
@@ -1025,7 +1036,7 @@ enum LearningFiles {
             return try JSONDecoder().decode(JSONValue.self, from: data)
         }.value
     }
-    static func recordedCapabilities(_ recordings: [RecordingManifest], root: URL,
+    static func recordedCapabilities(_ recordings: [RecordingManifest], root: URL, layout: ArtifactStorageLayout? = nil,
                                      selections: [UUID: RecordingTrainingSelection]? = nil) async throws -> ActionCapabilities {
         let operation = Task.detached {
             var result = ActionCapabilities()
@@ -1038,7 +1049,7 @@ enum LearningFiles {
                     guard let selection = selections[recording.id] else { throw AstraError("learning.selection", "Review the saved intervals for \(recording.name) before choosing its controls.") }
                     ranges = try selection.resolved(for: recording)
                 } else { ranges = nil }
-                let directory = root.appendingPathComponent("Recordings").appendingPathComponent(recording.id.uuidString + ".astrarecord")
+                let directory = (layout ?? .defaults(catalogRoot: root)).recordingDirectory(id: recording.id)
                 let descriptor = open(directory.appendingPathComponent(".writer.lock").path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
                 guard descriptor >= 0 else { throw AstraError("learning.recordingLock", "The recording's lock is unavailable.") }
                 defer { close(descriptor) }
@@ -1085,5 +1096,61 @@ enum LearningFiles {
             return try result.validated()
         }
         return try await withTaskCancellationHandler { try await operation.value } onCancel: { operation.cancel() }
+    }
+}
+
+extension LearningCoordinator {
+    func evaluateClosedLoop(checkpoints: [CheckpointDocument], agentID: UUID, protocol definition: ClosedLoopProtocol) throws {
+        guard !isBusy, !checkpoints.isEmpty, checkpoints.count <= 64, Set(checkpoints.map(\.id)).count == checkpoints.count else {
+            throw AstraError("evaluation.selection", "Choose up to 64 linked checkpoints and finish the current learning operation.")
+        }
+        _ = try definition.validated()
+        try store.layout.requireAvailable(.models)
+        begin(agentID: agentID); activeRun = nil
+        work = Task { await performClosedLoopEvaluation(checkpoints: checkpoints, agentID: agentID, definition: definition) }
+    }
+
+    private func performClosedLoopEvaluation(checkpoints: [CheckpointDocument], agentID: UUID, definition: ClosedLoopProtocol) async {
+        let comparisonID = UUID()
+        do {
+            let snapshot = try await store.snapshot(), linked = try await store.checkpointIDs(for: agentID)
+            guard checkpoints.allSatisfy({ candidate in linked.contains(candidate.id) && snapshot.checkpoints.contains(where: { $0.matchesIdentity(of: candidate) }) }) else {
+                throw AstraError("evaluation.checkpoint", "A selected checkpoint is no longer linked to this agent or changed identity.")
+            }
+            var failed = 0
+            for (index, checkpoint) in checkpoints.enumerated() {
+                if cancelRequested { throw CancellationError() }
+                var document = ClosedLoopEvaluationDocument(comparisonID: comparisonID, agentID: agentID, checkpoint: checkpoint, protocolDefinition: definition)
+                let destination = artifact("Jobs", document.id)
+                try await store.saveClosedLoopEvaluation(document); await changed()
+                do {
+                    let payload: JSONValue = .object(["checkpointPath": .string(artifact("Models", checkpoint.id).path), "protocol": try definition.payload])
+                    try await LearningFiles.write(payload, to: destination.appendingPathComponent("configuration.json"), exclusive: true)
+                    closedLoopCheckpointName = checkpoint.name
+                    phase = "Practice evaluation \(index + 1) of \(checkpoints.count) · \(checkpoint.name)…"
+                    if process == nil { try await openProcess() }
+                    let response = try await job("evaluate.closedLoop", payload)
+                    try response.requireComplete()
+                    document.result = try response.result.decode(ClosedLoopResult.self).validated(protocol: definition, checkpointID: checkpoint.id, signature: checkpoint.policySignature)
+                    document.status = .completed; document.finishedAt = Date()
+                    _ = try document.validated()
+                    try await LearningFiles.write(response.result, to: destination.appendingPathComponent("results.json"), exclusive: true)
+                } catch {
+                    document.result = nil; document.finishedAt = Date()
+                    document.status = error is CancellationError ? .cancelled : .failed; document.issue = error.localizedDescription
+                    if document.status == .failed { failed += 1; failure = error.localizedDescription }
+                }
+                try await store.saveClosedLoopEvaluation(document)
+                let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .millisecondsSince1970
+                try await LearningFiles.write(try JSONDecoder().decode(JSONValue.self, from: encoder.encode(document)),
+                    to: destination.appendingPathComponent("evaluation.json"), exclusive: true)
+                await changed()
+                if document.status == .cancelled || cancelRequested { throw CancellationError() }
+                if processFailure != nil { break }
+            }
+            phase = failed == 0 ? "Practice evaluation complete" : "Practice evaluation complete · \(failed) need attention"
+        } catch is CancellationError { phase = "Practice evaluation stopped" }
+        catch { failure = error.localizedDescription; phase = "Practice evaluation needs attention" }
+        await finish()
     }
 }

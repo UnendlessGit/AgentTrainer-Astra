@@ -88,6 +88,7 @@ public struct LibrarySnapshot: Sendable {
     public var rewardPrograms: [RewardProgram] = []
     public var recordingSelections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
     public var evaluations: [EvaluationDocument] = []
+    public var closedLoopEvaluations: [ClosedLoopEvaluationDocument] = []
     public var pendingFeedback: [PendingFeedbackDocument] = []
     public var contextFields: [ContextFieldDocument] = []
 }
@@ -105,13 +106,16 @@ public enum DocumentNames {
 
 public actor LibraryStore {
     public nonisolated let root: URL
-    private let database: SQLiteDatabase
+    public nonisolated let layout: ArtifactStorageLayout
+    // Module-internal for same-actor artifact transaction extensions.
+    let database: SQLiteDatabase
     private var recoveryIssues: [LibraryIssue] = []
     private var inferenceIssues: [LibraryIssue] = []
 
     public init(root: URL) throws {
         self.root = root.standardizedFileURL
-        database = try SQLiteDatabase(url: self.root.appendingPathComponent("library.sqlite"))
+        let database = try SQLiteDatabase(url: self.root.appendingPathComponent("library.sqlite"))
+        self.database = database
         try database.transaction {
             try database.execute("CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL)")
             let versions = try database.query("SELECT version FROM schema_info")
@@ -139,9 +143,11 @@ public actor LibraryStore {
             try database.execute("CREATE TABLE IF NOT EXISTS agent_checkpoints (agent_id TEXT NOT NULL REFERENCES agents(id), checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id), PRIMARY KEY(agent_id,checkpoint_id))")
             try database.execute("CREATE TABLE IF NOT EXISTS control_history_acknowledgements (location TEXT NOT NULL, directory_name TEXT NOT NULL, run_id TEXT NOT NULL, fingerprint TEXT NOT NULL, operator_acknowledged_at REAL NOT NULL, PRIMARY KEY(location,directory_name,fingerprint))")
             try database.execute("CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
+            try database.execute("CREATE TABLE IF NOT EXISTS closed_loop_evaluations (id TEXT PRIMARY KEY, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS reward_programs (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS pending_feedback (id TEXT PRIMARY KEY, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS checkpoint_cleanup (checkpoint_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, issue TEXT)")
+            try database.execute("CREATE TABLE IF NOT EXISTS artifact_transfers (id TEXT PRIMARY KEY, operation TEXT NOT NULL, status TEXT NOT NULL, document BLOB NOT NULL, issue TEXT, created REAL NOT NULL)")
             if try database.query("SELECT key FROM settings WHERE key='checkpointLinksMigrated'").isEmpty {
                 // Materialize old creator ownership once; repeated migration
                 // must never reattach an explicitly removed creator link.
@@ -149,13 +155,33 @@ public actor LibraryStore {
                 try database.execute("INSERT INTO settings(key,value) VALUES('checkpointLinksMigrated',?)", [.blob(Data([1]))])
             }
         }
-        for folder in ["Recordings", "Models", "Datasets", "Jobs", "Caches", "Logs"] {
+        if let bytes = try database.query("SELECT value FROM settings WHERE key='artifactStorageLayout'").first?["value"]?.data {
+            guard bytes.count <= 32_768 else { throw AstraError("storage.layout", "The saved storage locations exceed their metadata limit.") }
+            let saved = try JSONDecoder().decode(ArtifactStorageLayout.self, from: bytes).validated()
+            guard saved.catalogRoot == self.root else { throw AstraError("storage.catalogMoved", "The catalog moved independently of its storage settings. Open it from its original location or import a portable archive.") }
+            layout = saved
+        } else {
+            let initial = try ArtifactStorageLayout.initial(catalogRoot: self.root)
+            for kind in ArtifactStorageKind.allCases {
+                try FileManager.default.createDirectory(at: initial.root(for: kind), withIntermediateDirectories: true)
+                try ArtifactTransferFiles.requireDirectory(initial.root(for: kind))
+                try ArtifactStorageMarker.create(layout: initial, kind: kind)
+            }
+            try ArtifactTransferFiles.sync(self.root)
+            try database.execute("INSERT INTO settings(key,value) VALUES('artifactStorageLayout',?)", [.blob(try JSONEncoder().encode(initial))])
+            layout = initial
+        }
+        for folder in ["Datasets", "Jobs", "Caches", "Logs"] {
             try FileManager.default.createDirectory(at: self.root.appendingPathComponent(folder), withIntermediateDirectories: true)
         }
     }
 
     public func snapshot() throws -> LibrarySnapshot {
         var issues = recoveryIssues + inferenceIssues
+        for kind in ArtifactStorageKind.allCases {
+            do { try layout.requireAvailable(kind) }
+            catch { issues.append(.init(id: "storage." + kind.rawValue, collection: "storage", message: error.localizedDescription)) }
+        }
         for row in try database.query("SELECT checkpoint_id,issue FROM checkpoint_cleanup") {
             issues.append(.init(id: (row["checkpoint_id"]?.string ?? "unknown") + ".cleanup", collection: "checkpoint cleanup",
                 message: row["issue"]?.string ?? "A previously requested checkpoint cleanup is unfinished. Retry it from Manage Checkpoints."))
@@ -188,6 +214,10 @@ public actor LibraryStore {
             do { return try value.validated() }
             catch { issues.append(.init(id: value.id.uuidString, collection: "evaluations", message: error.localizedDescription)); return nil }
         }
+        let closedLoop: [ClosedLoopEvaluationDocument] = try documents(table: "closed_loop_evaluations", issues: &issues).compactMap { (value: ClosedLoopEvaluationDocument) -> ClosedLoopEvaluationDocument? in
+            do { return try value.validated() }
+            catch { issues.append(.init(id: value.id.uuidString, collection: "closed-loop evaluations", message: error.localizedDescription)); return nil }
+        }
         let pendingFeedback: [PendingFeedbackDocument] = try documents(table: "pending_feedback", maximumBytes: PendingFeedbackDocument.maximumBytes, issues: &issues).compactMap { (value: PendingFeedbackDocument) -> PendingFeedbackDocument? in
             do { return try value.validated() }
             catch { issues.append(.init(id: value.id.uuidString, collection: "pending_feedback", message: error.localizedDescription)); return nil }
@@ -213,7 +243,7 @@ public actor LibraryStore {
                 }
             }
         }
-        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues, rewardPrograms: rewards, recordingSelections: selections, evaluations: evaluations, pendingFeedback: pendingFeedback, contextFields: contexts)
+        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues, rewardPrograms: rewards, recordingSelections: selections, evaluations: evaluations, closedLoopEvaluations: closedLoop, pendingFeedback: pendingFeedback, contextFields: contexts)
     }
 
     public func saveContexts(_ fields: [ContextFieldDocument], selectedIDs: [UUID], for agentID: UUID) throws {
@@ -312,6 +342,26 @@ public actor LibraryStore {
         ])
     }
 
+    public func saveClosedLoopEvaluation(_ document: ClosedLoopEvaluationDocument) throws {
+        let value = try document.validated(), encoded = try encode(document)
+        try database.transaction {
+            if let bytes = try database.query("SELECT document FROM closed_loop_evaluations WHERE id=?", [.text(value.id.uuidString)]).first?["document"]?.data {
+                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+                let previous = try decoder.decode(ClosedLoopEvaluationDocument.self, from: bytes).validated()
+                guard previous.comparisonID == value.comparisonID, previous.agentID == value.agentID,
+                      previous.checkpointID == value.checkpointID, previous.checkpointName == value.checkpointName,
+                      previous.checkpointPolicySignature == value.checkpointPolicySignature,
+                      previous.protocolDefinition == value.protocolDefinition,
+                      abs(previous.createdAt.timeIntervalSince(value.createdAt)) < 0.001,
+                      previous.status == .running || bytes == encoded else {
+                    throw AstraError("evaluation.immutable", "A saved practice evaluation or its protocol cannot be overwritten.")
+                }
+            }
+            try database.execute("INSERT INTO closed_loop_evaluations(id,document,created) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET document=excluded.document", [
+                .text(value.id.uuidString), .blob(encoded), .real(value.createdAt.timeIntervalSince1970)])
+        }
+    }
+
     public func saveCheckpoint(_ document: CheckpointDocument) throws {
         var value = try document.validated()
         try database.transaction {
@@ -356,6 +406,11 @@ public actor LibraryStore {
             evaluation.status = .interrupted; evaluation.finishedAt = Date()
             evaluation.issue = "The previous compute session ended before this evaluation finished. No partial score was published."
             try saveEvaluation(evaluation)
+        }
+        let closedLoop: [ClosedLoopEvaluationDocument] = try documents(table: "closed_loop_evaluations", issues: &issues)
+        for var value in closedLoop where value.status == .running {
+            value.status = .interrupted; value.finishedAt = Date(); value.issue = "Astra closed before this practice evaluation finished."
+            try saveClosedLoopEvaluation(value)
         }
     }
 
@@ -424,9 +479,9 @@ public actor LibraryStore {
     }
 
     public nonisolated func recordingDirectory(id: UUID) -> URL {
-        root.appendingPathComponent("Recordings", isDirectory: true)
-            .appendingPathComponent(id.uuidString + ".astrarecord", isDirectory: true)
+        layout.recordingDirectory(id: id)
     }
+    public nonisolated func checkpointDirectory(id: UUID) -> URL { layout.checkpointDirectory(id: id) }
 
     public func saveRecording(_ manifest: RecordingManifest, linkTo agentID: UUID? = nil) throws {
         let value = try manifest.validated()
@@ -448,7 +503,8 @@ public actor LibraryStore {
         var issues: [LibraryIssue] = []
         let documents: [RecordingManifest] = try documents(table: "recordings", includeArchived: true, issues: &issues)
         let catalog = Dictionary(uniqueKeysWithValues: documents.map { ($0.id, $0) })
-        let packages = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("Recordings"),
+        try layout.requireAvailable(.recordings)
+        let packages = try FileManager.default.contentsOfDirectory(at: layout.recordingsRoot,
                                                                  includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         var seen: Set<UUID> = []
         for directory in packages.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where directory.pathExtension == "astrarecord" {
@@ -559,7 +615,7 @@ public actor LibraryStore {
 
     public func checkpoint() throws { try database.checkpoint() }
 
-    private func documents<T: Decodable & Identifiable>(table: String, includeArchived: Bool = false, maximumBytes: Int? = nil, issues: inout [LibraryIssue]) throws -> [T] where T.ID == UUID {
+    func documents<T: Decodable & Identifiable>(table: String, includeArchived: Bool = false, maximumBytes: Int? = nil, issues: inout [LibraryIssue]) throws -> [T] where T.ID == UUID {
         // Table is selected exclusively by private call sites above.
         let projection = maximumBytes == nil ? "document" : "CASE WHEN typeof(document)='blob' AND length(document)<=? THEN document END AS document"
         let rows = try database.query("SELECT id,\(projection) FROM \(table) \(includeArchived ? "" : "WHERE archived=0") ORDER BY created DESC,id ASC", maximumBytes.map { [.integer(Int64($0))] } ?? [])
@@ -583,7 +639,7 @@ public actor LibraryStore {
         }
     }
 
-    private func encode<T: Encodable>(_ value: T) throws -> Data {
+    func encode<T: Encodable>(_ value: T) throws -> Data {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         encoder.dateEncodingStrategy = .millisecondsSince1970
         return try encoder.encode(value)
@@ -613,6 +669,7 @@ extension LibraryStore {
         let checkpoints: [CheckpointDocument] = try documents(table: "checkpoints", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
         let runs: [LearningRunDocument] = try documents(table: "learning_runs", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
         let evaluations: [EvaluationDocument] = try documents(table: "evaluations", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
+        let closedLoop: [ClosedLoopEvaluationDocument] = try documents(table: "closed_loop_evaluations", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
         let feedback: [PendingFeedbackDocument] = try documents(table: "pending_feedback", includeArchived: true, maximumBytes: PendingFeedbackDocument.maximumBytes, issues: &issues)
         let recordings: [RecordingManifest] = try documents(table: "recordings", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
         guard issues.isEmpty, agents.contains(where: { $0.id == agentID }) else {
@@ -622,6 +679,7 @@ extension LibraryStore {
         for value in checkpoints { _ = try value.validated() }
         for value in runs { _ = try value.validated() }
         for value in evaluations { _ = try value.validated() }
+        for value in closedLoop { _ = try value.validated() }
         for value in feedback { _ = try value.validated() }
         for value in recordings { _ = try value.validated() }
         let byID = Dictionary(uniqueKeysWithValues: checkpoints.map { ($0.id, $0) })
@@ -651,6 +709,7 @@ extension LibraryStore {
             protected[value.checkpointID] = "Used by active evaluation"
             protected[value.protocolDefinition.sourceCheckpointID] = "Supplies an active evaluation protocol"
         }
+        for value in closedLoop where value.status == .running { protected[value.checkpointID] = "Used by active closed-loop evaluation" }
         for id in activeCheckpointIDs { protected[id] = "Retained by an active workflow" }
         let linked = checkpoints.filter { owners[$0.id]?.contains(agentID) == true }
             .sorted { $0.createdAt == $1.createdAt ? $0.id.uuidString < $1.id.uuidString : $0.createdAt > $1.createdAt }
@@ -679,7 +738,7 @@ extension LibraryStore {
         let chosen = candidates.prefix(256)
         let items = try chosen.map { value, disposition, retained in
             CheckpointCleanupItem(checkpoint: value, disposition: disposition, retainedByAgents: retained,
-                bytes: disposition == .unlinkShared ? 0 : try CheckpointArtifactFiles.bytes(root: root, id: value.id))
+                bytes: disposition == .unlinkShared ? 0 : try CheckpointArtifactFiles.bytes(modelsRoot: layout.modelsRoot, id: value.id))
         }
         return .init(agentID: agentID, keepNewest: keepNewest, items: items, protected: protected,
             remainingCandidates: max(0, candidates.count - items.count))
@@ -707,8 +766,8 @@ extension LibraryStore {
             do {
                 // This synchronous actor segment admits no new catalog owner.
                 // Recheck filesystem shape; no symlink is followed for cleanup.
-                _ = try CheckpointArtifactFiles.bytes(root: root, id: item.id)
-                let directory = try CheckpointArtifactFiles.directory(root: root, id: item.id)
+                _ = try CheckpointArtifactFiles.bytes(modelsRoot: layout.modelsRoot, id: item.id)
+                let directory = try CheckpointArtifactFiles.directory(modelsRoot: layout.modelsRoot, id: item.id)
                 if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
                 try database.execute("DELETE FROM checkpoint_cleanup WHERE checkpoint_id=?", [.text(item.id.uuidString)])
                 deleted += 1

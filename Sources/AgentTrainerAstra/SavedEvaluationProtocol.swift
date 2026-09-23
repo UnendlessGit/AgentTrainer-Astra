@@ -4,7 +4,7 @@ import AstraCore
 enum SavedEvaluationProtocol {
     /// Resolve once for the whole comparison. Candidate checkpoints never choose
     /// their own demonstrations, splits, or canonicalization configuration.
-    static func resolve(checkpoint: CheckpointDocument, root: URL, split: String) async throws -> EvaluationProtocol {
+    static func resolve(checkpoint: CheckpointDocument, root: URL, split: String, layout: ArtifactStorageLayout? = nil) async throws -> EvaluationProtocol {
         guard let runID = checkpoint.runID else {
             throw AstraError("evaluation.dataset", "Choose a checkpoint with a saved demonstration dataset.")
         }
@@ -14,8 +14,9 @@ enum SavedEvaluationProtocol {
               source.fields?["operation"] == .string("train.behavioral") else {
             throw AstraError("evaluation.sourceIdentity", "The saved demonstration configuration belongs to another run or has no behavioral dataset.")
         }
-        let dataset = try source.required("dataset")
-        let manifest = try await LearningFiles.read(root.appendingPathComponent("Models/\(checkpoint.id.uuidString.lowercased())/manifest.json"))
+        let layout = layout ?? .defaults(catalogRoot: root)
+        let manifest = try await LearningFiles.read(layout.modelsRoot.appendingPathComponent("\(checkpoint.id.uuidString.lowercased())/manifest.json"))
+        let dataset = try SavedArtifactLocations.dataset(source.required("dataset"), checkpointManifest: manifest, layout: layout)
         guard manifest.fields?["id"]?.text.flatMap(UUID.init(uuidString:)) == checkpoint.id,
               manifest.fields?["policySignature"]?.text == checkpoint.policySignature else {
             throw AstraError("evaluation.sourceCheckpoint", "The source checkpoint no longer matches its saved catalog identity.")

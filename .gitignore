@@ -29,3 +29,15 @@ recordings/
 checkpoints/
 datasets/
 legacy-snapshot/
+*.astraarchive/
+*.astrarecord/
+*.astraframes
+*.astraring
+*.safetensors
+.astra-storage.json
+/Recordings/
+/Models/
+/Datasets/
+/Jobs/
+/DesktopRuns/
+/ReviewedExperience/

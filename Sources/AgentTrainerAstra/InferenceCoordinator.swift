@@ -245,6 +245,7 @@ struct InferencePolicyDetails: Sendable {
             throw AstraError("inference.options", "Choose a supported environment and valid inference settings.")
         }
         _ = try source.captureBindings()
+        try store.layout.requireAvailable(.models)
         let run = UUID()
         correctionBuffer.clear(); correctionSource = source; correctionCheckpoint = checkpoint; correctionAgentID = agent.id
         correctionContexts = options.contextIDs; correctionContextValues = [:]; controlJoinedAtNanos = nil
@@ -372,7 +373,7 @@ struct InferencePolicyDetails: Sendable {
             // interrupts this session's owned task and joins its mapped leases.
             self.actor = actor
             let selected = PolicyActorCheckpoint(document: checkpoint,
-                directory: root.appendingPathComponent("Models").appendingPathComponent(checkpoint.id.uuidString.lowercased()))
+                directory: store.checkpointDirectory(id: checkpoint.id))
             let ready = try await actor.prepare(checkpoint: selected, collection: collectionSink != nil,
                 deterministic: options.deterministic, mode: .fresh(seed: UInt64(options.seed)))
             try checkRunning()

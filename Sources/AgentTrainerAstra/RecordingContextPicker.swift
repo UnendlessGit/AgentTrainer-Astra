@@ -30,8 +30,7 @@ struct RecordingContextPicker: View {
                     guard let checkpoint = checkpoints.first(where: { $0.id == checkpointID }) else {
                         throw AstraError("context.checkpoint", "The selected checkpoint is no longer linked to this agent.")
                     }
-                    let manifest = try await LearningFiles.read(workspace.supportRoot.appendingPathComponent("Models")
-                        .appendingPathComponent(checkpointID.uuidString.lowercased()).appendingPathComponent("manifest.json"))
+                    let manifest = try await LearningFiles.read(workspace.checkpointDirectory(checkpointID).appendingPathComponent("manifest.json"))
                     guard manifest.fields?["id"]?.uuid == checkpointID,
                           manifest.fields?["policySignature"]?.text == checkpoint.policySignature else {
                         throw AstraError("context.checkpoint", "The saved context vocabulary does not match this checkpoint.")
