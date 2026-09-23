@@ -52,13 +52,13 @@ struct InferenceDependencies: Sendable {
                 try await process.request(kind: kind, payload: payload, runID: run, timeout: timeout, acceptingError: acceptingError)
             }, shutdown: { await process.shutdown(); return await process.terminationStatus() })
         }, capture: { source in
-            let capture = ScreenCapture()
+            let capture = ScreenCaptureGroup()
             return InferenceCapture(start: { onFrame, onHealth in
                 try await capture.start(source: source, fps: 30, showsCursor: false, onFrame: { frame in
                     let metadata = FrameMetadata(id: frame.id, eventNanos: frame.eventNanos, observedNanos: frame.observedNanos,
                         surface: frame.surface, byteCount: frame.surface.pixelWidth * frame.surface.pixelHeight * 4, codec: "raw")
                     onFrame(InferenceImage(metadata: metadata, pixels: { try frame.copyCompactPixels() }, coverage: frame.coverage))
-                }, onHealth: onHealth)
+                }, onHealth: { _, health in onHealth(health) })
             }, stop: { await capture.stop() })
         }, activate: { source in
             if let pid = source.applicationPID {
@@ -78,20 +78,30 @@ struct InferenceDependencies: Sendable {
     }
 }
 
-/// The producer replaces one retained frame synchronously on the capture queue.
-/// No per-frame Task, compressed archive or UI actor queue retains SCK buffers.
+/// Capture retains one frame per ordered source role. Reading a group is atomic;
+/// partial startup never becomes a smaller observation with different slot meaning.
 final class InferenceFrameInbox: @unchecked Sendable {
     private let lock = NSLock()
-    private var latest: InferenceImage?
+    private var latest: [String: InferenceImage] = [:]
+    private var sourceIDs: [String]
     private var issue: String?
     private var closed = false
+    init(sourceIDs: [String] = []) {
+        self.sourceIDs = sourceIDs
+        if sourceIDs.count > 16 || Set(sourceIDs).count != sourceIDs.count { issue = "Invalid capture source membership." }
+    }
     func receive(_ image: InferenceImage) {
         lock.withLock {
             guard !closed else { return }
-            if let latest, image.metadata.observedNanos < latest.metadata.observedNanos {
+            let id = image.metadata.surface.id
+            // Unbound legacy fixtures acquire one source; production supplies
+            // the full fixed group before starting any streams.
+            if sourceIDs.isEmpty { sourceIDs = [id] }
+            guard sourceIDs.contains(id) else { issue = "Capture returned an unexpected source."; return }
+            if let previous = latest[id], image.metadata.observedNanos < previous.metadata.observedNanos {
                 issue = "Capture observation time moved backwards."; return
             }
-            latest = image
+            latest[id] = image
         }
     }
     func health(_ value: CaptureHealth) {
@@ -101,28 +111,35 @@ final class InferenceFrameInbox: @unchecked Sendable {
             case .unavailable(let message): issue = message
             case .stopped: issue = "The capture stream stopped unexpectedly."
             case .coverage(let evidence):
-                guard var latest else { issue = "Capture coverage arrived without its source frame."; return }
+                let id = evidence.surface.id
+                guard var frame = latest[id] else { issue = "Capture coverage arrived without its source frame."; return }
                 do {
-                    try evidence.validated(frame: latest.metadata, cutoffNanos: evidence.verifiedAtNanos)
-                    if let previous = latest.coverage {
+                    try evidence.validated(frame: frame.metadata, cutoffNanos: evidence.verifiedAtNanos)
+                    if let previous = frame.coverage {
                         guard previous.streamID == evidence.streamID, evidence.throughNanos >= previous.throughNanos,
                               evidence.verifiedAtNanos >= previous.verifiedAtNanos else {
                             throw AstraError("capture.coverageOrder", "Capture coverage changed stream or moved backwards.")
                         }
                     }
-                    latest.coverage = evidence; self.latest = latest
+                    frame.coverage = evidence; latest[id] = frame
                 } catch { issue = error.localizedDescription }
             default: break
             }
         }
     }
-    func read() throws -> InferenceImage? {
+    func readAll() throws -> [InferenceImage]? {
         try lock.withLock {
             if let issue { throw AstraError("inference.capture", issue) }
-            return latest
+            guard !closed, !sourceIDs.isEmpty, latest.count == sourceIDs.count else { return nil }
+            return sourceIDs.compactMap { latest[$0] }
         }
     }
-    func close() { lock.withLock { closed = true; latest = nil } }
+    func read() throws -> InferenceImage? {
+        guard let frames = try readAll() else { return nil }
+        guard frames.count == 1 else { throw AstraError("inference.sourceGroup", "This operation requires the complete source group.") }
+        return frames[0]
+    }
+    func close() { lock.withLock { closed = true; latest.removeAll() } }
 }
 
 struct InferencePolicyDetails: Sendable {
@@ -188,6 +205,31 @@ struct InferencePolicyDetails: Sendable {
     private var collectionSink: InferenceCollectionSink?
     private var collectionFault: InferenceCollectionFault?
     private var collectionNextSequence: UInt64 = 0
+    private let correctionBuffer = InferenceCorrectionBuffer()
+    private var correctionSource: CaptureSource?
+    private var correctionCheckpoint: CheckpointDocument?
+    private var correctionAgentID: UUID?
+    private var correctionContexts: [Int] = []
+    private var correctionContextValues: [UUID: UUID] = [:]
+    private var controlJoinedAtNanos: UInt64?
+    var retainedCorrectionCheckpointID: UUID? { correctionSource == nil ? nil : correctionCheckpoint?.id }
+    var correctionOwnerID: UUID? { correctionAgentID }
+    var canRecordCorrection: Bool { !isBusy && cleanupConfirmed && producedPackets > 0 && controlJoinedAtNanos != nil && correctionSource != nil }
+
+    func prepareCorrection(for requestingAgentID: UUID, requestedAtNanos: UInt64) async throws -> InferenceCorrection {
+        guard correctionAgentID == requestingAgentID else { throw AstraError("correction.agent", "Open the agent that produced this run to record its correction.") }
+        await stopAndWait()
+        guard canRecordCorrection, let source = correctionSource, let checkpoint = correctionCheckpoint,
+              let agentID = correctionAgentID, let runID, let joined = controlJoinedAtNanos else {
+            throw AstraError("correction.cleanup", "Finish the agent run with confirmed control release before recording a correction.")
+        }
+        let seed = CorrectionRecordingSeed(sourceRunID: runID, sourceCheckpointID: checkpoint.id,
+            sourcePolicySignature: checkpoint.policySignature, contextIDs: correctionContexts,
+            requestedAtNanos: requestedAtNanos, controlJoinedAtNanos: joined,
+            observations: correctionBuffer.snapshot(through: min(requestedAtNanos, joined)))
+        return .init(agentID: agentID, checkpoint: checkpoint, source: source, seed: seed, contextValues: correctionContextValues)
+    }
+    func discardCorrectionHistory() { correctionBuffer.clear(); correctionSource = nil; correctionCheckpoint = nil; correctionAgentID = nil }
 
     init(store: LibraryStore, root: URL, bundle: Bundle = .main, dependencies: InferenceDependencies? = nil) {
         self.store = store; self.root = root; self.dependencies = dependencies ?? .live(bundle: bundle)
@@ -199,10 +241,13 @@ struct InferencePolicyDetails: Sendable {
         guard dependencies.controlOwner.priorCleanupJoined else { throw AstraError("inference.previousControl", "The previous control owner has not joined confirmed cleanup. Resolve its cleanup warning before starting another run.") }
         guard collection == nil || !options.deterministic else { throw AstraError("inference.collectionMode", "Reinforcement collection requires categorical policy sampling.") }
         guard options.seed >= 0, options.seed <= 1_000_000_000, options.contextIDs.count <= 32,
-              options.contextIDs.allSatisfy({ $0 >= 0 && $0 < 65_536 }), [.window, .display].contains(source.kind) else {
+              options.contextIDs.allSatisfy({ $0 >= 0 && $0 < 65_536 }) else {
             throw AstraError("inference.options", "Choose a supported environment and valid inference settings.")
         }
+        _ = try source.captureBindings()
         let run = UUID()
+        correctionBuffer.clear(); correctionSource = source; correctionCheckpoint = checkpoint; correctionAgentID = agent.id
+        correctionContexts = options.contextIDs; correctionContextValues = [:]; controlJoinedAtNanos = nil
         isBusy = true; isStopping = false; activeAgentID = agent.id; runID = run; stopRequested = false; userOrInterventionStop = false
         failure = nil; stopReason = nil; phase = "Opening the local policy…"; decisions = 0; producedPackets = 0; executedPackets = 0
         lastLatencyMS = nil; maximumLatencyMS = nil; warmupLatencyMS = []; policy = nil; resultsURL = nil
@@ -312,15 +357,17 @@ struct InferencePolicyDetails: Sendable {
                 "seed": .integer(Int64(options.seed)), "contextIDs": .array(options.contextIDs.map { .integer(Int64($0)) }),
                 "startedAt": .string(startedAt.ISO8601Format())]), to: directory.appendingPathComponent("configuration.json"), exclusive: true)
             try checkRunning()
-            let inbox = InferenceFrameInbox(); self.inbox = inbox
+            let inbox = InferenceFrameInbox(sourceIDs: try source.captureBindings().map(\.id)); self.inbox = inbox
             let capture = dependencies.capture(source); self.capture = capture
             phase = "Observing the environment…"
             try await capture.start({ inbox.receive($0) }, { inbox.health($0) })
-            let first = try await waitForFrame(inbox)
-            let initialSurface = try first.metadata.surface.validated()
+            let first = try await waitForFrames(inbox)
+            let initialSurfaces = try first.map { try $0.metadata.surface.validated() }
+            let initialSurface = initialSurfaces[0]
+            let geometryRevision = initialSurfaces.count == 1 ? initialSurface.geometryRevision : 0
             try checkRunning()
             let actor = PolicyActorSession(runID: run, ringURL: directory.appendingPathComponent("frames.astraring"),
-                slotCapacity: first.metadata.byteCount, runtime: makeActorRuntime(run: run))
+                slotCapacity: first[0].metadata.byteCount, slotCapacities: first.map(\.metadata.byteCount), runtime: makeActorRuntime(run: run))
             // Publish ownership before preparation can suspend. Stop explicitly
             // interrupts this session's owned task and joins its mapped leases.
             self.actor = actor
@@ -332,6 +379,12 @@ struct InferencePolicyDetails: Sendable {
             guard let details = await actor.policy else { throw AstraError("inference.policy", "The actor did not prepare its policy.") }
             try checkRunning()
             policy = details
+            if let model = ready.payload.fields?["model"], let vocabulary = try ContextVocabulary.from(model: model) {
+                for (field, index) in zip(vocabulary.fields, options.contextIDs) where index > 0 {
+                    guard field.values.indices.contains(index - 1) else { throw AstraError("correction.context", "The run's named context value is unavailable.") }
+                    correctionContextValues[field.id] = field.values[index - 1].id
+                }
+            }
             if let collectionSink { try collectionSink.offer(.prepared(runID: run, actor: ready.payload)) }
             phase = "Warming the local policy…"
             // Warmup runs the actual mapped image/preprocessing/policy/decoder
@@ -345,16 +398,16 @@ struct InferencePolicyDetails: Sendable {
                                         y: initialSurface.globalBounds.y + initialSurface.globalBounds.height / 2)
             for index in 0..<3 {
                 try checkRunning()
-                guard let frame = try inbox.read(), frame.metadata.surface == initialSurface else {
+                guard let frames = try inbox.readAll(), frames.map(\.metadata.surface) == initialSurfaces else {
                     throw AstraError("inference.geometryChanged", "The environment changed while warming the policy. Choose it again and restart.")
                 }
                 let cutoff = MonotonicClock.now
-                guard frame.metadata.observedNanos <= cutoff else { throw AstraError("inference.causality", "Capture returned an image from a future observation.") }
+                guard frames.allSatisfy({ $0.metadata.observedNanos <= cutoff }) else { throw AstraError("inference.causality", "Capture returned an image from a future observation.") }
                 warmState.observedNanos = cutoff
                 let begin = MonotonicClock.now
                 let observation = ControlObservation(controlState: warmState, executedEvents: [], intervalCovered: true,
                     cutoffNanos: cutoff, lastSequence: nil)
-                _ = try await actor.warmup(.init(frame: frame, controls: observation))
+                _ = try await actor.warmup(.init(frames: frames, geometryRevision: geometryRevision, controls: observation))
                 try checkRunning()
                 let elapsed = Double(MonotonicClock.now - begin) / 1_000_000
                 warmupLatencyMS.append(elapsed)
@@ -380,11 +433,11 @@ struct InferencePolicyDetails: Sendable {
                 }
             } else { try dependencies.activate(source) }
             countdown = nil
-            guard let fresh = try inbox.read(), fresh.metadata.surface == initialSurface else {
+            guard let fresh = try inbox.readAll(), fresh.map(\.metadata.surface) == initialSurfaces else {
                 throw AstraError("inference.geometryChanged", "The environment changed size or position while preparing. Choose it again and restart.")
             }
-            let scope = ControlScope(surfaces: [initialSurface], applicationPID: source.applicationPID, windowID: source.windowID,
-                                     wholeDesktop: false, stopOnPhysicalInput: true, geometryRevision: initialSurface.geometryRevision)
+            let scope = ControlScope(surfaces: initialSurfaces, applicationPID: source.applicationPID, windowID: source.windowID,
+                                     wholeDesktop: source.kind == .desktop, stopOnPhysicalInput: true, geometryRevision: geometryRevision)
             try checkRunning()
             let configuration = try NativeControlConfiguration(runID: run, scope: scope, capabilities: details.capabilities,
                 packetCapacity: details.capacity, recoveryDirectory: directory)
@@ -400,23 +453,24 @@ struct InferencePolicyDetails: Sendable {
                 try checkRunning()
                 // Select the image first, then obtain an atomic input cutoff.
                 // A newer image never enters an earlier control observation.
-                guard let image = try inbox.read() else { throw AstraError("inference.capture", "The capture stream has no current frame.") }
-                guard image.metadata.surface == initialSurface else {
+                guard let images = try inbox.readAll() else { throw AstraError("inference.capture", "The capture stream has no current frame.") }
+                guard images.map(\.metadata.surface) == initialSurfaces else {
                     throw AstraError("inference.geometryChanged", "The environment changed size or position. Select the environment again before restarting.")
                 }
                 let observed = try await observation(control, after: lastEventSequence)
                 try checkRunning()
                 let begin = MonotonicClock.now
-                let sink = collectionSink
-                let ticket = try await actor.beginPrediction(.init(frame: image, controls: observed), onObservation: { owned in
+                let sink = collectionSink, correctionBuffer = correctionBuffer
+                let ticket = try await actor.beginPrediction(.init(frames: images, geometryRevision: geometryRevision, controls: observed), onObservation: { owned in
                     // This bounded offer completes before sampling and retains
                     // the exact CPU copy published by the actor session.
-                    if let sink { try sink.offer(.observation(try owned.singleSource())) }
+                    if let sink { try sink.offer(.observation(owned.collected())) }
+                    correctionBuffer.append(owned)
                 })
                 let result = try await ticket.value()
                 producedPackets = result.packet.sequence + 1
                 try checkRunning()
-                guard let current = try inbox.read(), current.metadata.surface == initialSurface else {
+                guard let current = try inbox.readAll(), current.map(\.metadata.surface) == initialSurfaces else {
                     throw AstraError("inference.geometryChanged", "The environment changed while the policy was deciding. Select it again before restarting.")
                 }
                 let packet = result.packet
@@ -476,15 +530,17 @@ struct InferencePolicyDetails: Sendable {
             : "Agent stopped · needs attention"
     }
 
-    private func waitForFrame(_ inbox: InferenceFrameInbox) async throws -> InferenceImage {
+    private func waitForFrames(_ inbox: InferenceFrameInbox) async throws -> [InferenceImage] {
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         while ContinuousClock.now < deadline {
             try checkRunning()
-            if let image = try inbox.read() {
-                _ = try image.metadata.validated()
-                guard image.metadata.eventNanos <= image.metadata.observedNanos,
-                      image.metadata.observedNanos <= MonotonicClock.now else { throw AstraError("inference.causality", "Capture returned an invalid image timestamp.") }
-                return image
+            if let images = try inbox.readAll() {
+                for image in images {
+                    _ = try image.metadata.validated()
+                    guard image.metadata.eventNanos <= image.metadata.observedNanos,
+                          image.metadata.observedNanos <= MonotonicClock.now else { throw AstraError("inference.causality", "Capture returned an invalid image timestamp.") }
+                }
+                return images
             }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -564,6 +620,7 @@ struct InferencePolicyDetails: Sendable {
             let message = "The control helper exited before input cleanup could be confirmed. Release any held controls manually before starting another run."
             if failure?.contains("input cleanup could be confirmed") != true { failure = [failure, message].compactMap { $0 }.joined(separator: "\n") }
         }
+        if cleanupConfirmed { controlJoinedAtNanos = MonotonicClock.now }
         self.control = nil
         inbox?.close()
         await capture?.stop(); capture = nil; inbox = nil

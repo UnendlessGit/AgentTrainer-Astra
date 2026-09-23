@@ -35,3 +35,32 @@ import AstraPlatform
     inbox.health(.coverage(initial))
     #expect(throws: AstraError.self) { try inbox.read() }
 }
+
+@Test func sourceGroupWaitsForAllRolesAndAdvancesCoverageIndependently() throws {
+    let inbox = InferenceFrameInbox(sourceIDs: ["left", "right"])
+    func image(_ id: String, observed: UInt64, value: UInt8) throws -> InferenceImage {
+        let metadata = FrameMetadata(eventNanos: observed - 1, observedNanos: observed,
+            surface: SurfaceDescriptor(id: id, globalBounds: .init(x: 0, y: 0, width: 2, height: 2),
+                pixelWidth: 2, pixelHeight: 2), byteCount: 16, codec: "raw")
+        return .init(metadata: metadata, pixels: { Data(repeating: value, count: 16) },
+                     coverage: try CaptureFrameCoverage(streamID: UUID(), frame: metadata))
+    }
+    let left = try image("left", observed: 110, value: 1), right = try image("right", observed: 100, value: 2)
+    inbox.receive(left)
+    #expect(try inbox.readAll() == nil)
+    inbox.receive(right) // Independent arrival clocks must not be compared across sources.
+    let before = try #require(try inbox.readAll())
+    #expect(before.map(\.metadata.id) == [left.metadata.id, right.metadata.id])
+    #expect(throws: AstraError.self) { try inbox.read() }
+    let initial = try #require(right.coverage)
+    let continued = try initial.verifyingUnchanged(streamID: initial.streamID, surface: right.metadata.surface,
+        throughNanos: 200, verifiedAtNanos: 210)
+    inbox.health(.coverage(continued))
+    let after = try #require(try inbox.readAll())
+    #expect(after[0].coverage == left.coverage)
+    #expect(after[1].coverage == continued)
+    #expect(after.map(\.metadata.id) == before.map(\.metadata.id))
+    #expect(try after[1].pixels() == Data(repeating: 2, count: 16))
+    inbox.receive(try image("foreign", observed: 220, value: 3))
+    #expect(throws: AstraError.self) { try inbox.readAll() }
+}

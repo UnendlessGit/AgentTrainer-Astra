@@ -2,6 +2,7 @@ import Foundation
 import AstraCore
 
 struct DesktopLearningOptions: Sendable {
+    var contextVocabulary = ContextVocabulary.empty
     var initialCheckpointID: UUID?
     var resume = false
     var iterations = 20
@@ -11,8 +12,14 @@ struct DesktopLearningOptions: Sendable {
     var actions = ActionCapabilities(mouseButtons: [0], absolutePointer: true)
     var contextIDs: [Int] = []
     var training = ReinforcementSettings()
+    var surfaceBindings: [String: String] = [:]
 
     func validated() throws -> Self {
+        _ = try contextVocabulary.validated()
+        guard surfaceBindings.count <= 16, surfaceBindings.allSatisfy({ !$0.key.isEmpty && $0.key.utf8.count <= 256
+            && !$0.value.isEmpty && $0.value.utf8.count <= 256 }) else {
+            throw AstraError("desktop.surfaceBindings", "The reward source selections are invalid.")
+        }
         guard (1...100_000).contains(iterations), !resume || initialCheckpointID != nil else {
             throw AstraError("desktop.options", "Choose an iteration target and a saved desktop checkpoint when resuming.")
         }
@@ -26,8 +33,8 @@ struct DesktopLearningOptions: Sendable {
         return self
     }
     var model: JSONValue {
-        .object(["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
-                 "packet_capacity": .integer(Int64(packetCapacity))])
+        contextVocabulary.applying(to: .object(["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
+                 "packet_capacity": .integer(Int64(packetCapacity))]))
     }
 }
 

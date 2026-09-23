@@ -332,19 +332,22 @@ private final class Fixture {
         recording.frameCount = 1; recording.storedBytes = 4; recording.firstObservedNanos = 1_000_000_000
         recording.stoppedNanos = 5_000_000_000; recording.status = .complete
         try await library.saveRecording(recording, linkTo: agent.id)
-        let selection = RecordingTrainingSelection(ranges: [.init(startNanos: 1_000_000_000, endNanos: 2_000_000_000), .init(startNanos: 3_000_000_000, endNanos: 4_000_000_000)])
+        let field = ContextFieldDocument(name: "Task", values: [.init(name: "Inspect")])
+        let vocabulary = ContextVocabulary(fields: [field])
+        let selection = RecordingTrainingSelection(ranges: [.init(startNanos: 1_000_000_000, endNanos: 2_000_000_000), .init(startNanos: 3_000_000_000, endNanos: 4_000_000_000)], contextValues: [field.id: field.values[0].id])
         try await library.saveRecordingSelection(selection, recordingID: recording.id, agentID: agent.id)
         let coordinator = LearningCoordinator(store: library, root: fixture.root, bundle: fixture.bundle, changed: {})
-        var options = BehaviorOptions(); options.recordingIDs = [recording.id]
+        var options = BehaviorOptions(); options.recordingIDs = [recording.id]; options.contextVocabulary = vocabulary
         try coordinator.start(agent: agent, options: options, recordings: [recording], selections: [recording.id: selection])
         try await library.saveRecordingSelection(.whole, recordingID: recording.id, agentID: agent.id)
         try await waitUntil { (coordinator.activeRun?.updates ?? 0) > 0 || !coordinator.isBusy }
         await coordinator.stopAndWait()
         #expect(coordinator.failure == nil)
         let run = try #require(coordinator.activeRun), checkpointID = try #require(run.checkpointID)
-        let expected: JSONValue = .array([try selection.payload(recordingID: recording.id)])
+        let expected: JSONValue = .array([try selection.payload(recordingID: recording.id, vocabulary: vocabulary)])
         let configuration = try await LearningFiles.read(fixture.root.appendingPathComponent("Jobs/\(run.id.uuidString.lowercased())/configuration.json"))
         #expect(configuration.fields?["sourceSelections"] == expected)
+        #expect(try ContextVocabulary.from(model: configuration.required("model")) == vocabulary)
         let requests = try String(contentsOf: fixture.log, encoding: .utf8).split(separator: "\n").map { try JSONDecoder().decode(WireMessage.self, from: Data($0.utf8)) }
         #expect(requests.first { $0.kind == "dataset.prepare" }?.payload.fields?["selections"] == expected)
         try await library.unlinkRecording(recording.id, from: agent.id)

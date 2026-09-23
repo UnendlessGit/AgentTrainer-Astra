@@ -44,11 +44,13 @@ struct InputScopeSnapshot: Equatable, Sendable {
     let frontmostPID: Int32?
     let applicationLaunchDate: Date?
     let windows: [Window]
+    let displays: [UInt32: Rect2D]?
 
     init(observedNanos: UInt64, frontmostPID: Int32?, applicationLaunchDate: Date?, windows: [Window],
-         samplingBeganNanos: UInt64? = nil) {
+         samplingBeganNanos: UInt64? = nil, displays: [UInt32: Rect2D]? = nil) {
         self.observedNanos = observedNanos; self.samplingBeganNanos = samplingBeganNanos ?? observedNanos
         self.frontmostPID = frontmostPID; self.applicationLaunchDate = applicationLaunchDate; self.windows = windows
+        self.displays = displays
     }
 
     static func current(for source: CaptureSource) throws -> Self {
@@ -68,8 +70,13 @@ struct InputScopeSnapshot: Equatable, Sendable {
         }
         let afterPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let launchDate = source.applicationPID.flatMap { NSRunningApplication(processIdentifier: $0)?.launchDate }
+        var displayIDs = [CGDirectDisplayID](repeating: 0, count: 32), displayCount: UInt32 = 0
+        guard CGGetActiveDisplayList(UInt32(displayIDs.count), &displayIDs, &displayCount) == .success, displayCount <= 16 else {
+            throw AstraError("input.displayTopology", "The active display topology could not be verified.")
+        }
+        let displays = Dictionary(uniqueKeysWithValues: displayIDs.prefix(Int(displayCount)).map { ($0, Rect2D(CGDisplayBounds($0))) })
         return Self(observedNanos: MonotonicClock.now, frontmostPID: beforePID == afterPID ? afterPID : nil,
-                    applicationLaunchDate: launchDate, windows: windows, samplingBeganNanos: began)
+                    applicationLaunchDate: launchDate, windows: windows, samplingBeganNanos: began, displays: displays)
     }
 
     var frontmostNormalWindow: Window? {
@@ -79,6 +86,7 @@ struct InputScopeSnapshot: Equatable, Sendable {
     }
 
     func verifyTarget(_ source: CaptureSource) throws {
+        if source.bindings != nil { try verifyBindings(source) }
         if source.kind == .window || source.kind == .application {
             guard let pid = source.applicationPID, pid > 0, frontmostPID == pid,
                   source.applicationLaunchDate == nil || source.applicationLaunchDate == applicationLaunchDate else {
@@ -101,9 +109,55 @@ struct InputScopeSnapshot: Equatable, Sendable {
         }
     }
 
+    /// Membership and geometry verification does not require focus, so capture
+    /// can perform it independently while the input/control owners check focus.
+    func verifyBindings(_ source: CaptureSource) throws {
+        let bindings = try source.captureBindings()
+        for binding in bindings {
+            if binding.kind == .window {
+                guard let window = windows.first(where: { $0.id == binding.windowID }),
+                      window.pid == binding.applicationPID, window.bounds == binding.bounds else {
+                    throw AstraError("capture.bindingChanged", "A bound window moved, resized or disappeared. Choose the source again.")
+                }
+            } else if let displays {
+                guard let id = binding.displayID, displays[id] == binding.bounds else {
+                    throw AstraError("capture.bindingChanged", "A bound display disconnected or changed geometry. Choose the source again.")
+                }
+            }
+        }
+        if source.kind == .application {
+            guard source.applicationLaunchDate == nil || source.applicationLaunchDate == applicationLaunchDate,
+                  Set(windows.filter { $0.pid == source.applicationPID && $0.layer == 0 && $0.bounds.width > 1 && $0.bounds.height > 1 }.map(\.id))
+                    == Set(bindings.compactMap(\.windowID)) else {
+                throw AstraError("capture.applicationTopology", "The application's window set changed. Choose its current windows again.")
+            }
+        } else if source.kind == .desktop, let displays {
+            guard Set(displays.keys) == Set(bindings.compactMap(\.displayID)) else {
+                throw AstraError("capture.desktopTopology", "The desktop display set changed. Choose the desktop again.")
+            }
+        }
+    }
+
+    func routedSurfaceID(_ event: RawInputEvent, handlingWindowID: UInt32?, source: CaptureSource) throws -> String? {
+        guard [.pointer, .buttonDown, .buttonUp, .scroll].contains(event.kind),
+              let x = event.x, let y = event.y else { return nil }
+        let point = Point2D(x: x, y: y), bindings = try source.captureBindings()
+        if let handlingWindowID, bindings.contains(where: { $0.kind == .window }) {
+            return bindings.first { $0.windowID == handlingWindowID && Self.contains($0.bounds, point) }?.id
+        }
+        let candidates = bindings.filter { Self.contains($0.bounds, point) }
+        return candidates.count == 1 ? candidates[0].id : nil
+    }
+
     func verify(_ event: RawInputEvent, targetPID: Int32?, handlingWindowID: UInt32? = nil, source: CaptureSource) throws {
         guard event.origin == .physical else { return }
-        if source.kind == .desktop { return }
+        if source.kind == .desktop {
+            if [.pointer, .buttonDown, .buttonUp, .scroll].contains(event.kind), let x = event.x, let y = event.y,
+               let bindings = source.bindings, !bindings.contains(where: { Self.contains($0.bounds, .init(x: x, y: y)) }) {
+                throw Self.pointerBoundary()
+            }
+            return
+        }
         if source.kind == .window || source.kind == .application {
             if let targetPID, targetPID > 0, targetPID != source.applicationPID {
                 throw AstraError("input.eventTarget", "macOS routed an input event to another application. It was excluded from the demonstration.")
@@ -137,7 +191,8 @@ struct InputScopeSnapshot: Equatable, Sendable {
                 }
                 guard let hit, Self.contains(hit.bounds, point),
                       hit.pid == source.applicationPID,
-                      source.kind != .window || hit.id == source.windowID else { throw Self.pointerBoundary() }
+                      source.kind != .window || hit.id == source.windowID,
+                      source.bindings.map({ $0.contains(where: { $0.windowID == hit.id }) }) ?? true else { throw Self.pointerBoundary() }
             }
         case .keyDown, .keyUp, .keyRepeat, .flags:
             if source.kind == .display {
@@ -158,6 +213,11 @@ struct InputScopeSnapshot: Equatable, Sendable {
         guard frontmostPID == other.frontmostPID, applicationLaunchDate == other.applicationLaunchDate else { return false }
         if source.kind == .window {
             return windows.first(where: { $0.id == source.windowID }) == other.windows.first(where: { $0.id == source.windowID })
+        }
+        if let bindings = source.bindings {
+            return bindings.allSatisfy { binding in
+                windows.first(where: { $0.id == binding.windowID }) == other.windows.first(where: { $0.id == binding.windowID })
+            }
         }
         return true
     }
@@ -321,7 +381,7 @@ private final class InputTapContext: @unchecked Sendable {
     func prepare() throws {
         do {
             keyboardContinuity = try KeyboardObservationContinuity(keyboardTrust.refreshSynchronously())
-            if let scopeSource, scopeSource.kind != .desktop {
+            if let scopeSource {
                 let snapshot = try InputScopeSnapshot.current(for: scopeSource)
                 try snapshot.verifyTarget(scopeSource)
                 scopeSnapshot = snapshot
@@ -478,7 +538,8 @@ private final class InputTapContext: @unchecked Sendable {
             onFault(AstraError("input.keyboardInterrupted", boundary.message))
             return
         }
-        if let scopeSource, scopeSource.kind != .desktop, let previous = scopeSnapshot {
+        var routed = batch.map(\.value)
+        if let scopeSource, let previous = scopeSnapshot {
             // Verify every nonempty delivery batch and at least ten times per
             // second while idle. A blocked WindowServer never blocks the tap;
             // its bounded ring will stop observation on backpressure.
@@ -490,11 +551,14 @@ private final class InputTapContext: @unchecked Sendable {
                 guard current.sameTarget(as: previous, source: scopeSource) else {
                     throw AstraError("input.targetChanged", "The observed target moved or focus changed during input collection. This interval was excluded from demonstration training.")
                 }
-                for event in batch {
+                for (index, event) in batch.enumerated() {
                     try previous.verify(event.value, targetPID: event.routing.targetPID,
                                         handlingWindowID: event.routing.handlingWindowID, source: scopeSource)
                     try current.verify(event.value, targetPID: event.routing.targetPID,
                                        handlingWindowID: event.routing.handlingWindowID, source: scopeSource)
+                    let before = try previous.routedSurfaceID(event.value, handlingWindowID: event.routing.handlingWindowID, source: scopeSource)
+                    let after = try current.routedSurfaceID(event.value, handlingWindowID: event.routing.handlingWindowID, source: scopeSource)
+                    if before == after { routed[index].surfaceID = before }
                 }
                 scopeSnapshot = current
             } catch {
@@ -514,6 +578,6 @@ private final class InputTapContext: @unchecked Sendable {
                 return
             }
         }
-        if !batch.isEmpty { onEvents(batch.map(\.value)) }
+        if !routed.isEmpty { onEvents(routed) }
     }
 }

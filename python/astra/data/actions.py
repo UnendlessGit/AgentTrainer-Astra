@@ -100,7 +100,8 @@ def _simplify(points: list[tuple[int, float, float]], tolerance: float, forced: 
 
 def canonicalize(events: Sequence[dict], *, start_nanos: int, config: ModelConfig,
                  vocabulary: ActionVocabulary, surfaces: Sequence[dict],
-                 pointer_mode: str, initial_pointer: tuple[float, float] | None) -> CanonicalPacket:
+                 pointer_mode: str, initial_pointer: tuple[float, float] | None,
+                 initial_surface_id: str | None = None) -> CanonicalPacket:
     config.validate(); vocabulary.validate()
     surfaces = [validate_surface(surface) for surface in surfaces]
     if pointer_mode not in ("absolute", "relative", "disabled") or type(start_nanos) is not int or start_nanos < 0:
@@ -130,25 +131,30 @@ def canonicalize(events: Sequence[dict], *, start_nanos: int, config: ModelConfi
     points: list[tuple[int, float, float]] = []
     source_points: list[tuple[float, float, float, int]] = []
     point_order = []
+    point_surfaces: list[str | None] = []
     forced = set()
     maximum_time_error = 0.0
     accumulated = np.zeros(2, dtype=np.float64)
     if pointer_mode == "absolute" and initial_pointer is not None:
         if len(initial_pointer) != 2 or not all(type(value) in (int, float) and math.isfinite(value) for value in initial_pointer):
             raise ActionEncodingError("Invalid initial pointer")
-        points.append((0, *initial_pointer)); point_order.append(-2)
+        points.append((0, *initial_pointer)); point_order.append(-2); point_surfaces.append(initial_surface_id)
     elif pointer_mode == "relative":
-        points.append((0, 0, 0)); point_order.append(-2)
+        points.append((0, 0, 0)); point_order.append(-2); point_surfaces.append(None)
     motion_evidence = False
 
-    def add_point(time, order, x, y, *, preserve=False, source_time=None):
+    def add_point(time, order, x, y, *, preserve=False, source_time=None, surface_id=None):
         source_time = time if source_time is None else source_time
-        if points and points[-1] == (time, x, y):
+        if points and points[-1] == (time, x, y) and point_surfaces[-1] == surface_id:
+            if point_order[-1] == -2:
+                point_order[-1] = order  # A real same-position event is no longer only a synthetic seed.
             if preserve:
                 forced.add(len(points) - 1)
             source_points.append((source_time, x, y, len(points) - 1))
             return
-        points.append((time, x, y)); point_order.append(order)
+        if points and point_surfaces[-1] != surface_id:
+            forced.update((len(points) - 1, len(points)))
+        points.append((time, x, y)); point_order.append(order); point_surfaces.append(surface_id)
         source_points.append((source_time, x, y, len(points) - 1))
         if preserve:
             forced.add(len(points) - 1)
@@ -165,7 +171,7 @@ def canonicalize(events: Sequence[dict], *, start_nanos: int, config: ModelConfi
                     raise ActionEncodingError("Demonstration pointer motion exceeds the selected capabilities")
                 if initial_pointer is None and not points:
                     raise ActionEncodingError("Pointer motion has no causal boundary position")
-                add_point(offset, order, event["x"], event["y"], source_time=source_ms)
+                add_point(offset, order, event["x"], event["y"], source_time=source_ms, surface_id=event.get("surfaceID"))
                 motion_evidence = True
             elif pointer_mode == "relative":
                 if not vocabulary.relative_pointer or event.get("dx") is None or event.get("dy") is None:
@@ -194,7 +200,7 @@ def canonicalize(events: Sequence[dict], *, start_nanos: int, config: ModelConfi
             if pointer_mode == "absolute":
                 if event.get("x") is None or event.get("y") is None:
                     raise ActionEncodingError("Absolute button commands need their recorded pointer position")
-                add_point(offset, order - 1, event["x"], event["y"], preserve=True, source_time=source_ms)
+                add_point(offset, order - 1, event["x"], event["y"], preserve=True, source_time=source_ms, surface_id=event.get("surfaceID"))
                 motion_evidence = True
             elif points:
                 add_point(offset, order - 1, *accumulated, preserve=True, source_time=source_ms)
@@ -211,13 +217,24 @@ def canonicalize(events: Sequence[dict], *, start_nanos: int, config: ModelConfi
                 motion_evidence |= position != tuple(points[-1][1:])
             else:
                 position = accumulated
-            add_point(offset, order - 1, *position, preserve=True, source_time=source_ms)
+            hint = (event.get("surfaceID") if event.get("x") is not None and event.get("y") is not None else point_surfaces[-1]) if pointer_mode == "absolute" else None
+            add_point(offset, order - 1, *position, preserve=True, source_time=source_ms, surface_id=hint)
         commands.append((offset, order, command))
     maximum_motion_error = 0.0
+    if pointer_mode == "absolute":
+        for event in eligible:
+            hint = event.get("surfaceID")
+            if hint is not None and event.get("x") is not None and event.get("y") is not None:
+                matches = [surface for surface in surfaces if surface["id"] == hint]
+                if len(matches) != 1:
+                    raise ActionEncodingError("Observed pointer surface hint is unavailable")
+                bounds = matches[0]["globalBounds"]
+                if not (bounds["x"] <= event["x"] < bounds["x"] + bounds["width"] and bounds["y"] <= event["y"] < bounds["y"] + bounds["height"]):
+                    raise ActionEncodingError("Observed pointer surface hint does not contain its position")
     if motion_evidence and points:
         # A terminal held-position knot prevents interpolation from implicitly
         # moving for the whole interval after the last actual motion sample.
-        add_point(config.period_ms, 2 * len(eligible) + 1, *points[-1][1:])
+        add_point(config.period_ms, 2 * len(eligible) + 1, *points[-1][1:], surface_id=point_surfaces[-1])
         # A spatial bound at rounded timestamps alone misses fast movement
         # displaced by timestamp quantization. Qualify at original sample times
         # too, adding knots where retaining more detail can repair the error.
@@ -243,7 +260,17 @@ def canonicalize(events: Sequence[dict], *, start_nanos: int, config: ModelConfi
             if pointer_mode == "absolute":
                 candidates = [surface for surface in surfaces if surface["globalBounds"]["x"] <= x < surface["globalBounds"]["x"] + surface["globalBounds"]["width"]
                               and surface["globalBounds"]["y"] <= y < surface["globalBounds"]["y"] + surface["globalBounds"]["height"]]
-                if len(candidates) != 1:
+                hint = point_surfaces[index]
+                if hint is not None:
+                    candidates = [surface for surface in candidates if surface["id"] == hint]
+                    if len(candidates) != 1:
+                        raise ActionEncodingError("Observed pointer surface hint is unavailable or does not contain its position")
+                elif len(candidates) != 1:
+                    if len(candidates) > 1 and point_order[index] == -2:
+                        # This seed is the already-observed current position,
+                        # not a physical event. It constrains curve fitting but
+                        # needs no synthetic move with a guessed recipient.
+                        continue
                     raise ActionEncodingError("Pointer trajectory does not have one unambiguous observed surface")
                 surface = candidates[0]; bounds = surface["globalBounds"]
                 command = {"offsetMs": offset, "operation": "pointerAbsolute", "surfaceID": surface["id"],
@@ -266,7 +293,7 @@ def encode_commands(commands: Sequence[dict], *, config: ModelConfig, vocabulary
     """Encode exactly one packet against observation-derived dense cell bounds."""
     if len(commands) > config.packet_capacity:
         raise PacketCapacityError(len(commands), config.packet_capacity)
-    if visual.cells.ndim != 4 or not 0 <= batch_index < visual.cells.shape[0] or len(surfaces) != visual.cells.shape[1]:
+    if visual.cells.ndim != 4 or not 0 <= batch_index < visual.cells.shape[0] or not 1 <= len(surfaces) <= visual.cells.shape[1]:
         raise ActionEncodingError("Packet encoding needs flattened, matching observed surfaces")
     arrays = {name: np.zeros((1, config.packet_capacity + 1), dtype=np.int32) for name in PacketBatch.__dataclass_fields__}
     cell_bounds = np.asarray(visual.cell_bounds[batch_index])

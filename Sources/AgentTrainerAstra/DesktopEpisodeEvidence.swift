@@ -171,7 +171,7 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
     private func submit(_ input: Input, generation: UUID) throws {
         let kind: Int, bytes: Int
         switch input {
-        case .event(.observation(let value)): kind = 0; bytes = value.pixels.count + 2 * AstraVersion.maximumMessageBytes
+        case .event(.observation(let value)): kind = 0; bytes = value.pixelByteCount + 2 * AstraVersion.maximumMessageBytes
         case .event(.control): kind = 1; bytes = 0
         case .manual, .result, .abort: kind = 2; bytes = 0
         default: kind = 0; bytes = 2 * AstraVersion.maximumMessageBytes
@@ -232,7 +232,10 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
         case .event(.observation(let observed)):
             guard ready != nil, observed.runID == identity.runID,
                   try observed.actorInput.required("episodeID").decode(UUID.self) == episodeID,
-                  observed.pixels.count == observed.frame.byteCount, scope.surfaces.contains(observed.frame.surface) else {
+                  try observed.actorInput.required("geometryRevision").decode(UInt64.self) == scope.geometryRevision,
+                  observed.frames.map({ $0.metadata.surface }) == scope.surfaces,
+                  Set(observed.frames.map { $0.metadata.id }).count == observed.frames.count,
+                  observed.frames.allSatisfy({ $0.pixels.count == $0.metadata.byteCount }) else {
                 throw AstraError("desktop.observationIdentity", "Actor observations require the ready episode and its unchanged source.")
             }
             let id = try observed.actorInput.required("observationID").decode(UUID.self)
@@ -334,9 +337,9 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
                   record.fields?["recurrentReset"] == .bool(produced == 0),
                   sampler.fields?["kind"] == .string("categorical"), sampler.fields?["temperature"]?.double == 1,
                   sampler.fields?["mixture"] == .string("none"), sampler.fields?["version"]?.int == 1,
-                  try record.required("frameIDs").decode([UUID].self) == [observation.frame.id],
-                  try record.required("geometryRevision").decode(UInt64.self) == observation.frame.surface.geometryRevision,
-                  packet.geometryRevision == observation.frame.surface.geometryRevision else {
+                  try record.required("frameIDs").decode([UUID].self) == observation.frames.map({ $0.metadata.id }),
+                  try record.required("geometryRevision").decode(UInt64.self) == scope.geometryRevision,
+                  packet.geometryRevision == scope.geometryRevision else {
                 throw AstraError("desktop.actorSequence", "Actor sampling, packet counters or retained frames are inconsistent.")
             }
             let before = try record.required("previousStateID").decode(UUID.self)
@@ -377,7 +380,7 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
                     throw AstraError("desktop.preActorFeedback", "The baseline has no policy interval for manual markers or coverage.")
                 }
                 try analysis!.offer(RewardAnalysisObservation(id: id, episodeID: episodeID, cutoffNanos: value.cutoff!,
-                    frames: [.init(metadata: observed.frame, pixels: observed.pixels)], coverage: observed.coverage.map { [$0] } ?? [],
+                    frames: observed.frames.map { .init(metadata: $0.metadata, pixels: $0.pixels) }, coverage: observed.frames.compactMap(\.coverage),
                     manualReadings: feedback?.readings ?? [], markers: feedback?.markers ?? [], markerCoverage: feedback?.coverage))
                 value.analysisOffered = true
             }

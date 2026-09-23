@@ -9,6 +9,8 @@ final class HostQualificationBackend: ControlInputBackend, @unchecked Sendable {
     private let lock = NSLock()
     private var keys: Set<Int> = [], buttons: Set<Int> = []
     private var posts = 0
+    private let surfaces: [SurfaceDescriptor]
+    init(surfaces: [SurfaceDescriptor]) { self.surfaces = surfaces }
     var clean: Bool { lock.withLock { keys.isEmpty && buttons.isEmpty } }
     var posted: Int { lock.withLock { posts } }
     func prepare(_ request: ArmRequest) throws -> ControlState { physicalState() }
@@ -19,7 +21,7 @@ final class HostQualificationBackend: ControlInputBackend, @unchecked Sendable {
     func checkHealth() throws {}
     func validate(_ scope: ControlScope, pointer: Point2D?) throws {
         _ = try scope.validated()
-        guard scope.surfaces.count == 1, scope.surfaces[0].id == "generated-host-source", pointer?.isFinite != false else {
+        guard scope.surfaces == surfaces, pointer?.isFinite != false else {
             throw AstraError("qualification.scope", "Virtual input escaped its generated source.")
         }
     }
@@ -40,7 +42,7 @@ final class HostQualificationBackend: ControlInputBackend, @unchecked Sendable {
 /// The control transport is injected; its scheduler, admission, histories,
 /// deadlines, receipts and cleanup are the actual production InputExecutor.
 final class HostQualificationControl: @unchecked Sendable {
-    let backend = HostQualificationBackend()
+    let backend: HostQualificationBackend
     private let lock = NSLock()
     private let output = DispatchQueue(label: "astra.qualification.control-events")
     private let events: ComputeProcess.EventHandler
@@ -49,8 +51,8 @@ final class HostQualificationControl: @unchecked Sendable {
     private var sequence: UInt64 = 1
     private var recorded: [ExecutionReceipt] = []
     private var joined = false
-    init(events: @escaping ComputeProcess.EventHandler) {
-        self.events = events
+    init(events: @escaping ComputeProcess.EventHandler, surfaces: [SurfaceDescriptor]) {
+        self.events = events; backend = HostQualificationBackend(surfaces: surfaces)
         executor = InputExecutor(backend: backend, onReceipt: { [weak self] in self?.receipt($0) },
             onStop: { [weak self] run, cause, reason in
                 self?.emit("control.stopped", .object(["cause": .string(cause.rawValue), "reason": .string(reason)]), run: run)
@@ -127,36 +129,65 @@ final class HostQualificationControl: @unchecked Sendable {
 final class HostQualificationControls: @unchecked Sendable {
     private let lock = NSLock()
     private var children: [HostQualificationControl] = []
+    private let surfaces: [SurfaceDescriptor]
+    init(surfaces: [SurfaceDescriptor] = HostQualificationCapture().surfaces) { self.surfaces = surfaces }
     var all: [HostQualificationControl] { lock.withLock { children } }
     var factory: NativeControlRuntimeFactory {
         .init(protectsPhysicalInputs: false) { events, _ in
-            let child = HostQualificationControl(events: events)
+            let child = HostQualificationControl(events: events, surfaces: self.surfaces)
             self.lock.withLock { self.children.append(child) }; return child.runtime
         }
     }
 }
 
 final class HostQualificationCapture: @unchecked Sendable {
-    let surface = SurfaceDescriptor(id: "generated-host-source", globalBounds: .init(x: 0, y: 0, width: 32, height: 32), pixelWidth: 32, pixelHeight: 32)
+    let surfaces: [SurfaceDescriptor]
+    var surface: SurfaceDescriptor { surfaces[0] }
     private let queue = DispatchQueue(label: "astra.qualification.capture")
     private let lock = NSLock()
     private var timer: DispatchSourceTimer?
     private var frames = 0, joined = false
-    private let pixels = Data((0..<4096).map { UInt8(($0 * 17) % 256) })
+    private var producedMetadata: [FrameMetadata] = []
+    private let buffers: [Data]
+    init(multiSurface: Bool = false) {
+        var sources = [SurfaceDescriptor(id: "generated-host-source", globalBounds: .init(x: 0, y: 0, width: 32, height: 32),
+            pixelWidth: 32, pixelHeight: 32, geometryRevision: 7, nativeDisplayID: 7_001)]
+        if multiSurface {
+            sources.append(.init(id: "generated-host-secondary", globalBounds: .init(x: 32, y: 0, width: 48, height: 32),
+                pixelWidth: 48, pixelHeight: 32, geometryRevision: 19, nativeDisplayID: 7_002))
+        }
+        surfaces = sources
+        buffers = sources.enumerated().map { index, value in
+            Data((0..<(value.pixelWidth * value.pixelHeight * 4)).map { UInt8(($0 * 17 + index * 31) % 256) })
+        }
+    }
     var hasJoined: Bool { lock.withLock { joined } }
     var produced: Int { lock.withLock { frames } }
+    var metadata: [FrameMetadata] { lock.withLock { producedMetadata } }
     var source: CaptureSource {
-        .init(id: surface.id, name: "Generated private fixture", kind: .desktop, bounds: surface.globalBounds, pixelWidth: 32, pixelHeight: 32)
+        let leaves = surfaces.map { value in
+            CaptureSource(id: value.id, name: "Generated private fixture", kind: .display, displayID: value.nativeDisplayID,
+                bounds: value.globalBounds, pixelWidth: value.pixelWidth, pixelHeight: value.pixelHeight)
+        }
+        guard leaves.count > 1 else { return leaves[0] }
+        return .init(id: "generated-host-desktop", name: "Generated two-source desktop", kind: .desktop,
+            bounds: .init(x: 0, y: 0, width: 80, height: 32), pixelWidth: 32, pixelHeight: 32, bindings: leaves)
     }
     var runtime: InferenceCapture {
         .init(start: { frame, _ in
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
             timer.setEventHandler { [self] in
-                let now = MonotonicClock.now, pixels = pixels
-                let metadata = FrameMetadata(id: UUID(), eventNanos: now, observedNanos: now, surface: surface, byteCount: pixels.count, codec: "raw")
-                lock.withLock { frames += 1 }
-                frame(.init(metadata: metadata, pixels: { pixels }))
+                for (index, surface) in surfaces.enumerated() {
+                    let now = MonotonicClock.now, pixels = buffers[index]
+                    let metadata = FrameMetadata(id: UUID(), eventNanos: now - UInt64(index + 1) * 1_000_000,
+                        observedNanos: now, surface: surface, byteCount: pixels.count, codec: "raw")
+                    lock.withLock {
+                        frames += 1
+                        if producedMetadata.count < 20_000 { producedMetadata.append(metadata) }
+                    }
+                    frame(.init(metadata: metadata, pixels: { pixels }))
+                }
             }
             self.lock.withLock { self.timer = timer; self.joined = false }; timer.resume()
         }, stop: {

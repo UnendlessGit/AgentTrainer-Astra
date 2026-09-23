@@ -11,6 +11,7 @@ public struct AgentDocument: Codable, Hashable, Identifiable, Sendable {
     public var selectedCheckpointID: UUID?
     public var rewardProgramID: UUID?
     public var pinned: Bool
+    public var contextFieldIDs: [UUID]?
 
     public init(id: UUID = UUID(), name: String, notes: String = "", createdAt: Date = Date(),
                 environmentID: UUID? = nil, selectedCheckpointID: UUID? = nil, pinned: Bool = false) {
@@ -23,6 +24,11 @@ public struct AgentDocument: Codable, Hashable, Identifiable, Sendable {
         guard schemaVersion == AstraVersion.dataVersion, notes.utf8.count <= 65_536,
               createdAt.timeIntervalSince1970.isFinite, modifiedAt.timeIntervalSince1970.isFinite else {
             throw AstraError("library.agent", "The agent document is unsupported or invalid.")
+        }
+        if let contextFieldIDs {
+            guard contextFieldIDs.count <= 32, Set(contextFieldIDs).count == contextFieldIDs.count else {
+                throw AstraError("context.agent", "An agent can use up to 32 distinct context fields.")
+            }
         }
         return copy
     }
@@ -83,6 +89,7 @@ public struct LibrarySnapshot: Sendable {
     public var recordingSelections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
     public var evaluations: [EvaluationDocument] = []
     public var pendingFeedback: [PendingFeedbackDocument] = []
+    public var contextFields: [ContextFieldDocument] = []
 }
 
 public enum DocumentNames {
@@ -115,6 +122,7 @@ public actor LibraryStore {
             }
             try database.execute("CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
+            try database.execute("CREATE TABLE IF NOT EXISTS context_fields (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
             try database.execute("CREATE TABLE IF NOT EXISTS recordings (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             if previousVersion == 1 {
@@ -133,6 +141,13 @@ public actor LibraryStore {
             try database.execute("CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS reward_programs (id TEXT PRIMARY KEY, name TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
             try database.execute("CREATE TABLE IF NOT EXISTS pending_feedback (id TEXT PRIMARY KEY, document BLOB NOT NULL, created REAL NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
+            try database.execute("CREATE TABLE IF NOT EXISTS checkpoint_cleanup (checkpoint_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, document BLOB NOT NULL, created REAL NOT NULL, issue TEXT)")
+            if try database.query("SELECT key FROM settings WHERE key='checkpointLinksMigrated'").isEmpty {
+                // Materialize old creator ownership once; repeated migration
+                // must never reattach an explicitly removed creator link.
+                try database.execute("INSERT OR IGNORE INTO agent_checkpoints(agent_id,checkpoint_id) SELECT agents.id,checkpoints.id FROM checkpoints JOIN agents ON agents.id=CASE WHEN json_valid(CAST(checkpoints.document AS TEXT)) THEN json_extract(CAST(checkpoints.document AS TEXT),'$.agentID') END WHERE checkpoints.archived=0")
+                try database.execute("INSERT INTO settings(key,value) VALUES('checkpointLinksMigrated',?)", [.blob(Data([1]))])
+            }
         }
         for folder in ["Recordings", "Models", "Datasets", "Jobs", "Caches", "Logs"] {
             try FileManager.default.createDirectory(at: self.root.appendingPathComponent(folder), withIntermediateDirectories: true)
@@ -141,6 +156,10 @@ public actor LibraryStore {
 
     public func snapshot() throws -> LibrarySnapshot {
         var issues = recoveryIssues + inferenceIssues
+        for row in try database.query("SELECT checkpoint_id,issue FROM checkpoint_cleanup") {
+            issues.append(.init(id: (row["checkpoint_id"]?.string ?? "unknown") + ".cleanup", collection: "checkpoint cleanup",
+                message: row["issue"]?.string ?? "A previously requested checkpoint cleanup is unfinished. Retry it from Manage Checkpoints."))
+        }
         let agents: [AgentDocument] = try documents(table: "agents", issues: &issues).compactMap { (document: AgentDocument) -> AgentDocument? in
             do { return try document.validated() }
             catch { issues.append(.init(id: document.id.uuidString, collection: "agents", message: error.localizedDescription)); return nil }
@@ -173,6 +192,10 @@ public actor LibraryStore {
             do { return try value.validated() }
             catch { issues.append(.init(id: value.id.uuidString, collection: "pending_feedback", message: error.localizedDescription)); return nil }
         }
+        let contexts: [ContextFieldDocument] = try documents(table: "context_fields", issues: &issues).compactMap { (value: ContextFieldDocument) -> ContextFieldDocument? in
+            do { return try value.validated() }
+            catch { issues.append(.init(id: value.id.uuidString, collection: "context fields", message: error.localizedDescription)); return nil }
+        }
         var selections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
         let recordingsByID = Dictionary(uniqueKeysWithValues: recordings.map { ($0.id, $0) })
         for agent in agents {
@@ -190,7 +213,33 @@ public actor LibraryStore {
                 }
             }
         }
-        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues, rewardPrograms: rewards, recordingSelections: selections, evaluations: evaluations, pendingFeedback: pendingFeedback)
+        return LibrarySnapshot(agents: agents, environments: environments, recordings: recordings, learningRuns: runs, checkpoints: checkpoints, issues: issues, rewardPrograms: rewards, recordingSelections: selections, evaluations: evaluations, pendingFeedback: pendingFeedback, contextFields: contexts)
+    }
+
+    public func saveContexts(_ fields: [ContextFieldDocument], selectedIDs: [UUID], for agentID: UUID) throws {
+        let checked = try fields.map { try $0.validated() }
+        guard checked.count <= 256, Set(checked.map(\.id)).count == checked.count else {
+            throw AstraError("context.catalog", "Save at most 256 distinct context fields at once.")
+        }
+        _ = try ContextVocabulary(fields: selectedIDs.map { id in
+            guard let field = checked.first(where: { $0.id == id }) else { throw AstraError("context.field", "A selected context field is missing.") }
+            return field
+        }).validated()
+        try database.transaction {
+            guard let bytes = try database.query("SELECT document FROM agents WHERE id=? AND archived=0", [.text(agentID.uuidString)]).first?["document"]?.data else {
+                throw AstraError("context.agent", "The agent is no longer available.")
+            }
+            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+            var agent = try decoder.decode(AgentDocument.self, from: bytes).validated()
+            for field in checked { try saveContextField(field) }
+            agent.contextFieldIDs = selectedIDs; agent.modifiedAt = Date(); try save(agent)
+        }
+    }
+
+    public func saveContextField(_ document: ContextFieldDocument) throws {
+        let value = try document.validated()
+        try database.execute("INSERT INTO context_fields(id,name,document,created) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,document=excluded.document", [
+            .text(value.id.uuidString), .text(value.name), .blob(try encode(value)), .real(Date().timeIntervalSince1970)])
     }
 
     public func savePendingFeedback(_ document: PendingFeedbackDocument) throws {
@@ -264,30 +313,31 @@ public actor LibraryStore {
     }
 
     public func saveCheckpoint(_ document: CheckpointDocument) throws {
-        let value = try document.validated()
+        var value = try document.validated()
         try database.transaction {
-            let existing = try database.query("SELECT document FROM checkpoints WHERE id=?", [.text(value.id.uuidString)])
+            let existing = try database.query("SELECT document,archived FROM checkpoints WHERE id=?", [.text(value.id.uuidString)])
             if let bytes = existing.first?["document"]?.data {
                 let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
                 let previous = try decoder.decode(CheckpointDocument.self, from: bytes)
-                guard previous.agentID == value.agentID, previous.policySignature == value.policySignature,
+                guard existing.first?["archived"]?.integer == 0, previous.agentID == value.agentID, previous.policySignature == value.policySignature,
                       previous.trainingStep == value.trainingStep, previous.parameterCount == value.parameterCount,
                       previous.kind == value.kind, previous.runID == value.runID else {
                     throw AstraError("checkpoint.immutable", "A checkpoint's identity and model metadata cannot be overwritten.")
                 }
+                value.name = previous.name; value.pinned = previous.pinned; value.createdAt = previous.createdAt
             }
             try database.execute("INSERT INTO checkpoints(id,name,document,created) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,document=excluded.document", [
                 .text(value.id.uuidString), .text(value.name), .blob(try encode(value)), .real(value.createdAt.timeIntervalSince1970)
             ])
-            try database.execute("INSERT OR IGNORE INTO agent_checkpoints VALUES(?,?)", [.text(value.agentID.uuidString), .text(value.id.uuidString)])
+            if existing.isEmpty {
+                try database.execute("INSERT OR IGNORE INTO agent_checkpoints VALUES(?,?)", [.text(value.agentID.uuidString), .text(value.id.uuidString)])
+            }
         }
     }
 
     public func checkpointIDs(for agentID: UUID) throws -> Set<UUID> {
-        // Creator rows remain usable when opening an older development catalog
-        // that predates explicit shared links.
-        let rows = try database.query("SELECT checkpoint_id AS id FROM agent_checkpoints WHERE agent_id=? UNION SELECT id FROM checkpoints WHERE json_extract(CAST(document AS TEXT),'$.agentID')=?",
-                                      [.text(agentID.uuidString), .text(agentID.uuidString)])
+        let rows = try database.query("SELECT checkpoint_id AS id FROM agent_checkpoints JOIN checkpoints ON checkpoints.id=checkpoint_id WHERE agent_id=? AND checkpoints.archived=0",
+                                      [.text(agentID.uuidString)])
         return Set(rows.compactMap { $0["id"]?.string.flatMap(UUID.init(uuidString:)) })
     }
 
@@ -463,7 +513,7 @@ public actor LibraryStore {
                 throw AstraError("selection.link", "This recording is no longer linked to the agent.")
             }
             try database.execute("UPDATE agent_recordings SET selection=? WHERE agent_id=? AND recording_id=?", [
-                selection.ranges == nil ? .null : .blob(try encode(selection)), .text(agentID.uuidString), .text(recordingID.uuidString)])
+                (selection.ranges == nil && (selection.contextValues?.isEmpty ?? true)) ? .null : .blob(try encode(selection)), .text(agentID.uuidString), .text(recordingID.uuidString)])
         }
     }
 
@@ -537,5 +587,137 @@ public actor LibraryStore {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         encoder.dateEncodingStrategy = .millisecondsSince1970
         return try encoder.encode(value)
+    }
+}
+
+extension LibraryStore {
+    public func updateCheckpointPresentation(id: UUID, name: String, pinned: Bool) throws {
+        guard let bytes = try database.query("SELECT document FROM checkpoints WHERE id=? AND archived=0", [.text(id.uuidString)]).first?["document"]?.data else {
+            throw AstraError("checkpoint.missing", "This checkpoint is no longer available in the catalog.")
+        }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+        var value = try decoder.decode(CheckpointDocument.self, from: bytes).validated()
+        guard value.id == id else { throw AstraError("checkpoint.identity", "The checkpoint catalog identity is inconsistent.") }
+        let updatedName = try DocumentNames.validated(name)
+        value.pinned = pinned || updatedName != value.name
+        value.name = updatedName
+        try database.execute("UPDATE checkpoints SET name=?,document=? WHERE id=? AND archived=0", [.text(value.name), .blob(try encode(value)), .text(id.uuidString)])
+    }
+
+    /// The caller owns the library lease and blocks new runtime work while
+    /// previewing/applying. Persisted dependencies are independently rechecked.
+    public func previewCheckpointRetention(agentID: UUID, keepNewest: Int, activeCheckpointIDs: Set<UUID> = []) throws -> CheckpointRetentionPreview {
+        guard (0...100).contains(keepNewest) else { throw AstraError("checkpoint.retention", "Keep between zero and one hundred recent checkpoints.") }
+        var issues: [LibraryIssue] = []
+        let agents: [AgentDocument] = try documents(table: "agents", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
+        let checkpoints: [CheckpointDocument] = try documents(table: "checkpoints", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
+        let runs: [LearningRunDocument] = try documents(table: "learning_runs", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
+        let evaluations: [EvaluationDocument] = try documents(table: "evaluations", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
+        let feedback: [PendingFeedbackDocument] = try documents(table: "pending_feedback", includeArchived: true, maximumBytes: PendingFeedbackDocument.maximumBytes, issues: &issues)
+        let recordings: [RecordingManifest] = try documents(table: "recordings", includeArchived: true, maximumBytes: 1_048_576, issues: &issues)
+        guard issues.isEmpty, agents.contains(where: { $0.id == agentID }) else {
+            throw AstraError("checkpoint.retentionCatalog", "Checkpoint references could not all be read. Resolve catalog issues before removing models.")
+        }
+        for value in agents { _ = try value.validated() }
+        for value in checkpoints { _ = try value.validated() }
+        for value in runs { _ = try value.validated() }
+        for value in evaluations { _ = try value.validated() }
+        for value in feedback { _ = try value.validated() }
+        for value in recordings { _ = try value.validated() }
+        let byID = Dictionary(uniqueKeysWithValues: checkpoints.map { ($0.id, $0) })
+        let agentNames = Dictionary(uniqueKeysWithValues: agents.map { ($0.id, $0.name) })
+        var owners: [UUID: Set<UUID>] = [:]
+        for row in try database.query("SELECT agent_id,checkpoint_id FROM agent_checkpoints") {
+            guard let agent = row["agent_id"]?.string.flatMap(UUID.init(uuidString:)), agentNames[agent] != nil,
+                  let checkpoint = row["checkpoint_id"]?.string.flatMap(UUID.init(uuidString:)), byID[checkpoint] != nil else {
+                throw AstraError("checkpoint.retentionCatalog", "An owning checkpoint link is inconsistent. No model was removed.")
+            }
+            owners[checkpoint, default: []].insert(agent)
+        }
+        var protected: [UUID: String] = [:]
+        for value in checkpoints where value.isPinned { protected[value.id] = "Pinned" }
+        for agent in agents { if let id = agent.selectedCheckpointID { protected[id] = "Selected by \(agent.name)" } }
+        for value in feedback where ![.completed, .discarded].contains(value.status) { protected[value.checkpoint.id] = "Needed by saved feedback" }
+        for recording in recordings {
+            if let reference = recording.correction {
+                let prelude = try CorrectionPrelude.load(in: recordingDirectory(id: recording.id), reference: reference)
+                protected[prelude.sourceCheckpointID] = "Needed by correction recording \(recording.name)"
+            }
+        }
+        for value in runs where [.preparing, .running, .cancelling].contains(value.status) {
+            for id in [value.initialCheckpointID, value.checkpointID].compactMap({ $0 }) { protected[id] = "Used by active learning" }
+        }
+        for value in evaluations where value.status == .running {
+            protected[value.checkpointID] = "Used by active evaluation"
+            protected[value.protocolDefinition.sourceCheckpointID] = "Supplies an active evaluation protocol"
+        }
+        for id in activeCheckpointIDs { protected[id] = "Retained by an active workflow" }
+        let linked = checkpoints.filter { owners[$0.id]?.contains(agentID) == true }
+            .sorted { $0.createdAt == $1.createdAt ? $0.id.uuidString < $1.id.uuidString : $0.createdAt > $1.createdAt }
+        for value in linked.filter({ !$0.isPinned }).prefix(keepNewest) where protected[value.id] == nil {
+            protected[value.id] = "Among the newest \(keepNewest) unpinned checkpoints"
+        }
+        var candidates: [(CheckpointDocument, CheckpointCleanupDisposition, [String])] = []
+        for value in linked where protected[value.id] == nil {
+            let retained = (owners[value.id] ?? []).subtracting([agentID]).compactMap { agentNames[$0] }.sorted()
+            candidates.append((value, retained.isEmpty ? .deleteFiles : .unlinkShared, retained))
+        }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+        let retired = Set(try database.query("SELECT id FROM checkpoints WHERE archived=1").compactMap { $0["id"]?.string.flatMap(UUID.init(uuidString:)) })
+        for row in try database.query("SELECT checkpoint_id,agent_id,document FROM checkpoint_cleanup ORDER BY created,checkpoint_id") {
+            guard let data = row["document"]?.data, data.count <= 1_048_576,
+                  let id = row["checkpoint_id"]?.string.flatMap(UUID.init(uuidString:)), retired.contains(id),
+                  let requestingAgent = row["agent_id"]?.string.flatMap(UUID.init(uuidString:)), agentNames[requestingAgent] != nil else {
+                throw AstraError("checkpoint.cleanupJournal", "A pending cleanup entry needs manual review.")
+            }
+            let checkpoint = try decoder.decode(CheckpointDocument.self, from: data).validated()
+            guard checkpoint.id == id, byID[id]?.matchesIdentity(of: checkpoint) == true, owners[id, default: []].isEmpty else {
+                throw AstraError("checkpoint.cleanupJournal", "A pending cleanup entry regained ownership or has inconsistent identity.")
+            }
+            if row["agent_id"]?.string == agentID.uuidString, protected[id] == nil { candidates.append((checkpoint, .retryFiles, [])) }
+        }
+        let chosen = candidates.prefix(256)
+        let items = try chosen.map { value, disposition, retained in
+            CheckpointCleanupItem(checkpoint: value, disposition: disposition, retainedByAgents: retained,
+                bytes: disposition == .unlinkShared ? 0 : try CheckpointArtifactFiles.bytes(root: root, id: value.id))
+        }
+        return .init(agentID: agentID, keepNewest: keepNewest, items: items, protected: protected,
+            remainingCandidates: max(0, candidates.count - items.count))
+    }
+
+    public func applyCheckpointRetention(_ preview: CheckpointRetentionPreview, activeCheckpointIDs: Set<UUID> = []) throws -> CheckpointCleanupResult {
+        let current = try previewCheckpointRetention(agentID: preview.agentID, keepNewest: preview.keepNewest, activeCheckpointIDs: activeCheckpointIDs)
+        guard current == preview else { throw AstraError("checkpoint.retentionChanged", "Checkpoint ownership or selections changed. Review a refreshed cleanup preview before continuing.") }
+        guard !current.items.isEmpty else { return .init(unlinked: 0, deleted: 0, issues: []) }
+        try database.transaction {
+            for item in current.items where item.disposition != .retryFiles {
+                try database.execute("DELETE FROM agent_checkpoints WHERE agent_id=? AND checkpoint_id=?", [.text(current.agentID.uuidString), .text(item.id.uuidString)])
+                if item.disposition == .deleteFiles {
+                    guard try database.query("SELECT agent_id FROM agent_checkpoints WHERE checkpoint_id=?", [.text(item.id.uuidString)]).isEmpty else {
+                        throw AstraError("checkpoint.retentionOwned", "Another agent still owns this checkpoint.")
+                    }
+                    try database.execute("UPDATE checkpoints SET archived=1 WHERE id=?", [.text(item.id.uuidString)])
+                    try database.execute("INSERT INTO checkpoint_cleanup(checkpoint_id,agent_id,document,created) VALUES(?,?,?,?)", [
+                        .text(item.id.uuidString), .text(current.agentID.uuidString), .blob(try encode(item.checkpoint)), .real(Date().timeIntervalSince1970)])
+                }
+            }
+        }
+        var deleted = 0, failures: [String] = []
+        for item in current.items where item.disposition != .unlinkShared {
+            do {
+                // This synchronous actor segment admits no new catalog owner.
+                // Recheck filesystem shape; no symlink is followed for cleanup.
+                _ = try CheckpointArtifactFiles.bytes(root: root, id: item.id)
+                let directory = try CheckpointArtifactFiles.directory(root: root, id: item.id)
+                if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
+                try database.execute("DELETE FROM checkpoint_cleanup WHERE checkpoint_id=?", [.text(item.id.uuidString)])
+                deleted += 1
+            } catch {
+                let message = "\(item.checkpoint.name): \(error.localizedDescription) Retry the pending cleanup from Manage Checkpoints."
+                failures.append(message)
+                try database.execute("UPDATE checkpoint_cleanup SET issue=? WHERE checkpoint_id=?", [.text(message), .text(item.id.uuidString)])
+            }
+        }
+        return .init(unlinked: current.items.filter { $0.disposition == .unlinkShared }.count, deleted: deleted, issues: failures)
     }
 }

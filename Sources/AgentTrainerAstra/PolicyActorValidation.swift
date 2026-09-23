@@ -42,7 +42,11 @@ enum PolicyActorValidation {
     static func snapshot(_ snapshot: PolicyActorSnapshot, now: UInt64, previousCutoff: UInt64?, periodMS: Int,
                          episodeStep: UInt64, previousEvent: UInt64?, collecting: Bool) throws -> [SurfaceDescriptor] {
         let input = snapshot.controls, cutoff = input.cutoffNanos
-        guard snapshot.frames.count == 1, input.intervalCovered, input.controlState.valid,
+        guard (1...16).contains(snapshot.frames.count),
+              Set(snapshot.frames.map { $0.metadata.surface.id }).count == snapshot.frames.count,
+              Set(snapshot.frames.map { $0.metadata.id }).count == snapshot.frames.count,
+              snapshot.frames.allSatisfy({ (4...FrameArchive.maximumFrameBytes).contains($0.metadata.byteCount) }),
+              snapshot.frames.reduce(0, { $0 + $1.metadata.byteCount }) <= 256 * 1024 * 1024, input.intervalCovered, input.controlState.valid,
               input.controlState.pointer.isFinite, input.controlState.observedNanos <= cutoff, cutoff <= now,
               input.executedEvents.count <= 2048 else {
             throw AstraError("inference.inputCoverage", "A complete causal source and settled input observation are required.")
@@ -84,7 +88,7 @@ enum PolicyActorValidation {
 
     static func result(_ value: JSONValue, checkpoint: CheckpointDocument, runID: UUID, episodeID: UUID,
                        previousState: UUID, observationID: UUID, cutoff: UInt64, sequence: UInt64,
-                       surfaces: [SurfaceDescriptor], policy: InferencePolicyDetails) throws -> ActionPacket {
+                       surfaces: [SurfaceDescriptor], geometryRevision: UInt64? = nil, policy: InferencePolicyDetails) throws -> ActionPacket {
         let packet = try value.required("packet").decode(ActionPacket.self)
         let deadline = cutoff.addingReportingOverflow(UInt64(policy.leadMS) * 1_000_000)
         let end = deadline.partialValue.addingReportingOverflow(UInt64(policy.periodMS) * 1_000_000)
@@ -95,12 +99,12 @@ enum PolicyActorValidation {
               ["logProbability", "conditionalEntropy", "value"].allSatisfy({ value.fields?[$0]?.double?.isFinite == true }),
               try value.required("surfaces").decode([SurfaceDescriptor].self) == surfaces,
               packet.runID == runID, packet.sequence == sequence, packet.observationID == observationID,
-              packet.geometryRevision == surfaces.first?.geometryRevision,
+              packet.geometryRevision == (geometryRevision ?? surfaces.first?.geometryRevision),
               !deadline.overflow, !end.overflow, packet.executeAtNanos == deadline.partialValue,
               packet.durationMs == policy.periodMS else {
             throw AstraError("inference.resultIdentity", "The actor returned inconsistent policy, state, observation or packet evidence.")
         }
-        return try packet.validated(capabilities: policy.capabilities, surfaces: surfaces, capacity: policy.capacity)
+        return try packet.validated(capabilities: policy.capabilities, surfaces: surfaces, capacity: policy.capacity, expectedGeometryRevision: geometryRevision ?? surfaces.first?.geometryRevision)
     }
 
     static func collection(_ value: JSONValue, packet: ActionPacket, checkpoint: CheckpointDocument,

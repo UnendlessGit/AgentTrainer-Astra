@@ -19,9 +19,13 @@ struct PolicyActorSnapshot: Sendable {
     let observationID: UUID
     let frames: [InferenceImage]
     let controls: ControlObservation
+    let geometryRevision: UInt64
 
     init(observationID: UUID = UUID(), frame: InferenceImage, controls: ControlObservation) {
-        self.observationID = observationID; frames = [frame]; self.controls = controls
+        self.init(observationID: observationID, frames: [frame], geometryRevision: frame.metadata.surface.geometryRevision, controls: controls)
+    }
+    init(observationID: UUID = UUID(), frames: [InferenceImage], geometryRevision: UInt64, controls: ControlObservation) {
+        self.observationID = observationID; self.frames = frames; self.geometryRevision = geometryRevision; self.controls = controls
     }
 }
 
@@ -35,8 +39,11 @@ struct PolicyActorOwnedObservation: Sendable {
     let actorInput: JSONValue
     let frames: [Frame]
 
-    /// The current native collector is single-source. Keep the session's owned
-    /// frames explicit so a later multi-surface collector cannot silently drop one.
+    func collected() -> InferenceCollectedObservation {
+        .init(runID: runID, actorInput: actorInput, frames: frames)
+    }
+
+    /// Legacy single-source adapters must explicitly reject a source group.
     func singleSource() throws -> InferenceCollectedObservation {
         guard frames.count == 1, let frame = frames.first else {
             throw AstraError("inference.collectorSurfaces", "This collector requires exactly one observed surface.")
@@ -112,10 +119,10 @@ actor PolicyActorSession {
     let runID: UUID
     private let sessionID = UUID()
     private let ringURL: URL
-    private let slotCapacity: Int
+    private let slotCapacities: [Int]
     private let runtime: InferenceRuntime
     private let clock: @Sendable () -> UInt64
-    private var ring: SharedFrameRing?
+    private var ring: ObservationFrameRings?
     private var checkpoint: PolicyActorCheckpoint?
     private(set) var policy: InferencePolicyDetails?
     private var collecting = false
@@ -131,6 +138,7 @@ actor PolicyActorSession {
     private var lastCutoff: UInt64?
     private var lastEventSequence: UInt64?
     private var episodeSurfaces: [SurfaceDescriptor]?
+    private var episodeGeometryRevision: UInt64?
     private var lastProgress: JSONValue?
     private var progressKnown = true
     private var stopped = false
@@ -143,9 +151,9 @@ actor PolicyActorSession {
     private var forceInterrupted = false
     private var learningPauseID: UUID?
 
-    init(runID: UUID, ringURL: URL, slotCapacity: Int, runtime: InferenceRuntime,
+    init(runID: UUID, ringURL: URL, slotCapacity: Int, slotCapacities: [Int]? = nil, runtime: InferenceRuntime,
          clock: @escaping @Sendable () -> UInt64 = { MonotonicClock.now }) {
-        self.runID = runID; self.ringURL = ringURL; self.slotCapacity = slotCapacity
+        self.runID = runID; self.ringURL = ringURL; self.slotCapacities = slotCapacities ?? [slotCapacity]
         self.runtime = runtime; self.clock = clock
     }
 
@@ -273,16 +281,17 @@ actor PolicyActorSession {
         }
         _ = try selected.document.validated()
         guard selected.directory.isFileURL, ringURL.isFileURL else { throw AstraError("inference.path", "Actor artifacts require local paths.") }
-        let ring = try await Task.detached { [ringURL, runID, slotCapacity] in
-            try SharedFrameRing(url: ringURL, runID: runID, slotCount: 2, slotCapacity: slotCapacity)
+        let ring = try await Task.detached { [ringURL, runID, slotCapacities] in
+            try ObservationFrameRings(url: ringURL, runID: runID, capacities: slotCapacities)
         }.value
         self.ring = ring
         if forceInterrupted { throw CancellationError() }
         try PolicyActorValidation.hello(try await runtime.start())
         if forceInterrupted { throw CancellationError() }
         var fields: [String: JSONValue] = ["checkpointPath": .string(selected.directory.path),
-            "ring": .object(["path": .string(ring.url.path), "ringID": .string(ring.ringID.uuidString.lowercased())]),
+            "ring": ring.descriptors[0],
             "collection": .bool(collection), "deterministic": .bool(deterministic)]
+        if ring.rings.count > 1 { fields["additionalRings"] = .array(Array(ring.descriptors.dropFirst())) }
         var expected: JSONValue?
         let resuming: Bool
         switch mode {
@@ -305,7 +314,12 @@ actor PolicyActorSession {
         if case .resumeCollection = mode, reply.payload.fields?["resumedCollection"] != .bool(true) {
             throw AstraError("inference.resumeSource", "The actor did not authenticate its suspended collection cursor.")
         }
-        let details = try InferencePolicyDetails(reply.payload, checkpoint: selected.document, runID: runID, ringID: ring.ringID)
+        let details = try InferencePolicyDetails(reply.payload, checkpoint: selected.document, runID: runID, ringID: ring.primary.ringID)
+        if ring.rings.count > 1 {
+            guard try reply.payload.required("ringIDs").decode([UUID].self) == ring.rings.map(\.ringID) else {
+                throw AstraError("inference.frameTransport", "The actor did not open the complete ordered source transport.")
+            }
+        }
         let counters = try PolicyActorValidation.counters(reply.payload)
         guard reply.payload.fields?["needsReset"] == .bool(true), reply.payload.fields?["resumedActor"] == .bool(resuming),
               reply.payload.fields?["collection"] == .bool(collection), reply.payload.fields?["deterministic"] == .bool(deterministic),
@@ -357,7 +371,7 @@ actor PolicyActorSession {
             throw AstraError("inference.reset", "The actor did not confirm the expected checkpoint, recurrent reset and persistent counters.")
         }
         self.checkpoint = selected; episodeID = episode; stateID = state; self.contexts = contexts
-        resetGeneration = counters.generation; episodeStep = 0; lastEventSequence = nil; episodeSurfaces = nil
+        resetGeneration = counters.generation; episodeStep = 0; lastEventSequence = nil; episodeSurfaces = nil; episodeGeometryRevision = nil
         prediction = nil
         return reply
     }
@@ -373,24 +387,28 @@ actor PolicyActorSession {
         }
         let surfaces = try PolicyActorValidation.snapshot(snapshot, now: clock(), previousCutoff: lastCutoff,
             periodMS: policy.periodMS, episodeStep: episodeStep, previousEvent: lastEventSequence, collecting: collecting)
-        guard episodeSurfaces == nil || episodeSurfaces == surfaces else {
+        guard (episodeSurfaces == nil || episodeSurfaces == surfaces),
+              episodeGeometryRevision == nil || episodeGeometryRevision == snapshot.geometryRevision else {
             throw AstraError("inference.geometryChanged", "Surface geometry may change only at a confirmed environment reset.")
         }
         let published = try await Task.detached {
-            try snapshot.frames.map { image -> (SharedFrameReference, PolicyActorOwnedObservation.Frame) in
-                let pixels = try image.pixels()
-                let reference = try ring.publish(pixels: pixels, metadata: image.metadata)
-                return (reference, .init(metadata: reference.metadata, pixels: pixels, coverage: image.coverage))
+            let frames = try snapshot.frames.map { image in
+                PolicyActorOwnedObservation.Frame(metadata: image.metadata, pixels: try image.pixels(), coverage: image.coverage)
             }
+            let references = try ring.publish(frames)
+            let owned = zip(references, frames).map { reference, frame in
+                PolicyActorOwnedObservation.Frame(metadata: reference.metadata, pixels: frame.pixels, coverage: frame.coverage)
+            }
+            return (references, owned)
         }.value
-        let references = published.map(\.0)
+        let references = published.0
         var input: [String: JSONValue] = ["observationID": .string(snapshot.observationID.uuidString.lowercased()),
             "episodeID": .string(episodeID.uuidString.lowercased()), "previousStateID": .string(stateID.uuidString.lowercased()),
-            "cutoffNanos": .unsigned(snapshot.controls.cutoffNanos), "geometryRevision": .unsigned(surfaces[0].geometryRevision),
+            "cutoffNanos": .unsigned(snapshot.controls.cutoffNanos), "geometryRevision": .unsigned(snapshot.geometryRevision),
             "controlState": try .encode(snapshot.controls.controlState), "executedEvents": try .encode(snapshot.controls.executedEvents),
             "intervalCovered": .bool(true), "contextIDs": try .encode(contexts)]
         if let coverage = snapshot.controls.controlCoverageNanos { input["controlCoverageNanos"] = .unsigned(coverage) }
-        let owned = PolicyActorOwnedObservation(runID: runID, actorInput: .object(input), frames: published.map(\.1))
+        let owned = PolicyActorOwnedObservation(runID: runID, actorInput: .object(input), frames: published.1)
         input["frames"] = try .encode(references)
         if forceInterrupted { throw CancellationError() }
         do { try onObservation?(owned) }
@@ -412,7 +430,7 @@ actor PolicyActorSession {
         try PolicyActorValidation.success(reply, runID: runID)
         let packet = try PolicyActorValidation.result(reply.payload, checkpoint: checkpoint.document, runID: runID,
             episodeID: episodeID, previousState: stateID, observationID: snapshot.observationID,
-            cutoff: snapshot.controls.cutoffNanos, sequence: nextSequence, surfaces: surfaces, policy: policy)
+            cutoff: snapshot.controls.cutoffNanos, sequence: nextSequence, surfaces: surfaces, geometryRevision: snapshot.geometryRevision, policy: policy)
         var progress: JSONValue?
         if warmup {
             guard reply.payload.fields?["warmup"] == .bool(true), reply.payload.fields?["collectionRecord"] == nil else {
@@ -428,7 +446,7 @@ actor PolicyActorSession {
             self.stateID = try reply.payload.requiredUUID("stateID")
             nextSequence += 1; nextDraw += 1; self.episodeStep += 1
             lastCutoff = snapshot.controls.cutoffNanos; lastEventSequence = snapshot.controls.lastSequence
-            episodeSurfaces = surfaces; lastProgress = progress; progressKnown = true
+            episodeSurfaces = surfaces; episodeGeometryRevision = snapshot.geometryRevision; lastProgress = progress; progressKnown = true
         }
         return .init(response: reply, packet: packet, observation: owned, actorProgress: progress)
     }

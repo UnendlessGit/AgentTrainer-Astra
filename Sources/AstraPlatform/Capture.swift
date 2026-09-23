@@ -16,6 +16,50 @@ public struct CaptureSource: Identifiable, Hashable, Sendable {
     public var bounds: Rect2D
     public var pixelWidth: Int
     public var pixelHeight: Int
+    /// An application/desktop binds these exact leaves until the session ends.
+    public var bindings: [CaptureSource]? = nil
+
+    public init(id: String, name: String, kind: TargetKind, displayID: UInt32? = nil, windowID: UInt32? = nil,
+                applicationBundleID: String? = nil, applicationPID: Int32? = nil, applicationLaunchDate: Date? = nil,
+                bounds: Rect2D, pixelWidth: Int, pixelHeight: Int, bindings: [CaptureSource]? = nil) {
+        self.id = id; self.name = name; self.kind = kind; self.displayID = displayID; self.windowID = windowID
+        self.applicationBundleID = applicationBundleID; self.applicationPID = applicationPID
+        self.applicationLaunchDate = applicationLaunchDate; self.bounds = bounds
+        self.pixelWidth = pixelWidth; self.pixelHeight = pixelHeight; self.bindings = bindings
+    }
+
+    public func captureBindings() throws -> [CaptureSource] {
+        let leaves = bindings ?? [self]
+        guard (1...16).contains(leaves.count), Set(leaves.map(\.id)).count == leaves.count,
+              leaves.allSatisfy({ $0.bindings == nil && ($0.kind == .window || $0.kind == .display) }) else {
+            throw AstraError("capture.bindings", "Choose one to sixteen fixed window or display surfaces.")
+        }
+        for leaf in leaves {
+            _ = try leaf.surfaceDescriptor().validated()
+            guard (leaf.kind == .window && leaf.windowID != nil && leaf.applicationPID != nil)
+                    || (leaf.kind == .display && leaf.displayID != nil) else {
+                throw AstraError("capture.bindingIdentity", "A capture binding has no native source identity.")
+            }
+        }
+        if kind == .application {
+            guard windowID == nil, applicationPID != nil, leaves.allSatisfy({ $0.kind == .window
+                && $0.applicationPID == applicationPID && $0.applicationLaunchDate == applicationLaunchDate }) else {
+                throw AstraError("capture.applicationBindings", "The application surfaces do not belong to the same running application.")
+            }
+        } else if kind == .desktop {
+            guard leaves.allSatisfy({ $0.kind == .display }) else {
+                throw AstraError("capture.desktopBindings", "A desktop source must bind only displays.")
+            }
+        } else if bindings != nil {
+            throw AstraError("capture.groupKind", "Only an application or desktop can contain multiple capture bindings.")
+        }
+        return leaves
+    }
+
+    public func surfaceDescriptor() -> SurfaceDescriptor {
+        SurfaceDescriptor(id: id, globalBounds: bounds, pixelWidth: pixelWidth, pixelHeight: pixelHeight,
+                          nativeWindowID: windowID, nativeDisplayID: displayID)
+    }
 }
 
 public enum CaptureDiscovery {
@@ -44,7 +88,25 @@ public enum CaptureDiscovery {
                                  bounds: Rect2D(window.frame),
                                  pixelWidth: Int(width.rounded(.up)), pixelHeight: Int(height.rounded(.up)))
         }
-        return displays + windows.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let applications = Dictionary(grouping: windows, by: { $0.applicationPID! }).values.compactMap { leaves -> CaptureSource? in
+            guard leaves.count <= 16, let first = leaves.first else { return nil }
+            let ordered = leaves.sorted { $0.windowID! < $1.windowID! }
+            let name = content.applications.first(where: { $0.processID == first.applicationPID })?.applicationName ?? first.name
+            return CaptureSource(id: "application:\(first.applicationPID!)", name: "\(name) — all current windows",
+                kind: .application, applicationBundleID: first.applicationBundleID, applicationPID: first.applicationPID,
+                applicationLaunchDate: first.applicationLaunchDate, bounds: unionBounds(ordered),
+                pixelWidth: first.pixelWidth, pixelHeight: first.pixelHeight, bindings: ordered)
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let desktop: [CaptureSource] = displays.isEmpty || displays.count > 16 ? [] : [
+            CaptureSource(id: "desktop", name: "Whole desktop", kind: .desktop, bounds: unionBounds(displays),
+                pixelWidth: displays[0].pixelWidth, pixelHeight: displays[0].pixelHeight,
+                bindings: displays.sorted { $0.displayID! < $1.displayID! })
+        ]
+        return desktop + displays + applications + windows.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    private static func unionBounds(_ sources: [CaptureSource]) -> Rect2D {
+        Rect2D(sources.dropFirst().reduce(sources[0].bounds.cgRect) { $0.union($1.bounds.cgRect) })
     }
 }
 
@@ -70,7 +132,8 @@ enum CaptureGeometry {
                             width: contentRect.width * scaleFactor, height: contentRect.height * scaleFactor)
         var descriptor = SurfaceDescriptor(id: previous.id, globalBounds: Rect2D(screenRect),
                                            pixelWidth: pixelWidth, pixelHeight: pixelHeight,
-                                           contentBounds: pixels, geometryRevision: previous.geometryRevision)
+                                           contentBounds: pixels, geometryRevision: previous.geometryRevision,
+                                           nativeWindowID: previous.nativeWindowID, nativeDisplayID: previous.nativeDisplayID)
         _ = try descriptor.validated()
         if previous.globalBounds != descriptor.globalBounds || previous.pixelWidth != descriptor.pixelWidth
             || previous.pixelHeight != descriptor.pixelHeight || previous.contentBounds != descriptor.contentBounds {
@@ -127,7 +190,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
     public typealias FrameHandler = @Sendable (CapturedFrame) -> Void
     public typealias HealthHandler = @Sendable (CaptureHealth) -> Void
     private let lock = NSLock()
-    private let outputQueue = DispatchQueue(label: "astra.capture.output", qos: .userInitiated)
+    private let outputQueue: DispatchQueue
     private var stream: SCStream?
     private var generation: UUID?
     private var source: CaptureSource?
@@ -138,7 +201,8 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
     private var startingCompletion: AsyncCompletion?
     private var stopTask: Task<Void, Never>?
 
-    public override init() { super.init() }
+    public override init() { outputQueue = DispatchQueue(label: "astra.capture.output", qos: .userInitiated); super.init() }
+    init(outputQueue: DispatchQueue) { self.outputQueue = outputQueue; super.init() }
 
     public func start(source: CaptureSource, fps: Int, showsCursor: Bool,
                       onFrame: @escaping FrameHandler, onHealth: @escaping HealthHandler) async throws {
@@ -146,8 +210,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
             throw AstraError("permission.screenRecording", "Screen Recording permission is required for this environment.")
         }
         guard (1...120).contains(fps) else { throw AstraError("capture.rate", "Choose a capture rate between 1 and 120 fps.") }
-        let initialSurface = try SurfaceDescriptor(id: source.id, globalBounds: source.bounds,
-                                                    pixelWidth: source.pixelWidth, pixelHeight: source.pixelHeight).validated()
+        let initialSurface = try source.surfaceDescriptor().validated()
         guard source.pixelWidth * source.pixelHeight * 4 <= FrameArchive.maximumFrameBytes else {
             throw AstraError("capture.frameTooLarge", "This capture exceeds the recording frame memory limit.")
         }

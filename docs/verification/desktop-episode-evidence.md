@@ -36,3 +36,5 @@ A valid zero-actor join returns `.empty`: no fabricated begin, end, decision or 
 - rejection of unconfirmed cleanup.
 
 These are injected native protocol/lifecycle tests with the real collector session, frame-ring publication, reward queue and evaluator. They use neither a GPU nor OS input/capture. Installed target collection, real manual-feedback ownership, the persistent actor/reset loop, and end-to-end desktop PPO remain separate integration gates.
+
+The episode runner and evidence bridge accept complete ordered source groups. Every bound surface must remain present, match its original descriptor and supply fresh source evidence; a partial group stops collection. Reward warmup/analysis receive all images and coverage records, collector reservations count all retained pixels, actor frame IDs preserve group order, and packet geometry is checked against the group revision rather than a single surface revision. Single-source fixture APIs remain supported explicitly. The multi-source transport increment received an incremental build; installed multi-display capture remains a release qualification gate.

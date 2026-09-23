@@ -32,21 +32,25 @@ struct RecordingRangeDraft: Identifiable, Equatable {
 }
 
 struct RecordingSelectionEditor: View {
+    let contextVocabulary: ContextVocabulary
     let recording: RecordingManifest
     let agentName: String
     let playheadSeconds: Double
     let onSave: (RecordingTrainingSelection) async -> String?
     var onDirty: (Bool) -> Void = { _ in }
     var onSaving: (Bool) -> Void = { _ in }
+    @State private var contextValues: [UUID: UUID]
     @State private var whole: Bool
     @State private var draft: [RecordingRangeDraft]
     @State private var saved: RecordingTrainingSelection?
     @State private var saving = false
     @State private var saveError: String?
 
-    init(recording: RecordingManifest, agentName: String, selection: RecordingTrainingSelection?, playheadSeconds: Double,
+    init(recording: RecordingManifest, agentName: String, selection: RecordingTrainingSelection?, playheadSeconds: Double, contextVocabulary: ContextVocabulary = .empty,
          onSave: @escaping (RecordingTrainingSelection) async -> String?, onDirty: @escaping (Bool) -> Void = { _ in },
          onSaving: @escaping (Bool) -> Void = { _ in }) {
+        self.contextVocabulary = contextVocabulary
+        _contextValues = State(initialValue: selection?.contextValues ?? [:])
         self.recording = recording; self.agentName = agentName; self.playheadSeconds = playheadSeconds
         self.onSave = onSave; self.onDirty = onDirty
         self.onSaving = onSaving
@@ -57,8 +61,10 @@ struct RecordingSelectionEditor: View {
 
     private var chosen: Result<RecordingTrainingSelection, any Error> {
         Result {
-            let selection = whole ? .whole : RecordingTrainingSelection(ranges: try draft.map { try $0.range(origin: recording.firstObservedNanos ?? 0) }
+            var selection = whole ? .whole : RecordingTrainingSelection(ranges: try draft.map { try $0.range(origin: recording.firstObservedNanos ?? 0) }
                 .sorted { ($0.startNanos, $0.endNanos) < ($1.startNanos, $1.endNanos) })
+            selection.contextValues = contextValues.isEmpty ? nil : contextValues
+            _ = try contextVocabulary.indices(for: contextValues)
             _ = try selection.resolved(for: recording)
             return selection
         }
@@ -106,6 +112,13 @@ struct RecordingSelectionEditor: View {
                         if let nextRange { draft.append(nextRange); draft.sort { $0.start < $1.start } }
                     }.disabled(nextRange == nil)
                         .help(nextRange == nil ? "Shorten an existing interval to leave time for another one." : "Add an interval in unselected time.")
+                }
+                if !contextVocabulary.fields.isEmpty {
+                    Divider()
+                    Text("Context for these demonstrations").font(.headline)
+                    ContextAssignmentPickers(vocabulary: contextVocabulary, values: $contextValues)
+                    Text("These values apply to the selected intervals for this agent and are frozen into each new dataset.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if case .failure(let error) = chosen { AttentionLabel(message: error.localizedDescription).font(.callout) }
                 if let saveError { AttentionLabel(message: saveError).font(.callout) }

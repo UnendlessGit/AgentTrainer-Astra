@@ -21,7 +21,7 @@ from astra.checkpoints import _publish, _sync
 from astra.model.config import ModelConfig
 from astra.model.actions import ActionVocabulary
 from astra.model.observation import ObservationBatch
-from astra.recordings import RecordingReader, RecordingError, _json, _integer, _regular, validate_frame
+from astra.recordings import RecordingReader, RecordingError, _json, _integer, _regular, validate_frame, validate_surface_ids, validate_frame_coverage
 from .history import ControlHistory
 from .preprocessing import prepare_surface
 from .actions import (canonicalize, quantized_event_nanos, ActionEncodingError, CANONICALIZER_VERSION,
@@ -35,6 +35,7 @@ MAXIMUM_SOURCE_READERS = 4
 MAXIMUM_INTERVAL_EVENTS = 100_000
 MAXIMUM_INTERVAL_EVENT_BYTES = 16 * 1024**2
 MAXIMUM_SELECTION_RANGES = 256
+MAXIMUM_FRAME_AGE_MS = 250
 
 
 def _selection(selection: RecordingSelection, config: ModelConfig) -> None:
@@ -106,11 +107,19 @@ class RecordingSelection:
         return cls(**fields)
 
 
-def _ranges(manifest: dict, selection: RecordingSelection) -> tuple[RecordingRange, ...]:
+def _ranges(manifest: dict, selection: RecordingSelection, supervision_start_nanos: int = 0) -> tuple[RecordingRange, ...]:
     first, last = _interval(manifest, RecordingSelection(selection.recording_id))
     if selection.ranges is None:
         start, end = _interval(manifest, selection)
+        if selection.start_nanos is None:
+            start = max(start, supervision_start_nanos)
+        elif start < supervision_start_nanos:
+            raise RecordingError("Explicit correction range starts before expert supervision; review its start time")
+        if start >= end:
+            raise RecordingError("The recording has no source interval after expert supervision begins")
         return (RecordingRange(start, end),)
+    if any(item.start_nanos < supervision_start_nanos for item in selection.ranges):
+        raise RecordingError("Explicit correction range starts before expert supervision; review its start time")
     if any(item.start_nanos < first or item.end_nanos > last for item in selection.ranges):
         raise RecordingError("Recording range extends beyond verified source coverage")
     return selection.ranges
@@ -177,6 +186,46 @@ def _validate_partition(value: dict, config: ModelConfig) -> None:
             raise RecordingError("Dataset label exclusion is inconsistent with its source/grid")
 
 
+def _surface_roles(reader: RecordingReader, maximum: int) -> tuple[str, ...]:
+    # New captures declare role order before any stream emits its first frame.
+    # Arrival order and native window identifiers must never choose model roles.
+    if "surfaceIDs" in reader.manifest:
+        roles = validate_surface_ids(reader.manifest["surfaceIDs"])
+    else:
+        rows = list(reader.connection.execute("SELECT DISTINCT json_extract(CAST(block AS TEXT),'$.metadata.surface.id') FROM frames LIMIT 2"))
+        if len(rows) != 1:
+            raise RecordingError("A multi-surface recording needs explicit ordered surfaceIDs")
+        roles = validate_surface_ids([rows[0][0]])
+    if len(roles) > maximum:
+        raise RecordingError("Recording surface roles exceed the model capacity")
+    return roles
+
+
+def _causal_frames(references: list[dict], roles: tuple[str, ...], cutoff: int, maximum_age_ms: int,
+                   coverage: list[dict | None]) -> list[dict]:
+    if not isinstance(references, list) or len(references) != len(roles):
+        raise RecordingError("Every observation needs every required surface role")
+    if not isinstance(coverage, list) or len(coverage) != len(roles):
+        raise RecordingError("Every surface needs its own visual coverage binding")
+    metadata = []
+    for reference, role, proof in zip(references, roles, coverage):
+        if not isinstance(reference, dict) or set(reference) != {"shard", "block"} or not isinstance(reference["block"], dict):
+            raise RecordingError("Invalid dataset frame reference")
+        frame = validate_frame(reference["block"].get("metadata"))
+        if frame["surface"]["id"] != role:
+            raise RecordingError("Dataset frame order differs from its immutable surface roles")
+        if not frame["eventNanos"] <= frame["observedNanos"] <= cutoff:
+            raise RecordingError("Dataset frame would leak beyond the observation cutoff")
+        through = frame["eventNanos"]
+        if proof is not None:
+            validate_frame_coverage(proof, frame=frame, cutoff=cutoff)
+            through = proof["throughNanos"]
+        if cutoff - through > maximum_age_ms * 1_000_000:
+            raise RecordingError(f"Required surface {role} has stale visual coverage; select a continuously observed range")
+        metadata.append(frame)
+    return metadata
+
+
 def build_dataset(destination: Path, *, recording_root: Path, selections: list[RecordingSelection],
                   config: ModelConfig, vocabulary: ActionVocabulary, pointer_mode: str,
                   split_seed: int = 0, cancelled=lambda: False) -> dict:
@@ -208,6 +257,7 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
         errors = []
         total = 0
         episode_count = 0
+        prefix_exclusions = 0
         for selection, recording_id in zip(selections, ids):
             if cancelled():
                 raise InterruptedError("Dataset creation cancelled")
@@ -217,14 +267,33 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
                 manifest = reader.manifest
                 if manifest["frameCount"] == 0:
                     raise RecordingError("Selected recording has no complete frames")
-                roles = list(reader.connection.execute("SELECT DISTINCT json_extract(CAST(block AS TEXT),'$.metadata.surface.id') FROM frames LIMIT 2"))
-                if len(roles) != 1:
-                    raise RecordingError("This recording needs aligned multi-surface observations; single-surface dataset construction cannot discard its other surfaces")
-                chosen_ranges = _ranges(manifest, selection)
+                roles = _surface_roles(reader, config.maximum_surfaces)
+                chosen_ranges = _ranges(manifest, selection, reader.supervision_start_nanos)
+                if len(roles) > 1 and selection.ranges is None and selection.start_nanos is None:
+                    first_by_role = {row[0]: row[1] for row in reader.connection.execute(
+                        "SELECT json_extract(CAST(block AS TEXT),'$.metadata.surface.id'), MIN(observed) FROM frames GROUP BY 1")}
+                    if any(role not in first_by_role for role in roles):
+                        raise RecordingError("A required recording surface never produced a frame")
+                    first_complete = max(first_by_role[role] for role in roles)
+                    if first_complete > chosen_ranges[0].start_nanos:
+                        excluded_start = chosen_ranges[0].start_nanos
+                        count = reader.connection.execute("SELECT COUNT(*) FROM events WHERE source_time>=? AND source_time<? AND json_extract(CAST(event AS TEXT),'$.origin')='physical'", (excluded_start, first_complete)).fetchone()[0]
+                        if prefix_exclusions < 8:
+                            warnings.append(f"Recording {recording_id}: the automatic range starts at {first_complete} ns, when all required surfaces are available; excluded the initial {first_complete - excluded_start} ns and {count} physical events. Original frames/events are unchanged.")
+                        prefix_exclusions += 1
+                        chosen_ranges = (RecordingRange(first_complete, chosen_ranges[0].end_nanos),)
                 source_spec = {"id": recording_id, "manifestSHA256": hashlib.sha256(_dump(manifest).encode()).hexdigest(),
                                "split": splits[recording_id], "selection": {"recording_id": recording_id,
                                "ranges": [asdict(item) for item in chosen_ranges], "context_ids": list(selection.context_ids)},
-                               "labelPartitions": []}
+                               "labelPartitions": [], "surfaceIDs": list(roles)}
+                if reader.correction is not None:
+                    source_spec["correction"] = {
+                        "descriptor": manifest["correction"],
+                        **{key: reader.correction[key] for key in ("sourceRunID", "sourceCheckpointID", "sourcePolicySignature", "contextIDs", "supervisionStartNanos")},
+                        "preRollUse": "review_only"}
+                    if prefix_exclusions < 8:
+                        warnings.append(f"Recording {recording_id}: expert supervision begins at {reader.supervision_start_nanos} ns. Retained policy lead-up is review-only; training starts a fresh recurrent sequence.")
+                    prefix_exclusions += 1
                 sources.append(source_spec)
                 # Two independent event cursors prevent the shifted label stream
                 # from contaminating causal control history at t.
@@ -238,10 +307,17 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
                 frame_stream = iter(reader.frames())
                 streams.callback(frame_stream.close)
                 future_frame = next(frame_stream, None)
-                current_frame = None
-                verified_frame = None
+                coverage_stream = iter(reader.coverage())
+                streams.callback(coverage_stream.close)
+                future_coverage = next(coverage_stream, None)
+                current_coverage = {}
+                current_frames = {}
+                verified_frames = None
+                binding_geometry = None
+                geometry_epoch = 0
                 prepared_layout = None
                 label_pointer = None
+                label_surface = None
                 # Sorted ranges share monotonic source cursors, but each range
                 # starts a new recurrent episode and discards transient gap deltas.
                 for selection_index, chosen_range in enumerate(chosen_ranges):
@@ -267,8 +343,10 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
                         observed = next(observations, None)
                     history.advance_interval()
                     def consume_label():
-                        nonlocal labeled, label_pointer
+                        nonlocal labeled, label_pointer, label_surface
                         event = labeled
+                        if reader.correction is not None and event["origin"] == "agent" and start <= event["eventNanos"] < end:
+                            raise ActionEncodingError("Correction expert coverage contains agent input; policy actions cannot be treated as human supervision")
                         quantized = quantized_event_nanos(event["eventNanos"], grid_origin_nanos=execution_origin)
                         if execution_origin <= event["eventNanos"] < execution_end and (event["origin"] == "boundary" or event["kind"] == "gap"):
                             raise ActionEncodingError("Selected action coverage contains an input discontinuity, including at a quantized boundary")
@@ -286,6 +364,7 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
                                         "eventNanos": event["eventNanos"], "quantizedNanos": quantized, "side": side})
                         if event.get("x") is not None and event.get("y") is not None and event["origin"] in ("physical", "reconciliation"):
                             label_pointer = (event["x"], event["y"])
+                            label_surface = event.get("surfaceID")
                         labeled = next(labels, None)
                         return event
                     current_geometry = None
@@ -308,13 +387,30 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
                         while future_frame is not None and future_frame["block"]["metadata"]["observedNanos"] <= cutoff:
                             candidate = future_frame
                             future_frame = next(frame_stream, None)
-                            if candidate["block"]["metadata"]["eventNanos"] <= cutoff:
-                                current_frame = candidate
-                        if current_frame is None:
-                            raise RecordingError("Selected interval has no causal observation; action labels cannot be discarded")
-                        metadata = current_frame["block"]["metadata"]
-                        surface = metadata["surface"]
-                        geometry = _dump(surface)
+                            frame_metadata = candidate["block"]["metadata"]
+                            role = frame_metadata["surface"]["id"]
+                            if role not in roles:
+                                raise RecordingError("Recording contains a surface outside its declared roles")
+                            if frame_metadata["eventNanos"] > frame_metadata["observedNanos"]:
+                                raise RecordingError("A source frame cannot be available before its event time")
+                            current_frames[role] = candidate
+                        if any(role not in current_frames for role in roles):
+                            raise RecordingError("Selected interval has no causal observation for every required surface; action labels cannot be discarded")
+                        while future_coverage is not None and future_coverage["verifiedAtNanos"] <= cutoff:
+                            proof = future_coverage
+                            future_coverage = next(coverage_stream, None)
+                            role = proof["surface"]["id"]
+                            if role not in roles:
+                                raise RecordingError("Recorded source proof is outside its declared roles")
+                            current_coverage[role] = proof
+                        references = [current_frames[role] for role in roles]
+                        coverage = [current_coverage.get(role) if role in current_coverage and uuid.UUID(current_coverage[role]["frameID"]) == uuid.UUID(current_frames[role]["block"]["metadata"]["id"]) else None for role in roles]
+                        metadata = _causal_frames(references, roles, cutoff, MAXIMUM_FRAME_AGE_MS, coverage)
+                        surfaces = [item["surface"] for item in metadata]
+                        geometry = _dump(surfaces)
+                        if binding_geometry is not None and binding_geometry != geometry:
+                            geometry_epoch += 1
+                        binding_geometry = geometry
                         if current_geometry is not None and geometry != current_geometry:
                             seal_episode(); episode = str(uuid.uuid4()); episode_step = 0
                         current_geometry = geometry
@@ -328,6 +424,7 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
                         interval = []
                         interval_bytes = 0
                         initial_pointer = label_pointer
+                        initial_surface = label_surface
                         while labeled is not None and labeled["eventNanos"] < end and (
                                 quantized_event_nanos(labeled["eventNanos"], grid_origin_nanos=execution_origin) < execution + period):
                             interval_bytes += len(_dump(labeled).encode())
@@ -338,23 +435,26 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
                             raise RecordingError("Selected interval has no valid causal initial input state")
                         try:
                             packet = canonicalize(interval, start_nanos=execution, config=config, vocabulary=vocabulary,
-                                                  surfaces=[surface], pointer_mode=pointer_mode, initial_pointer=initial_pointer)
-                            if verified_frame != metadata["id"]:
-                                prepared = prepare_surface(reader.pixels(current_frame), metadata, config, pointer=None)
-                                observation = ObservationBatch((prepared.batch(),), mx.zeros((1, 1, config.control_width)), mx.zeros((1, 1)),
+                                                  surfaces=surfaces, pointer_mode=pointer_mode, initial_pointer=initial_pointer,
+                                                  initial_surface_id=initial_surface)
+                            frame_ids = tuple(item["id"] for item in metadata)
+                            if verified_frames != frame_ids:
+                                prepared = tuple(prepare_surface(reader.pixels(reference), item, config, pointer=None).batch()
+                                                 for reference, item in zip(references, metadata))
+                                observation = ObservationBatch(prepared, mx.zeros((1, 1, config.control_width)), mx.zeros((1, 1)),
                                                                 mx.zeros((1, 1, len(config.context_sizes)), dtype=mx.int32), mx.array([[True]]), mx.array([[True]]))
                                 prepared_layout = pointing_layout(observation)
-                                verified_frame = metadata["id"]
-                            encode_commands(packet.commands, config=config, vocabulary=vocabulary, visual=prepared_layout, surfaces=[surface])
+                                verified_frames = frame_ids
+                            encode_commands(packet.commands, config=config, vocabulary=vocabulary, visual=prepared_layout, surfaces=surfaces)
                         except ActionEncodingError as error:
                             if len(errors) < 100:
                                 errors.append({"recordingID": recording_id, "cutoffNanos": cutoff, "message": str(error)})
                             continue
                         # Validate pixels/checksum at construction. Readers recheck
                         # again on use so changed source can never silently train.
-                        controls = history.features(cutoff, [surface], interval_covered=True)
+                        controls = history.features(cutoff, surfaces, interval_covered=True)
                         database.execute("INSERT INTO steps VALUES(?,?,?,?,?,?,?,?)", (episode, episode_step, cutoff,
-                                         _dump(current_frame).encode(), controls.tobytes(), _dump(history.pointer).encode(),
+                                         _dump({"frames": references, "coverage": coverage, "geometryRevision": geometry_epoch}).encode(), controls.tobytes(), _dump(history.pointer).encode(),
                                          _dump(packet.commands).encode(), _dump(selection.context_ids).encode()))
                         history.advance_interval(); episode_step += 1; total += 1
                     seal_episode()
@@ -370,6 +470,8 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
             raise ActionEncodingError("Dataset action fit failed; no partial revision was published.\n" + preview)
         if not total:
             raise RecordingError("Dataset contains no usable control intervals")
+        if prefix_exclusions > 8:
+            warnings.append(f"Another {prefix_exclusions - 8} recordings also start at their first complete multi-surface observation; immutable source selections contain each exact start.")
         excluded = sum(sum(partition["excludedPhysicalEvents"].values()) for source in sources for partition in source["labelPartitions"])
         excluded_discrete = sum(sum(partition["excludedDiscreteEvents"].values()) for source in sources for partition in source["labelPartitions"])
         if excluded:
@@ -381,7 +483,7 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
             raise RecordingError("Dataset index exceeds its supported size")
         with (staging / "index.sqlite").open("rb") as stream:
             index_digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        manifest = {"schemaVersion": 2, "id": identifier, "model": config.to_dict(), "actions": vocabulary.to_dict(),
+        manifest = {"schemaVersion": 3, "maximumFrameAgeMs": MAXIMUM_FRAME_AGE_MS, "id": identifier, "model": config.to_dict(), "actions": vocabulary.to_dict(),
                     "canonicalizerVersion": CANONICALIZER_VERSION, "pointerMode": pointer_mode, "splitSeed": split_seed,
                     "sources": sources, "steps": total, "warnings": warnings, "indexSHA256": index_digest}
         description = _dump(manifest).encode()
@@ -415,11 +517,15 @@ class DatasetReader:
             self.manifest = _json(path.read_bytes(), limit=8 * 1024**2)
             manifest = self.manifest
             required = {"schemaVersion", "id", "model", "actions", "canonicalizerVersion", "pointerMode", "splitSeed", "sources", "steps", "warnings", "indexSHA256"}
+            if isinstance(manifest, dict) and manifest.get("schemaVersion") == 3:
+                required.add("maximumFrameAgeMs")
             if (not isinstance(manifest, dict) or set(manifest) != required
-                or type(manifest["schemaVersion"]) is not int or manifest["schemaVersion"] not in (1, 2)
+                or type(manifest["schemaVersion"]) is not int or manifest["schemaVersion"] not in (1, 2, 3)
                 or manifest["id"] != str(uuid.UUID(self.directory.name))
                 or type(manifest["canonicalizerVersion"]) is not int or manifest["canonicalizerVersion"] != CANONICALIZER_VERSION):
                 raise RecordingError("Unsupported dataset identity/version")
+            if manifest["schemaVersion"] == 3 and (type(manifest["maximumFrameAgeMs"]) is not int or manifest["maximumFrameAgeMs"] != MAXIMUM_FRAME_AGE_MS):
+                raise RecordingError("Unsupported dataset frame freshness contract")
             self.config = ModelConfig.from_dict(manifest["model"])
             self.vocabulary = ActionVocabulary.from_dict(manifest["actions"])
             if self.config.control_width != 178 or manifest["pointerMode"] not in ("absolute", "relative", "disabled"):
@@ -432,8 +538,21 @@ class DatasetReader:
             self._source_specs = {}
             for source in manifest["sources"]:
                 partition_key = "labelPartition" if manifest["schemaVersion"] == 1 else "labelPartitions"
-                if not isinstance(source, dict) or set(source) != {"id", "manifestSHA256", "split", "selection", partition_key}:
+                source_fields = {"id", "manifestSHA256", "split", "selection", partition_key}
+                if manifest["schemaVersion"] == 3:
+                    source_fields.add("surfaceIDs")
+                if isinstance(source, dict) and "correction" in source:
+                    source_fields.add("correction")
+                    correction = source["correction"]
+                    if (manifest["schemaVersion"] != 3 or not isinstance(correction, dict) or
+                            set(correction) != {"descriptor", "sourceRunID", "sourceCheckpointID", "sourcePolicySignature", "contextIDs", "supervisionStartNanos", "preRollUse"} or
+                            correction["preRollUse"] != "review_only"):
+                        raise RecordingError("Invalid dataset correction provenance")
+                if not isinstance(source, dict) or set(source) != source_fields:
                     raise RecordingError("Invalid dataset source description")
+                if manifest["schemaVersion"] == 3:
+                    if len(validate_surface_ids(source["surfaceIDs"])) > self.config.maximum_surfaces:
+                        raise RecordingError("Dataset source exceeds the model surface capacity")
                 identifier = str(uuid.UUID(source["id"]))
                 selection = source["selection"]
                 if (identifier != source["id"] or identifier in self._source_specs or not isinstance(selection, dict)
@@ -441,7 +560,7 @@ class DatasetReader:
                                           else {"recording_id", "ranges", "context_ids"})
                     or not isinstance(selection["context_ids"], list)):
                     raise RecordingError("Invalid or duplicated dataset source identity")
-                if manifest["schemaVersion"] == 2 and (not isinstance(selection["ranges"], list) or
+                if manifest["schemaVersion"] >= 2 and (not isinstance(selection["ranges"], list) or
                         any(not isinstance(item, dict) or set(item) != {"start_nanos", "end_nanos"} for item in selection["ranges"])):
                     raise RecordingError("Invalid dataset recording ranges")
                 chosen = RecordingSelection.from_payload(selection)
@@ -508,7 +627,15 @@ class DatasetReader:
                 if not reader.manifest["frameCount"] or "firstObservedNanos" not in reader.manifest:
                     raise RecordingError("Dataset source has no complete observation")
                 spec = self._source_specs[identifier]
-                chosen_ranges = _ranges(reader.manifest, spec["chosen"])
+                if self.manifest["schemaVersion"] == 3 and tuple(spec["surfaceIDs"]) != _surface_roles(reader, self.config.maximum_surfaces):
+                    raise RecordingError("Dataset surface order differs from its recording")
+                expected_correction = None if reader.correction is None else {
+                    "descriptor": reader.manifest["correction"],
+                    **{key: reader.correction[key] for key in ("sourceRunID", "sourceCheckpointID", "sourcePolicySignature", "contextIDs", "supervisionStartNanos")},
+                    "preRollUse": "review_only"}
+                if spec.get("correction") != expected_correction:
+                    raise RecordingError("Dataset correction provenance differs from its original recording")
+                chosen_ranges = _ranges(reader.manifest, spec["chosen"], reader.supervision_start_nanos)
                 if any((partition["sourceStartNanos"], partition["sourceEndNanos"]) != (interval.start_nanos, interval.end_nanos)
                        for partition, interval in zip(spec["partitions"], chosen_ranges)):
                     raise RecordingError("Dataset label partition does not match the source selection")
@@ -518,7 +645,7 @@ class DatasetReader:
         return reader
 
     def _validate_index(self):
-        range_names = ["selection_index"] if self.manifest["schemaVersion"] == 2 else []
+        range_names = ["selection_index"] if self.manifest["schemaVersion"] >= 2 else []
         for table, names, keys in (
             ("episodes", ["id", "recording_id", "split", "steps"] + range_names, [1, 0, 0, 0] + [0] * len(range_names)),
             ("steps", ["episode_id", "step", "cutoff", "frame", "controls", "pointer", "commands", "context"], [1, 2, 0, 0, 0, 0, 0, 0]),
@@ -580,7 +707,7 @@ class DatasetReader:
             raise ValueError("Invalid dataset episode range")
         source = self._source_specs[episode["recording_id"]]
         selection = source["chosen"]
-        selection_index = episode["selection_index"] if self.manifest["schemaVersion"] == 2 else 0
+        selection_index = episode["selection_index"] if self.manifest["schemaVersion"] >= 2 else 0
         cursor = self._database.execute("SELECT * FROM steps WHERE episode_id=? AND step>=? AND step<? ORDER BY step", (episode_id, start, start + count if count is not None else episode["steps"]))
         try:
             for row in cursor:
@@ -589,21 +716,33 @@ class DatasetReader:
                 if any(not isinstance(row[field], bytes) for field in ("frame", "pointer", "commands", "context")):
                     raise RecordingError("Dataset row metadata must use bounded JSON blobs")
                 reader = self._source(episode["recording_id"])
-                chosen_range = _ranges(reader.manifest, selection)[selection_index]
+                chosen_range = _ranges(reader.manifest, selection, reader.supervision_start_nanos)[selection_index]
                 first, end = chosen_range.start_nanos, chosen_range.end_nanos
                 cutoff = _integer(row["cutoff"])
                 if not first <= cutoff or cutoff + (self.config.lead_ms + self.config.period_ms) * 1_000_000 > end:
                     raise RecordingError("Dataset action interval escapes its source selection or valid coverage")
-                reference = _json(row["frame"])
-                if not isinstance(reference, dict) or set(reference) != {"shard", "block"} or not isinstance(reference["block"], dict):
-                    raise RecordingError("Invalid dataset frame reference")
-                metadata = validate_frame(reference["block"].get("metadata"))
-                if max(metadata["eventNanos"], metadata["observedNanos"]) > cutoff:
-                    raise RecordingError("Dataset frame would leak beyond the observation cutoff")
+                stored = _json(row["frame"])
+                if self.manifest["schemaVersion"] == 3:
+                    if not isinstance(stored, dict) or set(stored) != {"frames", "coverage", "geometryRevision"}:
+                        raise RecordingError("Invalid dataset observation binding")
+                    _integer(stored["geometryRevision"])
+                    references = stored["frames"]
+                    metadata = _causal_frames(references, tuple(source["surfaceIDs"]), cutoff, self.manifest["maximumFrameAgeMs"], stored["coverage"])
+                    if any(proof is not None and not reader.contains_coverage(proof) for proof in stored["coverage"]):
+                        raise RecordingError("Dataset unchanged-frame evidence is missing or changed in the recording")
+                else:
+                    references = [stored]
+                    if not isinstance(stored, dict) or set(stored) != {"shard", "block"} or not isinstance(stored["block"], dict):
+                        raise RecordingError("Invalid dataset frame reference")
+                    metadata = [validate_frame(stored["block"].get("metadata"))]
+                    if max(metadata[0]["eventNanos"], metadata[0]["observedNanos"]) > cutoff:
+                        raise RecordingError("Dataset frame would leak beyond the observation cutoff")
+                surfaces = [item["surface"] for item in metadata]
                 pointer = _json(row["pointer"])
                 if pointer is not None and (not isinstance(pointer, list) or len(pointer) != 2 or any(type(value) not in (int, float) or not math.isfinite(value) for value in pointer)):
                     raise RecordingError("Dataset pointer state is invalid")
-                prepared = prepare_surface(reader.pixels(reference), metadata, self.config, pointer=pointer)
+                prepared = tuple(prepare_surface(reader.pixels(reference), item, self.config, pointer=pointer).batch()
+                                 for reference, item in zip(references, metadata))
                 if not isinstance(row["controls"], bytes) or len(row["controls"]) != self.config.control_width * 4:
                     raise RecordingError("Dataset control feature storage is invalid")
                 controls = np.frombuffer(row["controls"], dtype=np.float32)
@@ -612,13 +751,13 @@ class DatasetReader:
                 context = _json(row["context"])
                 if context != list(selection.context_ids) or any(type(value) is not int for value in context):
                     raise RecordingError("Dataset context differs from its immutable source selection")
-                observation = ObservationBatch((prepared.batch(),), mx.array(controls)[None, None], mx.array([[self.config.period_ms / 1000]]),
+                observation = ObservationBatch(prepared, mx.array(controls)[None, None], mx.array([[self.config.period_ms / 1000]]),
                                                 mx.array(context, dtype=mx.int32)[None, None], mx.array([[row["step"] == 0]]), mx.array([[True]]))
                 commands = _json(row["commands"])
                 if not isinstance(commands, list):
                     raise RecordingError("Dataset commands must be an ordered packet")
-                encode_commands(commands, config=self.config, vocabulary=self.vocabulary, visual=pointing_layout(observation), surfaces=[metadata["surface"]])
-                yield LearningSample(observation, (metadata["surface"],), tuple(commands), episode_id, row["step"])
+                encode_commands(commands, config=self.config, vocabulary=self.vocabulary, visual=pointing_layout(observation), surfaces=surfaces)
+                yield LearningSample(observation, tuple(surfaces), tuple(commands), episode_id, row["step"])
         finally:
             if self._database is not None:
                 cursor.close()

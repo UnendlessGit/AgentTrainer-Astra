@@ -205,7 +205,7 @@ def test_multi_range_dataset_job_keeps_one_session_and_trains_both_episodes(work
             {"start_nanos": 1_002_000_000, "end_nanos": 1_022_000_000},
             {"start_nanos": 1_075_000_000, "end_nanos": 1_100_000_000}], "context_ids": []}],
         "model": model.to_dict(), "actions": vocabulary.to_dict(), "pointerMode": "absolute"})
-    assert prepared["manifest"]["schemaVersion"] == 2 and prepared["manifest"]["steps"] == 2
+    assert prepared["manifest"]["schemaVersion"] == 3 and prepared["manifest"]["steps"] == 2
     assert len(prepared["manifest"]["sources"]) == 1 and len(prepared["manifest"]["sources"][0]["labelPartitions"]) == 2
     origin = initial(worker, tmp_path, model=model, vocabulary=vocabulary)
     result = worker.job("train.behavioral", {"checkpointPath": str(origin), "destination": str(tmp_path / str(uuid.uuid4())),

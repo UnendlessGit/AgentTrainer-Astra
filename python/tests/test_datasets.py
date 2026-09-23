@@ -59,13 +59,20 @@ def _write_legacy_dataset_format(directory):
     path = directory / "manifest.json"
     manifest = json.loads(path.read_bytes())
     manifest["schemaVersion"] = 1
+    manifest.pop("maximumFrameAgeMs", None)
     for source in manifest["sources"]:
+        source.pop("surfaceIDs", None)
         ranges = source["selection"].pop("ranges")
         assert len(ranges) == 1
         source["selection"].update(ranges[0])
         source["labelPartition"] = source.pop("labelPartitions")[0]
     with sqlite3.connect(directory / "index.sqlite") as database:
         database.execute("ALTER TABLE episodes DROP COLUMN selection_index")
+        rows = list(database.execute("SELECT episode_id,step,frame FROM steps"))
+        for episode_id, step, raw in rows:
+            observation = json.loads(raw)
+            database.execute("UPDATE steps SET frame=? WHERE episode_id=? AND step=?",
+                             (json.dumps(observation["frames"][0]).encode(), episode_id, step))
     manifest["indexSHA256"] = hashlib.sha256((directory / "index.sqlite").read_bytes()).hexdigest()
     path.write_text(json.dumps(manifest))
 
@@ -83,7 +90,7 @@ def test_multiple_ranges_share_one_session_split_and_preserve_causal_state_acros
     manifest = build_dataset(destination, recording_root=source.parent,
         selections=[RecordingSelection(item.stem, ranges=ranges) for item in (source, other)],
         config=_configuration(), vocabulary=_vocabulary(), pointer_mode="absolute")
-    assert manifest["schemaVersion"] == 2 and len(manifest["sources"]) == 2
+    assert manifest["schemaVersion"] == 3 and len(manifest["sources"]) == 2
     assert {item["split"] for item in manifest["sources"]} == {"train", "validation"}
     with DatasetReader(destination, recording_root=source.parent) as reader:
         for split in ("train", "validation"):
@@ -307,7 +314,7 @@ def test_multiple_surface_roles_are_never_silently_reduced_to_the_latest_frame(t
     database.execute("UPDATE frames SET block=? WHERE id=?", (json.dumps(block).encode(), row[0]))
     database.commit(); database.close()
     destination = tmp_path / str(uuid.uuid4())
-    with pytest.raises(RecordingError, match="aligned multi-surface"):
+    with pytest.raises(RecordingError, match="explicit ordered surfaceIDs"):
         build_dataset(destination, recording_root=source.parent, selections=[RecordingSelection(source.stem)],
                       config=_configuration(), vocabulary=_vocabulary(), pointer_mode="absolute")
     assert not destination.exists()

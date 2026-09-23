@@ -22,12 +22,9 @@ public struct ControlScope: Codable, Hashable, Sendable {
               windowID == nil || applicationPID != nil else {
             throw AstraError("control.scope", "The control scope has invalid surfaces or target identity.")
         }
-        for surface in surfaces {
-            _ = try surface.validated()
-            guard surface.geometryRevision == geometryRevision else {
-                throw AstraError("control.geometry", "The control scope contains inconsistent surface revisions.")
-            }
-        }
+        // This revision identifies the immutable group scope. Each source has
+        // its own geometry history and must retain its original frame revision.
+        for surface in surfaces { _ = try surface.validated() }
         return self
     }
 }
@@ -101,7 +98,7 @@ public struct ControlLease: Sendable {
             throw AstraError("control.geometry", "The action uses a previous target geometry.")
         }
         _ = try packet.validated(capabilities: request.capabilities, surfaces: request.scope.surfaces,
-                                 capacity: request.packetCapacity)
+                                 capacity: request.packetCapacity, expectedGeometryRevision: request.scope.geometryRevision)
         nextSequence += 1
     }
 

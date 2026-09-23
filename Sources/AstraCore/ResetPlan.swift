@@ -32,7 +32,7 @@ public struct ResetPacketTemplate: Codable, Hashable, Sendable {
         _ = try validated()
         return try ActionPacket(runID: context.resetID, sequence: sequence, observationID: observationID,
             geometryRevision: context.scope.geometryRevision, executeAtNanos: executeAtNanos,
-            durationMs: durationMS, commands: commands).validated(capabilities: capabilities, surfaces: context.scope.surfaces, capacity: 64)
+            durationMs: durationMS, commands: commands).validated(capabilities: capabilities, surfaces: context.scope.surfaces, capacity: 64, expectedGeometryRevision: context.scope.geometryRevision)
     }
 }
 

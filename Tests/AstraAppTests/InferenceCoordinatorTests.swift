@@ -363,7 +363,7 @@ private final class CollectionSpy: @unchecked Sendable {
     let harness: InferenceHarness
     let coordinator: InferenceCoordinator
     let controlOwner: NativeControlOwner
-    let source = CaptureSource(id: "display:1", name: "Fixture display", kind: .display, displayID: 1,
+    let source = CaptureSource(id: "surface", name: "Fixture display", kind: .display, displayID: 1,
                                bounds: .init(x: 0, y: 0, width: 100, height: 100), pixelWidth: 32, pixelHeight: 32)
     init(mode: String) async throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("AstraInference-" + UUID().uuidString)

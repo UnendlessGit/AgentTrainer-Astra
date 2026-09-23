@@ -288,7 +288,7 @@ public final class NativeControlSession: @unchecked Sendable {
         try await submit(packet, mode: .preservingStop)
     }
     private func submit(_ packet: ActionPacket, mode: SubmissionMode) async throws -> NativeControlSubmission {
-        _ = try packet.validated(capabilities: configuration.capabilities, surfaces: configuration.scope.surfaces, capacity: configuration.packetCapacity)
+        _ = try packet.validated(capabilities: configuration.capabilities, surfaces: configuration.scope.surfaces, capacity: configuration.packetCapacity, expectedGeometryRevision: configuration.scope.geometryRevision)
         let promise = NativeReceiptPromise()
         let task = try lock.withLock { () throws -> Task<NativeControlSubmission, any Error> in
             let late = mode == .lateOnly || (mode == .preservingStop && stopped)

@@ -35,6 +35,7 @@ struct DesktopTrainingView: View {
     @State private var issue: String?
     @State private var initialized = false
     @State private var advancedExpanded = false
+    @State private var pendingSurfaceBindings: [UUID: [String: String]] = [:]
     init(agent: AgentDocument, model: WorkspaceModel, showAdvanced: Bool = false) {
         self.agent = agent; self.model = model; _advancedExpanded = State(initialValue: showAdvanced)
     }
@@ -72,6 +73,7 @@ struct DesktopTrainingView: View {
                     GroupBox("Saved experience waiting for feedback") {
                         VStack(alignment: .leading, spacing: 14) {
                             ForEach(pending) { item in
+                                VStack(alignment: .leading, spacing: 10) {
                                 HStack(alignment: .top) {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(item.checkpoint.name).fontWeight(.medium)
@@ -82,12 +84,24 @@ struct DesktopTrainingView: View {
                                     if item.collectedDecisions < (item.configuration.fields?["training"]?.fields?["rollout_decisions"]?.int ?? 0) {
                                         Button("Collect More") {
                                             guard let source else { return }
-                                            do { try model.reopenFeedback(item, source: source); issue = nil } catch { issue = error.localizedDescription }
-                                        }.disabled(source == nil || busy).help("Choose the current environment below; the saved policy and task stay unchanged.")
+                                            do { try model.reopenFeedback(item, source: source, surfaceBindings: pendingSurfaceBindings[item.id] ?? [:]); issue = nil } catch { issue = error.localizedDescription }
+                                        }.disabled(source == nil || busy || !canBind(savedProgram(item), source: source, choices: pendingSurfaceBindings[item.id] ?? [:]))
+                                            .help("Choose the current environment and bind the saved reward sources; the policy and task stay unchanged.")
                                     }
                                     Button("Review / Learn") {
                                         do { try model.reopenFeedback(item); issue = nil } catch { issue = error.localizedDescription }
                                     }.disabled(busy)
+                                }
+                                if item.collectedDecisions < (item.configuration.fields?["training"]?.fields?["rollout_decisions"]?.int ?? 0), let source {
+                                    if let savedProgram = savedProgram(item) {
+                                        RewardSourceBindingsView(program: savedProgram, source: source, choices: Binding(
+                                            get: { pendingSurfaceBindings[item.id] ?? [:] },
+                                            set: { pendingSurfaceBindings[item.id] = $0 }))
+                                            .disabled(busy)
+                                    } else {
+                                        AttentionLabel(message: "The saved reward definition is unavailable. Review the saved experience before collecting more.")
+                                    }
+                                }
                                 }
                             }
                             Text("Review uses saved observations with controls released. Explicitly review zero feedback; unreviewed intervals remain unknown.")
@@ -111,7 +125,7 @@ struct DesktopTrainingView: View {
                 GroupBox("Environment & feedback") {
                     VStack(alignment: .leading, spacing: 14) {
                         Picker("Environment", selection: $sourceID) {
-                            Text("Choose an application window or display").tag(nil as String?)
+                            Text("Choose an application, window, display or desktop").tag(nil as String?)
                             ForEach(model.sources) { Text($0.name).tag(Optional($0.id)) }
                         }
                         HStack {
@@ -124,6 +138,7 @@ struct DesktopTrainingView: View {
                             ForEach(model.rewardPrograms) { Text($0.name).tag(Optional($0.id)) }
                         }
                         if let program {
+                            if let source { RewardSourceBindingsView(program: program, source: source, choices: $options.surfaceBindings) }
                             Text(program.resetPlan == nil ? "You confirm Ready after resetting each episode. Physical keyboard or pointer input takes over immediately."
                                  : "The saved reset runs between episodes. Physical keyboard or pointer input takes over immediately.")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -151,15 +166,8 @@ struct DesktopTrainingView: View {
                              : "Each update collects at least \(options.training.rolloutDecisions.formatted()) decisions and finishes the current episode.")
                             .font(.caption).foregroundStyle(.secondary)
                         if options.initialCheckpointID == nil { controls }
-                        if !model.checkpointContextSizes.isEmpty && !options.resume {
-                            ForEach(model.checkpointContextSizes.indices, id: \.self) { index in
-                                LabeledContent("Context \(index + 1) · 0–\(model.checkpointContextSizes[index] - 1)") {
-                                    TextField("Context \(index + 1)", value: Binding(
-                                        get: { options.contextIDs.indices.contains(index) ? options.contextIDs[index] : 0 },
-                                        set: { value in if options.contextIDs.indices.contains(index) { options.contextIDs[index] = value } }), format: .number.grouping(.never))
-                                        .textFieldStyle(.roundedBorder).labelsHidden().frame(width: 140)
-                                }
-                            }
+                        if !options.resume {
+                            ContextValuePickers(vocabulary: activeVocabulary, sizes: activeContextSizes, indices: $options.contextIDs)
                         }
                         DisclosureGroup("Advanced learning settings", isExpanded: $advancedExpanded) { advanced.padding(.top, 10) }.disabled(options.resume)
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
@@ -178,7 +186,8 @@ struct DesktopTrainingView: View {
                         guard let source, let program else { return }
                         do { try model.startDesktopTraining(agent: agent, source: source, program: program, options: options); issue = nil }
                         catch { issue = error.localizedDescription }
-                    }.buttonStyle(.borderedProminent).disabled(busy || source == nil || program == nil || (try? options.validated()) == nil)
+                    }.buttonStyle(.borderedProminent).disabled(busy || source == nil || program == nil || (try? options.validated()) == nil
+                        || !canBind(program, source: source, choices: options.surfaceBindings))
                 }
             }.padding(.bottom, 24).padding(.trailing, 5)
         }.sheet(isPresented: $showingRewards) { RewardEditor(agent: agent, model: model) }
@@ -186,10 +195,27 @@ struct DesktopTrainingView: View {
                 guard !initialized else { return }; initialized = true
                 options.initialCheckpointID = agent.selectedCheckpointID; programID = agent.rewardProgramID
             }.onChange(of: agent.rewardProgramID) { _, value in programID = value }
+            .onChange(of: activeContextSizes) { _, sizes in options.contextIDs = sizes.map { _ in 0 } }
+            .onChange(of: activeVocabulary) { _, _ in options.contextIDs = activeContextSizes.map { _ in 0 } }
             .task(id: options.initialCheckpointID) {
                 await model.inspectCheckpointContexts(options.initialCheckpointID, agentID: agent.id)
-                options.contextIDs = Array(repeating: 0, count: model.checkpointContextSizes.count)
+                options.contextIDs = activeContextSizes.map { _ in 0 }
             }
+    }
+
+    private var activeVocabulary: ContextVocabulary? {
+        options.initialCheckpointID == nil ? (try? model.contextVocabulary(for: agent)) : model.checkpointContextVocabulary
+    }
+    private func savedProgram(_ document: PendingFeedbackDocument) -> RewardProgram? {
+        (try? document.configuration.required("rewardBinding").decode(RewardProgramBinding.self))?.definition
+    }
+    private func canBind(_ program: RewardProgram?, source: CaptureSource?, choices: [String: String]) -> Bool {
+        guard let program, let source, let leaves = try? source.captureBindings() else { return false }
+        return (try? RewardProgramBinding.bound(program, sourceIDs: choices,
+            scope: ControlScope(surfaces: leaves.map { $0.surfaceDescriptor() }))) != nil
+    }
+    private var activeContextSizes: [Int] {
+        options.initialCheckpointID == nil ? (activeVocabulary?.sizes ?? []) : model.checkpointContextSizes
     }
 
     private var controls: some View {
@@ -243,5 +269,52 @@ struct DesktopTrainingView: View {
             TextField(label, value: value, format: .number.precision(.significantDigits(1...8)))
                 .textFieldStyle(.roundedBorder).labelsHidden().frame(width: 140)
         }
+    }
+}
+
+/// The same explicit source selection is used for a fresh run and for saved
+/// feedback collection. Changing the source never remaps by title or position.
+private struct RewardSourceBindingsView: View {
+    let program: RewardProgram
+    let source: CaptureSource
+    @Binding var choices: [String: String]
+    private var references: [String] { RewardProgramBinding.referencedSurfaces(in: program).sorted() }
+    private var leaves: [CaptureSource] { (try? source.captureBindings()) ?? [] }
+    private var single: Bool { references.count <= 1 && leaves.count == 1 }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !references.isEmpty {
+                Text("Reward & reset sources").font(.subheadline.weight(.medium))
+                if single, let leaf = leaves.first {
+                    Text(leaf.name).foregroundStyle(.secondary)
+                } else {
+                    ForEach(references, id: \.self) { reference in
+                        Picker(label(reference), selection: Binding(get: { choices[reference] }, set: { choices[reference] = $0 })) {
+                            Text("Choose a captured surface").tag(nil as String?)
+                            ForEach(leaves) { leaf in Text(leaf.name).tag(Optional(leaf.id)) }
+                        }.help("Reference surface: \(reference). Used by the saved reward definition and reset actions.")
+                    }
+                    Text("Match each saved source to the surface it observes now. These choices also apply to reset actions.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .onAppear(perform: normalize)
+        .onChange(of: source) { _, _ in normalize() }
+        .onChange(of: program) { _, _ in normalize() }
+    }
+    private func label(_ reference: String) -> String {
+        let names = program.signals.filter { $0.surfaceID == reference }.map(\.name)
+        return names.isEmpty ? "Reset source · \(reference)" : names.joined(separator: ", ")
+    }
+    private func normalize() {
+        let available = Set(leaves.map(\.id))
+        var next: [String: String] = [:]
+        for reference in references {
+            if single, let id = leaves.first?.id { next[reference] = id }
+            else if let selected = choices[reference], available.contains(selected) { next[reference] = selected }
+            else if available.contains(reference) { next[reference] = reference }
+        }
+        if next != choices { choices = next }
     }
 }

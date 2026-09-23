@@ -6,16 +6,20 @@ import AstraPlatform
 /// settings. Capture discovery and checkpoint inspection remain explicit inputs.
 struct RunView: View {
     let coordinator: InferenceCoordinator?
+    var agentID: UUID? = nil
     let checkpoints: [CheckpointDocument]
     let sources: [CaptureSource]
     let refreshingSources: Bool
     let sourceIssue: String?
     let unavailableReason: String?
     var contextSizes: [Int] = []
+    var contextVocabulary: ContextVocabulary? = nil
     var selectedCheckpointID: UUID? = nil
     let refreshSources: () -> Void
     let selectCheckpoint: (UUID?) -> Void
     let start: (CheckpointDocument, CaptureSource, InferenceOptions) -> Void
+    var recordCorrection: (() -> Void)? = nil
+    var correctionStarting = false
     var acknowledgeCleanup: (() async throws -> Void)? = nil
 
     @State private var checkpointID: UUID?
@@ -51,6 +55,12 @@ struct RunView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(busy || checkpoint == nil || source == nil || !validOptions || unavailableReason != nil
                                       || coordinator?.requiresManualControlCleanupAcknowledgement == true)
+                        if let recordCorrection, let coordinator, coordinator.correctionOwnerID == agentID, coordinator.producedPackets > 0,
+                           busy || coordinator.canRecordCorrection {
+                            Button(correctionStarting ? "Preparing Correction…" : "Record Correction", systemImage: "record.circle", action: recordCorrection)
+                                .disabled(correctionStarting || coordinator.isStopping)
+                                .help("Release agent controls, then record your demonstration after a countdown. The preceding agent observations are saved for review only.")
+                        }
                         if busy, let coordinator {
                             Button("Stop Agent", role: .destructive) { Task { await coordinator.stopAndWait() } }
                                 .disabled(coordinator.isStopping)
@@ -73,6 +83,7 @@ struct RunView: View {
         .onChange(of: checkpoints.map(\.id)) { _, ids in
             if checkpointID.map({ !ids.contains($0) }) ?? true { chooseCheckpoint(ids.first) }
         }
+        .onChange(of: contextVocabulary) { _, _ in resetContexts() }
         .onChange(of: contextSizes) { _, _ in resetContexts() }
         .onChange(of: sources.map(\.id)) { _, ids in
             if sourceID.map({ !ids.contains($0) }) == true { sourceID = nil }
@@ -90,8 +101,8 @@ struct RunView: View {
                     }
                 }
                 Picker("Environment", selection: $sourceID) {
-                    Text("Choose a window or display").tag(nil as String?)
-                    ForEach(sources.filter { $0.kind == .window || $0.kind == .display }) { source in
+                    Text("Choose an environment").tag(nil as String?)
+                    ForEach(sources) { source in
                         Text(source.name).tag(Optional(source.id))
                     }
                 }
@@ -103,7 +114,7 @@ struct RunView: View {
                     AttentionLabel(message: sourceIssue, symbol: "exclamationmark.circle").font(.callout)
                 }
                 if let source {
-                    Text("\(source.pixelWidth) × \(source.pixelHeight) source pixels. The agent stops if the selected environment changes size or position.")
+                    Text("\((source.bindings ?? [source]).count) observed surface(s). The agent stops if a source changes size, position or membership.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 DisclosureGroup("Run settings") {
@@ -115,15 +126,7 @@ struct RunView: View {
                         TextField("Random seed", value: $options.seed, format: .number.grouping(.never))
                             .textFieldStyle(.roundedBorder)
                             .help("A whole number from 0 to 1,000,000,000. Reusing a seed repeats random choices when observations are identical.")
-                        if !contextSizes.isEmpty {
-                            Text("Context values stay fixed throughout this run.").font(.caption).foregroundStyle(.secondary)
-                            ForEach(contextSizes.indices, id: \.self) { index in
-                                let selection = Binding(get: { options.contextIDs.indices.contains(index) ? options.contextIDs[index] : 0 },
-                                                        set: { value in if options.contextIDs.indices.contains(index) { options.contextIDs[index] = value } })
-                                TextField("Context \(index + 1) · 0–\(contextSizes[index] - 1)", value: selection, format: .number.grouping(.never))
-                                    .textFieldStyle(.roundedBorder)
-                            }
-                        }
+                        ContextValuePickers(vocabulary: contextVocabulary, sizes: contextSizes, indices: $options.contextIDs)
                     }.padding(.top, 12)
                 }
             }.padding(10).disabled(busy)

@@ -33,7 +33,7 @@ final class CollectorSession: @unchecked Sendable {
         case controlAudit(WireMessage)
 
         var reservedBytes: Int {
-            if case .actor(_, _, let observation) = self { return AstraVersion.maximumMessageBytes * 2 + observation.pixels.count }
+            if case .actor(_, _, let observation) = self { return AstraVersion.maximumMessageBytes * 2 + observation.pixelByteCount }
             return AstraVersion.maximumMessageBytes * 2
         }
         var isControlAudit: Bool { if case .controlAudit = self { return true }; return false }
@@ -42,7 +42,7 @@ final class CollectorSession: @unchecked Sendable {
     let runID: UUID
     let collectionID: UUID
     let journalURL: URL
-    private let ring: SharedFrameRing
+    private let ring: ObservationFrameRings
     private let queue: CollectorQueue
     private let state: CollectorState
     private let runtime: CollectorRuntime
@@ -52,14 +52,14 @@ final class CollectorSession: @unchecked Sendable {
     private var finishing = false
     private var abandonmentReason: String?
 
-    private init(runID: UUID, collectionID: UUID, journalURL: URL, ring: SharedFrameRing,
+    private init(runID: UUID, collectionID: UUID, journalURL: URL, ring: ObservationFrameRings,
                  queue: CollectorQueue, state: CollectorState, runtime: CollectorRuntime) {
         self.runID = runID; self.collectionID = collectionID; self.journalURL = journalURL
         self.ring = ring; self.queue = queue; self.state = state; self.runtime = runtime
     }
 
-    static func start(runID: UUID, configuration: JSONValue, journalURL: URL, ringURL: URL, slotCapacity: Int,
-                      maximumQueuedBytes: Int = 256 * 1024 * 1024, maximumQueuedItems: Int = 128,
+    static func start(runID: UUID, configuration: JSONValue, journalURL: URL, ringURL: URL, slotCapacity: Int, slotCapacities: [Int]? = nil,
+                      maximumQueuedBytes: Int = 256 * 1024 * 1024 + 2 * AstraVersion.maximumMessageBytes, maximumQueuedItems: Int = 128,
                       factory: CollectorRuntime.Factory,
                       onEvent: @escaping @Sendable (WireMessage) -> Void = { _ in },
                       onFault: @escaping @Sendable (AstraError) -> Void) async throws -> CollectorSession {
@@ -72,7 +72,8 @@ final class CollectorSession: @unchecked Sendable {
         }
         let queue = try CollectorQueue(maximumBytes: maximumQueuedBytes, maximumItems: maximumQueuedItems)
         let ring = try await Task.detached {
-            try SharedFrameRing(url: ringURL, runID: runID, slotCount: max(1, min(4, (256 * 1024 * 1024) / slotCapacity)), slotCapacity: slotCapacity)
+            try ObservationFrameRings(url: ringURL, runID: runID, capacities: slotCapacities ?? [slotCapacity],
+                                      maximumSlots: 4, maximumBytes: 256 * 1024 * 1024)
         }.value
         let state = CollectorState(runID: runID, collectionID: id, ring: ring, onEvent: onEvent, onFault: onFault)
         let runtime = factory({ state.receive($0) }, { state.fail($0) })
@@ -87,7 +88,7 @@ final class CollectorSession: @unchecked Sendable {
                   hello.payload.fields?["protocolVersion"] == .integer(1) else {
                 throw AstraError("collector.handshake", "The local collector did not negotiate its protocol.")
             }
-            fields["rings"] = .array([.object(["path": .string(ring.url.path), "ringID": .string(ring.ringID.uuidString.lowercased())])])
+            fields["rings"] = .array(ring.descriptors)
             let prepare = JSONValue.object(fields)
             try await Task.detached { try opened.append(kind: "collector.prepare", payload: prepare, sequence: 0) }.value
             let acknowledgement = try await runtime.request("collector.prepare", prepare, runID)
@@ -209,7 +210,7 @@ final class CollectorSession: @unchecked Sendable {
             // transport. It is not a substitute for the collector's pixel spool.
             return ("native.actor", .object(["sourceID": .string(source.uuidString.lowercased()),
                 "runID": .string(observation.runID.uuidString.lowercased()), "response": response,
-                "actorInput": observation.actorInput, "frame": try .encode(observation.frame),
+                "actorInput": observation.actorInput, "frames": try .encode(observation.frames.map(\.metadata)),
                 "pixelsPersistedByNativeAudit": .bool(false)]))
         }
     }
@@ -223,7 +224,9 @@ final class CollectorSession: @unchecked Sendable {
         case .actor(let source, let response, let observation):
             guard observation.runID == runID, let fields = observation.actorInput.fields,
                   let id = fields["observationID"]?.uuid, fields["episodeID"]?.uuid != nil,
-                  observation.pixels.count == observation.frame.byteCount else {
+                  (1...16).contains(observation.frames.count), observation.pixelByteCount <= 256 * 1024 * 1024,
+                  Set(observation.frames.map { $0.metadata.surface.id }).count == observation.frames.count,
+                  observation.frames.allSatisfy({ $0.pixels.count == $0.metadata.byteCount }) else {
                 throw AstraError("collector.observation", "The retained observation does not belong to this collector.")
             }
             let cutoff = try observation.actorInput.required("cutoffNanos").decode(UInt64.self)
@@ -233,20 +236,23 @@ final class CollectorSession: @unchecked Sendable {
             try ControlObservation.validateControlCoverage(state: try observation.actorInput.required("controlState").decode(ControlState.self),
                 cutoffNanos: cutoff, coverageNanos: controlCoverage,
                 intervalCovered: fields["intervalCovered"] == .bool(true) || (controlCoverage == nil && fields["intervalCovered"] == nil))
-            if let coverage = observation.coverage { try coverage.validated(frame: observation.frame, cutoffNanos: cutoff, maximumAgeMS: 250) }
-            else {
-                guard observation.frame.eventNanos <= observation.frame.observedNanos, observation.frame.observedNanos <= cutoff,
-                      cutoff - observation.frame.eventNanos <= 250_000_000 else { throw AstraError("collector.staleFrame", "The retained collection frame is stale.") }
+            for frame in observation.frames {
+                if let coverage = frame.coverage { try coverage.validated(frame: frame.metadata, cutoffNanos: cutoff, maximumAgeMS: 250) }
+                else {
+                    guard frame.metadata.eventNanos <= frame.metadata.observedNanos, frame.metadata.observedNanos <= cutoff,
+                          cutoff - frame.metadata.eventNanos <= 250_000_000 else { throw AstraError("collector.staleFrame", "A retained collection source is stale.") }
+                }
             }
-            let published = try ring.publish(pixels: observation.pixels, metadata: observation.frame)
-            try state.register(observation: id, lease: published.acknowledgement)
-            let reference = try JSONValue.encode(published)
-            let frame: JSONValue = .object(["metadata": try .encode(published.metadata), "reference": reference,
-                "coverageNanos": .unsigned(observation.coverage?.throughNanos ?? observation.frame.observedNanos),
-                "coverageKind": .string(observation.coverage?.kind.rawValue ?? "frame")])
+            let published = try ring.publish(observation.frames)
+            try state.register(observation: id, leases: published.map(\.acknowledgement))
+            let frames = try zip(published, observation.frames).map { reference, frame -> JSONValue in
+                .object(["metadata": try .encode(reference.metadata), "reference": try .encode(reference),
+                         "coverageNanos": .unsigned(frame.coverage?.throughNanos ?? frame.metadata.observedNanos),
+                         "coverageKind": .string(frame.coverage?.kind.rawValue ?? "frame")])
+            }
             var snapshot: [String: JSONValue] = ["id": .string(id.uuidString.lowercased()),
                 "episodeID": try observation.actorInput.required("episodeID"), "cutoffNanos": .unsigned(cutoff),
-                "geometryRevision": try observation.actorInput.required("geometryRevision"), "frames": .array([frame]),
+                "geometryRevision": try observation.actorInput.required("geometryRevision"), "frames": .array(frames),
                 "controlState": try observation.actorInput.required("controlState"),
                 "events": try observation.actorInput.required("executedEvents")]
             if let controlCoverage { snapshot["controlCoverageNanos"] = .unsigned(controlCoverage) }
@@ -331,7 +337,7 @@ private final class CollectorJournal: @unchecked Sendable {
 private final class CollectorState: @unchecked Sendable {
     private let lock = NSLock()
     private let runID: UUID, collectionID: UUID
-    private let ring: SharedFrameRing
+    private let ring: ObservationFrameRings
     private let onEvent: @Sendable (WireMessage) -> Void
     private let onFault: @Sendable (AstraError) -> Void
     private var storedFault: AstraError?
@@ -342,14 +348,14 @@ private final class CollectorState: @unchecked Sendable {
     private var waiting: CheckedContinuation<Void, any Error>?
     var fault: AstraError? { lock.withLock { storedFault } }
     var result: WireMessage? { lock.withLock { storedResult } }
-    init(runID: UUID, collectionID: UUID, ring: SharedFrameRing,
+    init(runID: UUID, collectionID: UUID, ring: ObservationFrameRings,
          onEvent: @escaping @Sendable (WireMessage) -> Void, onFault: @escaping @Sendable (AstraError) -> Void) {
         self.runID = runID; self.collectionID = collectionID; self.ring = ring; self.onEvent = onEvent; self.onFault = onFault
     }
-    func register(observation: UUID, lease: SharedFrameAcknowledgement) throws {
+    func register(observation: UUID, leases newLeases: [SharedFrameAcknowledgement]) throws {
         try lock.withLock {
-            guard leases[observation] == nil else { throw AstraError("collector.duplicateObservation", "This observation was already sent to the collector.") }
-            leases[observation] = [lease]
+            guard leases[observation] == nil, !newLeases.isEmpty, Set(newLeases).count == newLeases.count else { throw AstraError("collector.duplicateObservation", "This observation was already sent to the collector.") }
+            leases[observation] = Set(newLeases)
         }
     }
     func beginFinish() { lock.withLock { finishRequested = true } }
@@ -373,11 +379,12 @@ private final class CollectorState: @unchecked Sendable {
                 let acknowledgements = try event.payload.required("acknowledgements").decode([SharedFrameAcknowledgement].self)
                 try lock.withLock {
                     guard !acknowledgements.isEmpty, Set(acknowledgements).count == acknowledgements.count,
-                          let expected = leases[observation], Set(acknowledgements) == expected else {
-                        throw AstraError("collector.frameRelease", "The collector released an unknown, partial or repeated frame lease.")
+                          let expected = leases[observation], Set(acknowledgements).isSubset(of: expected) else {
+                        throw AstraError("collector.frameRelease", "The collector released an unknown or repeated frame lease.")
                     }
                     for acknowledgement in acknowledgements { try ring.release(acknowledgement) }
-                    leases[observation] = nil
+                    let remaining = expected.subtracting(acknowledgements)
+                    leases[observation] = remaining.isEmpty ? nil : remaining
                 }
             case "collector.fault":
                 if event.payload.fields?["auditContinuable"] == .bool(true) {

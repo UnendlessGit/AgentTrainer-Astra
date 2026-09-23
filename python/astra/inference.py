@@ -278,6 +278,7 @@ class InferenceSession:
     def __init__(self):
         self._owner = threading.get_ident()
         self._reader = self._checkpoint = self._run_id = None
+        self._readers = {}
         self._execution = None
         self._state = self._state_id = self._episode_id = self._key = None
         self._last_cutoff = self._last_event_sequence = self._geometry_revision = None
@@ -304,10 +305,21 @@ class InferenceSession:
         self._assert_owner()
         if self._reader is not None:
             raise InferenceError("inference.active", "Close this actor run before preparing another stream")
-        _fields(payload, ("checkpointPath", "ring"), ("seed", "deterministic", "collection", "resumeActor", "resumeCollection"))
+        _fields(payload, ("checkpointPath", "ring"), ("seed", "deterministic", "collection", "resumeActor", "resumeCollection", "additionalRings"))
         _fields(payload["ring"], ("path", "ringID"))
         run_id = _uuid(run_id)
         ring_id = _uuid(payload["ring"]["ringID"])
+        additional = payload.get("additionalRings", [])
+        if type(additional) is not list or len(additional) > 15:
+            raise InferenceError("inference.rings", "The actor supports at most sixteen mapped frame rings")
+        ring_specs = [payload["ring"], *additional]
+        ring_ids, ring_paths = [], []
+        for specification in ring_specs:
+            _fields(specification, ("path", "ringID"))
+            ring_ids.append(_uuid(specification["ringID"]))
+            ring_paths.append(_path(specification["path"]))
+        if len(set(ring_ids)) != len(ring_ids) or len(set(ring_paths)) != len(ring_paths):
+            raise InferenceError("inference.rings", "Frame ring identities and paths must be distinct")
         seed = _uint(payload.get("seed", 0))
         deterministic = payload.get("deterministic", True)
         collection = payload.get("collection", False)
@@ -331,14 +343,20 @@ class InferenceSession:
             raise InferenceError('inference.counterExhausted', 'The saved actor stream has exhausted its sequence or reset counters')
         if checkpoint.policy.config.control_width != 178:
             raise InferenceError("inference.configuration", "This actor requires the version-one observed-control feature layout")
-        reader = FrameRingReader(_path(payload["ring"]["path"]), run_id=run_id, ring_id=ring_id)
+        if len(ring_ids) > checkpoint.policy.config.maximum_surfaces:
+            raise InferenceError("inference.rings", "Mapped frame rings exceed the checkpoint surface capacity")
+        readers = {}
         try:
+            for identity, path in zip(ring_ids, ring_paths):
+                readers[identity] = FrameRingReader(path, run_id=run_id, ring_id=identity)
             checkpoint.policy.eval()
             key = mx.array(progress['rngState'], dtype=mx.uint32) if progress is not None else mx.random.key(seed)
         except BaseException:
-            reader.close()
+            for reader in readers.values():
+                reader.close()
             raise
-        self._reader, self._checkpoint, self._run_id, self._key = reader, checkpoint, run_id, key
+        self._readers = readers
+        self._reader, self._checkpoint, self._run_id, self._key = readers[ring_id], checkpoint, run_id, key
         self._deterministic = deterministic
         self._collection = collection
         self._rng_stream_id = str(uuid.UUID(progress['rngStreamID'])) if progress is not None else str(uuid.uuid4())
@@ -347,7 +365,7 @@ class InferenceSession:
             self._environment_resets = progress['actorResetGeneration']
         self._execution = _PolicyExecution(checkpoint.policy, greedy=deterministic)
         return {**self._identity(), "model": checkpoint.manifest["model"], "actions": checkpoint.manifest["actions"],
-                "ringID": ring_id, "deterministic": deterministic, "collection": collection,
+                "ringID": ring_id, "ringIDs": ring_ids, "deterministic": deterministic, "collection": collection,
                 "collectionVersion": 1 if collection else None, "rngStreamID": self._rng_stream_id if collection else None,
                 "resumedActor": resume or resume_collection is not None, "resumedCollection": resume_collection is not None, "nextPacketSequence": self._sequence, "nextDrawIndex": self._draw_index,
                 "actorResetGeneration": self._environment_resets}
@@ -481,7 +499,12 @@ class InferenceSession:
         owned, acknowledgements = [], []
         try:
             for reference in frames:
-                frame = self._reader.copy_frame(reference)
+                if type(reference) is not dict:
+                    raise InferenceError("inference.frames", "Frames require bound ring references")
+                reader = self._readers.get(_uuid(reference.get("ringID")))
+                if reader is None:
+                    raise InferenceError("inference.rings", "Frame references an unbound actor ring")
+                frame = reader.copy_frame(reference)
                 owned.append((frame.pixels, frame.metadata)); acknowledgements.append(frame.acknowledgement)
             surfaces = [metadata["surface"] for _, metadata in owned]
             if any(metadata["eventNanos"] > metadata["observedNanos"] for _, metadata in owned):
@@ -555,8 +578,9 @@ class InferenceSession:
 
     def close(self):
         self._assert_owner()
-        if self._reader is not None:
-            self._reader.close()
+        for reader in self._readers.values():
+            reader.close()
+        self._readers.clear()
         self._reader = self._checkpoint = self._state = self._key = None
         self._execution = None
         self._run_id = self._state_id = self._episode_id = None

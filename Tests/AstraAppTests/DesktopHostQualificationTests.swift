@@ -24,7 +24,9 @@ import AstraCore
             trainingStep: 0, policySignature: try initialInfo.required("policySignature").decode(String.self),
             parameterCount: try initialInfo.required("parameterCount").decode(Int.self))
         try await store.saveCheckpoint(initial)
-        let controls = HostQualificationControls(), capture = HostQualificationCapture(), owner = NativeControlOwner()
+        let multiple = environment["ASTRA_HOST_QUALIFICATION_MULTI_SURFACE"] == "1"
+        let capture = HostQualificationCapture(multiSurface: multiple), owner = NativeControlOwner()
+        let controls = HostQualificationControls(surfaces: capture.surfaces)
         let processes = HostQualificationProcesses(executable: bundle.bundleURL.appendingPathComponent("Contents/Helpers/AstraCompute.app/Contents/MacOS/AstraCompute"))
         let dependencies = InferenceDependencies(runtime: processes.actor, capture: { _ in capture.runtime }, activate: { _ in },
             countdownSeconds: 0, protectsPhysicalInputs: false, controlOwner: owner)
@@ -32,7 +34,7 @@ import AstraCore
         let host = DesktopLearningHost(store: store, root: root, learner: learner, bundle: bundle,
             dependencies: dependencies, controlFactory: controls.factory, collectorFactory: processes.collector,
             scopeVerifier: { source, scope in
-                guard source.id == capture.surface.id, scope.surfaces == [capture.surface] else {
+                guard source.id == capture.source.id, scope.surfaces == capture.surfaces else {
                     throw AstraError("qualification.scope", "The host changed its generated environment.")
                 }
                 return MonotonicClock.now
@@ -64,19 +66,21 @@ import AstraCore
             try #require(snapshot.agents.first?.selectedCheckpointID == saved.id)
             try #require(snapshot.learningRuns.contains { $0.checkpointID == saved.id && $0.status == .completed })
             try #require(readyConfirmations >= 2 && owner.priorCleanupJoined && capture.hasJoined)
-            let previousChildren = controls.all.count
-            options.initialCheckpointID = saved.id; options.resume = true; options.iterations = 2
-            try host.start(agent: agent, source: capture.source, program: program, options: options)
-            try await wait(host, phases: &phases, confirmations: &readyConfirmations, shouldStop: {
-                controls.all.dropFirst(previousChildren).contains { !$0.receipts.isEmpty }
-            })
-            try #require(host.failure == nil, "Resume: \(host.failure ?? "") / learner: \(learner.failure ?? "")")
-            let preserved = try #require(host.checkpoint); stopped = preserved
-            try #require(preserved.id != saved.id && preserved.trainingStep == saved.trainingStep)
+            if !multiple {
+                let previousChildren = controls.all.count
+                options.initialCheckpointID = saved.id; options.resume = true; options.iterations = 2
+                try host.start(agent: agent, source: capture.source, program: program, options: options)
+                try await wait(host, phases: &phases, confirmations: &readyConfirmations, shouldStop: {
+                    controls.all.dropFirst(previousChildren).contains { !$0.receipts.isEmpty }
+                })
+                try #require(host.failure == nil, "Resume: \(host.failure ?? "") / learner: \(learner.failure ?? "")")
+                let preserved = try #require(host.checkpoint); stopped = preserved
+                try #require(preserved.id != saved.id && preserved.trainingStep == saved.trainingStep)
+            }
             try #require(owner.priorCleanupJoined && controls.all.allSatisfy { $0.hasJoined && $0.backend.clean })
             try #require(capture.hasJoined && capture.produced > 0)
             let ended = await processes.statuses()
-            try #require(ended["actor"]?.count == 2 && ended["collector"]?.count == 2)
+            try #require(ended["actor"]?.count == (multiple ? 1 : 2) && ended["collector"]?.count == (multiple ? 1 : 2))
             try #require(ended.values.flatMap { $0 }.allSatisfy { $0 == 0 })
             let executed = controls.all.flatMap(\.receipts).filter { $0.status == .executed }
             try #require(!executed.isEmpty && controls.all.reduce(0) { $0 + $1.backend.posted } > 0)
@@ -85,7 +89,10 @@ import AstraCore
             await host.stopAndWait(); await learner.stopAndWait()
         }
         let statuses = await processes.statuses()
+        let sourceFrames = try capture.metadata.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) }
+        let sourceSurfaces = try capture.surfaces.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) }
         let report: [String: Any] = ["completed": failure == nil, "issue": failure ?? NSNull(),
+            "multiSurface": multiple, "sourceFrames": sourceFrames, "sourceSurfaces": sourceSurfaces,
             "privacyPermissionsUsed": false, "physicalInputPosted": false, "personalPixelsRead": false,
             "initialCheckpointID": initial.id.uuidString.lowercased(), "learnedCheckpointID": learned?.id.uuidString.lowercased() ?? NSNull(),
             "stoppedCheckpointID": stopped?.id.uuidString.lowercased() ?? NSNull(), "trainingUpdates": learned?.trainingStep ?? 0,

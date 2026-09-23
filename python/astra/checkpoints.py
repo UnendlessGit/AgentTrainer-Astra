@@ -251,7 +251,7 @@ def save_checkpoint(destination: Path, policy: AgentPolicy, *, kind: str, step: 
     trainable = dict(tree_flatten(policy.trainable_parameters()))
     config = policy.config.to_dict()
     vocabulary = policy.actions.vocabulary.to_dict()
-    identity = {"model": config, "actions": vocabulary, "canonicalizerVersion": CANONICALIZER_VERSION}
+    identity = {"model": policy.config.semantic_dict(), "actions": vocabulary, "canonicalizerVersion": CANONICALIZER_VERSION}
     manifest = {"schemaVersion": 1, "id": identifier, "createdAt": datetime.now(timezone.utc).isoformat(),
                 "kind": kind, "step": step, "parentID": parent_id, "datasetID": dataset_id,
                 "model": config, "actions": vocabulary, "canonicalizerVersion": CANONICALIZER_VERSION,
@@ -306,7 +306,7 @@ def load_checkpoint(directory: Path, *, include_training: bool = False) -> Loade
         vocabulary = ActionVocabulary.from_dict(manifest["actions"])
     except (TypeError, ValueError) as error:
         raise CheckpointError(f"Invalid checkpoint configuration: {error}") from error
-    identity = {"model": config.to_dict(), "actions": vocabulary.to_dict(), "canonicalizerVersion": CANONICALIZER_VERSION}
+    identity = {"model": config.semantic_dict(), "actions": vocabulary.to_dict(), "canonicalizerVersion": CANONICALIZER_VERSION}
     if hashlib.sha256(_json_bytes(identity)).hexdigest() != manifest["policySignature"]:
         raise CheckpointError("Checkpoint configuration signature does not match")
     artifacts = manifest["artifacts"]

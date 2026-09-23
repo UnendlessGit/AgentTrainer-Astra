@@ -38,10 +38,30 @@ public struct RewardProgramBinding: Codable, Hashable, Sendable {
     /// multiple recorded surfaces. Multi-source callers supply an explicit map.
     public static func singleSource(_ definition: RewardProgram, surface: SurfaceDescriptor, scope: ControlScope) throws -> Self {
         let names = referencedSurfaces(in: definition)
-        guard names.count <= 1 else {
+        guard names.count <= 1, scope.surfaces.count == 1, scope.surfaces.first == surface else {
             throw AstraError("reward.multipleBindings", "This definition uses several reference surfaces. Bind each surface explicitly before starting.")
         }
         return try Self(definition: definition, surfaces: Dictionary(uniqueKeysWithValues: names.map { ($0, surface) }), scope: scope)
+    }
+
+    /// Resolve an operator-reviewed reference map against this run's verified
+    /// surfaces. Native IDs are never matched by title, location or array order.
+    public static func bound(_ definition: RewardProgram, sourceIDs: [String: String], scope: ControlScope) throws -> Self {
+        let references = referencedSurfaces(in: definition)
+        if sourceIDs.isEmpty, references.count <= 1, scope.surfaces.count == 1, let surface = scope.surfaces.first {
+            return try singleSource(definition, surface: surface, scope: scope)
+        }
+        guard Set(sourceIDs.keys) == references else {
+            throw AstraError("reward.binding", "Choose a current capture surface for every reward and reset source before starting.")
+        }
+        var resolved: [String: SurfaceDescriptor] = [:]
+        for (reference, id) in sourceIDs {
+            guard let surface = scope.surfaces.first(where: { $0.id == id }) else {
+                throw AstraError("reward.bindingMissing", "A chosen reward or reset surface is no longer part of this environment. Choose its current source again.")
+            }
+            resolved[reference] = surface
+        }
+        return try Self(definition: definition, surfaces: resolved, scope: scope)
     }
 
     public func validated(scope: ControlScope) throws -> Self {

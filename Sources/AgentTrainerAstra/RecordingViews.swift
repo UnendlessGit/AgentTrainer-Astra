@@ -186,9 +186,9 @@ struct RecorderSheet: View {
             Form {
                 TextField("Name", text: $name)
                 Picker("Environment", selection: $selectedSourceID) {
-                    Text(refreshing ? "Loading sources…" : "Choose a display or window").tag(nil as String?)
+                    Text(refreshing ? "Loading sources…" : "Choose an environment").tag(nil as String?)
                     ForEach(model.sources) { source in
-                        Text("\(source.name) · \(source.pixelWidth) × \(source.pixelHeight)").tag(Optional(source.id))
+                        Text(source.bindings.map { "\(source.name) · \($0.count) surfaces" } ?? "\(source.name) · \(source.pixelWidth) × \(source.pixelHeight)").tag(Optional(source.id))
                     }
                 }.disabled(refreshing || !model.permissions.screenRecording)
                 Picker("Capture rate", selection: $fps) {
@@ -196,7 +196,7 @@ struct RecorderSheet: View {
                 }
             }
             if let source {
-                let rawRate = Int64(source.pixelWidth) * Int64(source.pixelHeight) * 4 * Int64(fps)
+                let rawRate = (source.bindings ?? [source]).reduce(Int64(0)) { $0 + Int64($1.pixelWidth) * Int64($1.pixelHeight) * 4 * Int64(fps) }
                 Text("Native resolution · Lossless color. Before compression, this source produces \(ByteCountFormatter.string(fromByteCount: rawRate, countStyle: .file))/s. Actual storage depends on the content.")
                     .font(.caption).foregroundStyle(.secondary)
             }

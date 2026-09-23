@@ -71,6 +71,13 @@ def _metadata_fingerprint(metadata):
         data += rectangle(surface["contentBounds"])
         data += struct.pack("<QQ", surface["geometryRevision"], size)
         data += b"bgra8-srgb\0raw\0"
+        native_fields = ("nativeWindowID", "nativeDisplayID")
+        presence = sum(1 << index for index, field in enumerate(native_fields) if field in surface)
+        if presence:
+            data += b"ASTRAN01" + bytes([presence])
+            for field in native_fields:
+                if field in surface:
+                    data += struct.pack("<I", surface[field])
         return hashlib.sha256(data).digest()
     except (TypeError, ValueError, OverflowError, KeyError, struct.error) as error:
         if isinstance(error, FrameRingError):

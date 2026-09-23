@@ -52,3 +52,22 @@ private func liveRewardSurface(_ id: String) -> SurfaceDescriptor {
     let changed = try JSONDecoder().decode(RewardProgramBinding.self, from: JSONSerialization.data(withJSONObject: value))
     #expect(throws: AstraError.self) { try changed.resolved(scope: scope) }
 }
+
+@Test func rewardBindingRequiresExplicitMultiSurfaceSelections() throws {
+    var definition = boundRewardFixture()
+    definition.signals.append(.init(name: "Second screen", kind: .ocrText, surfaceID: "window:20",
+        region: .init(x: 0, y: 0, width: 1, height: 1)))
+    let left = liveRewardSurface("window:21"), right = liveRewardSurface("window:89")
+    let scope = ControlScope(surfaces: [left, right], geometryRevision: 9)
+    #expect(throws: AstraError.self) { try RewardProgramBinding.bound(definition, sourceIDs: [:], scope: scope) }
+    #expect(throws: AstraError.self) { try RewardProgramBinding.bound(definition, sourceIDs: ["window:10": left.id], scope: scope) }
+    #expect(throws: AstraError.self) {
+        try RewardProgramBinding.bound(definition, sourceIDs: ["window:10": left.id, "window:20": "missing"], scope: scope)
+    }
+    #expect(throws: AstraError.self) { try RewardProgramBinding.singleSource(boundRewardFixture(), surface: left, scope: scope) }
+    let binding = try RewardProgramBinding.bound(definition, sourceIDs: ["window:10": right.id, "window:20": left.id], scope: scope)
+    let resolved = try binding.resolved(scope: scope)
+    #expect(resolved.signals.map(\.surfaceID) == [right.id, left.id])
+    #expect(resolved.resetPlan?.steps[0].packet?.commands[0].surfaceID == right.id)
+    #expect(binding.definition == definition)
+}

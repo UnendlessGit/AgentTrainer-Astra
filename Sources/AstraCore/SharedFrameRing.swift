@@ -222,6 +222,12 @@ public final class SharedFrameRing: @unchecked Sendable {
         data.ringAppend(frame.surface.contentBounds)
         data.ringAppend(frame.surface.geometryRevision); data.ringAppend(UInt64(frame.byteCount))
         data.append(Data("bgra8-srgb\0raw\0".utf8))
+        if frame.surface.nativeWindowID != nil || frame.surface.nativeDisplayID != nil {
+            data.append(Data("ASTRAN01".utf8))
+            data.ringAppend(UInt8((frame.surface.nativeWindowID == nil ? 0 : 1) | (frame.surface.nativeDisplayID == nil ? 0 : 2)))
+            if let id = frame.surface.nativeWindowID { data.ringAppend(id) }
+            if let id = frame.surface.nativeDisplayID { data.ringAppend(id) }
+        }
         return Data(SHA256.hash(data: data))
     }
 }

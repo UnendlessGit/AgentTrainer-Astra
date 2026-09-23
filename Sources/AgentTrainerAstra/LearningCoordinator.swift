@@ -31,8 +31,10 @@ struct BehaviorOptions: Sendable {
     var practiceTask = "pointing"
     var practiceDelayMS = 2000
     var practiceEpisodes = 12
+    var contextVocabulary = ContextVocabulary.empty
 
     func validated() throws -> Self {
+        _ = try contextVocabulary.validated()
         if resume {
             guard initialCheckpointID != nil else { throw AstraError("behavioral.resume", "Choose a saved behavioral checkpoint to resume.") }
             return self
@@ -50,8 +52,8 @@ struct BehaviorOptions: Sendable {
     }
 
     var model: JSONValue {
-        .object(["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
-                 "packet_capacity": .integer(Int64(packetCapacity))])
+        contextVocabulary.applying(to: .object(["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
+                 "packet_capacity": .integer(Int64(packetCapacity))]))
     }
     var training: JSONValue {
         .object(["epochs": .integer(Int64(epochs)), "learning_rate": .number(learningRate),
@@ -145,7 +147,7 @@ struct BehaviorEvaluation: Sendable {
                 throw AstraError("learning.selection", "Review the saved training intervals for \(recording.name) before training.")
             }
             _ = try selection.resolved(for: recording)
-            return try selection.payload(recordingID: recording.id)
+            return try selection.payload(recordingID: recording.id, vocabulary: options.initialCheckpointID == nil ? options.contextVocabulary : .empty)
         }
         guard chosen.count <= 4096, chosen.reduce(0, { total, value in
             if case .array(let ranges) = value.fields?["ranges"] { return total + ranges.count }
@@ -158,7 +160,7 @@ struct BehaviorEvaluation: Sendable {
         let run = LearningRunDocument(agentID: agent.id, kind: .behavioral,
                                       name: "\(String(agent.name.prefix(125))) · Imitation", sourceKind: options.source == .practice ? "practice_oracle" : "recordings")
         activeRun = run
-        work = Task { await performTraining(agent: agent, options: options, recordings: selected, selections: chosen, runID: run.id) }
+        work = Task { await performTraining(agent: agent, options: options, recordings: selected, selections: chosen, contextAssignments: selections?.mapValues { $0.contextValues ?? [:] } ?? [:], runID: run.id) }
     }
 
     func startReinforcement(agent: AgentDocument, options rawOptions: ReinforcementOptions) throws {
@@ -175,7 +177,7 @@ struct BehaviorEvaluation: Sendable {
         let directory = artifact("Jobs", runID)
         let initialID = options.initialCheckpointID ?? UUID(), finalID = UUID()
         var model = options.model, actions = options.actions, environment = options.environment, training = options.training
-        var contextIDs: JSONValue = .array([])
+        var contextIDs: JSONValue = .array(options.contextIDs.map { .integer(Int64($0)) })
         do {
             activeRun?.initialCheckpointID = initialID
             try await saveRun()
@@ -214,10 +216,13 @@ struct BehaviorEvaluation: Sendable {
                         fields["lead_ms"] = model.fields?["lead_ms"] ?? .integer(100)
                         environment = .object(fields)
                     }
-                    if case .array(let contexts) = model.fields?["context_sizes"] {
+                    if case .array(let contexts) = model.fields?["context_sizes"], options.contextIDs.isEmpty {
                         contextIDs = .array(contexts.map { _ in .integer(0) })
                     }
                 }
+            }
+            if options.initialCheckpointID == nil && options.contextIDs.isEmpty {
+                contextIDs = .array(options.contextVocabulary.sizes.map { _ in .integer(0) })
             }
             let configuration: JSONValue = .object(["schemaVersion": .integer(1), "runID": .string(runID.uuidString.lowercased()),
                 "agentID": .string(agent.id.uuidString.lowercased()), "operation": .string("train.reinforcement"),
@@ -347,10 +352,11 @@ struct BehaviorEvaluation: Sendable {
         _ = try await child.start()
     }
 
-    private func performTraining(agent: AgentDocument, options: BehaviorOptions, recordings: [RecordingManifest], selections: [JSONValue], runID: UUID) async {
+    private func performTraining(agent: AgentDocument, options: BehaviorOptions, recordings: [RecordingManifest], selections: [JSONValue], contextAssignments: [UUID: [UUID: UUID]], runID: UUID) async {
         let directory = artifact("Jobs", runID)
         let datasetID = UUID(), initialID = options.initialCheckpointID ?? UUID(), finalID = UUID()
         var model = options.model, actions = options.actions, training = options.training
+        var selections = selections
         var verificationMode = options.source == .practice
         var recordingIDs = recordings.map(\.id).sorted { $0.uuidString < $1.uuidString }
         var selectionProvenance: JSONValue? = options.source == .recordings && !options.resume ? .array(selections) : nil
@@ -414,6 +420,19 @@ struct BehaviorEvaluation: Sendable {
                     environment["lead_ms"] = model.fields?["lead_ms"]
                     fields["environment"] = .object(environment); dataset = .object(fields)
                 }
+            }
+            if !options.resume && options.source == .recordings {
+                let vocabulary = try ContextVocabulary.from(model: model) ?? .empty
+                let sizes = (try? model.required("context_sizes").decode([Int].self)) ?? []
+                selections = try selections.map { selection in
+                    guard var fields = selection.fields, let id = fields["recording_id"]?.uuid else {
+                        throw AstraError("context.selection", "A demonstration selection has no recording identity.")
+                    }
+                    let indices = vocabulary.fields.isEmpty ? sizes.map { _ in 0 } : try vocabulary.indices(for: contextAssignments[id] ?? [:])
+                    fields["context_ids"] = .array(indices.map { .integer(Int64($0)) })
+                    return .object(fields)
+                }
+                selectionProvenance = .array(selections)
             }
             var configurationFields: [String: JSONValue] = ["schemaVersion": .integer(1), "runID": .string(runID.uuidString.lowercased()),
                 "agentID": .string(agent.id.uuidString.lowercased()), "operation": .string("train.behavioral"),

@@ -15,11 +15,13 @@ public struct RecordingTimeRange: Codable, Hashable, Identifiable, Sendable {
 public struct RecordingTrainingSelection: Codable, Hashable, Sendable {
     public var schemaVersion = 1
     public var ranges: [RecordingTimeRange]?
-    public init(ranges: [RecordingTimeRange]? = nil) { self.ranges = ranges }
+    public var contextValues: [UUID: UUID]?
+    public init(ranges: [RecordingTimeRange]? = nil, contextValues: [UUID: UUID]? = nil) { self.ranges = ranges; self.contextValues = contextValues }
     public static let whole = RecordingTrainingSelection()
 
     public func validated() throws -> Self {
         guard schemaVersion == 1 else { throw AstraError("selection.version", "This recording selection uses an unsupported format.") }
+        guard (contextValues?.count ?? 0) <= 32 else { throw AstraError("context.selection", "A selection can carry at most 32 context values.") }
         if let ranges {
             guard (1...256).contains(ranges.count), Set(ranges.map(\.id)).count == ranges.count else {
                 throw AstraError("selection.ranges", "Choose between 1 and 256 distinct training intervals.")
@@ -50,9 +52,9 @@ public struct RecordingTrainingSelection: Codable, Hashable, Sendable {
         return result
     }
 
-    public func payload(recordingID: UUID) throws -> JSONValue {
+    public func payload(recordingID: UUID, vocabulary: ContextVocabulary = .empty) throws -> JSONValue {
         _ = try validated()
-        var value: [String: JSONValue] = ["recording_id": .string(recordingID.uuidString.lowercased()), "context_ids": .array([])]
+        var value: [String: JSONValue] = ["recording_id": .string(recordingID.uuidString.lowercased()), "context_ids": .array(try vocabulary.indices(for: contextValues ?? [:]).map { .integer(Int64($0)) })]
         if let ranges {
             value["ranges"] = .array(ranges.map { .object(["start_nanos": .integer(Int64($0.startNanos)), "end_nanos": .integer(Int64($0.endNanos))]) })
         }

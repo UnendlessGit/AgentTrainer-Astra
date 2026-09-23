@@ -70,7 +70,7 @@ class PracticeDemonstrations:
             if step >= start:
                 observation = make_observation([(current.pixels, current.metadata)], current.control_state,
                                                 cutoff_nanos=current.metadata["observedNanos"], elapsed_seconds=self.config.period_ms / 1000,
-                                                reset=step == 0, config=self.config, executed_events=previous_events,
+                                                reset=step == 0, config=self.config, context_ids=(0,) * len(self.config.context_sizes), executed_events=previous_events,
                                                 last_input_nanos=last_input_nanos)
                 yield LearningSample(observation, (current.metadata["surface"],), commands, episode_id, step)
             transition = env.step(list(commands), episode_id=current.episode_id, provenance="oracle")

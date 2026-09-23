@@ -5,6 +5,7 @@ public struct RecordingInspection: Sendable {
     public let manifest: RecordingManifest
     public let firstFrameNanos: UInt64?
     public let lastFrameNanos: UInt64?
+    public let surfaceIDs: [String]
 }
 
 public struct RecordingPreview: Sendable {
@@ -66,16 +67,19 @@ public final class RecordingReader: @unchecked Sendable {
         try lock.withLock {
             let row = try database.query("SELECT MIN(observed) AS first,MAX(observed) AS last FROM frames").first
             return RecordingInspection(manifest: manifest, firstFrameNanos: row?["first"]?.integer.flatMap(UInt64.init(exactly:)),
-                                       lastFrameNanos: row?["last"]?.integer.flatMap(UInt64.init(exactly:)))
+                                       lastFrameNanos: row?["last"]?.integer.flatMap(UInt64.init(exactly:)),
+                                       surfaceIDs: try manifest.surfaceIDs ?? database.query("SELECT DISTINCT json_extract(CAST(block AS TEXT),'$.metadata.surface.id') AS surface FROM frames ORDER BY surface").compactMap { $0["surface"]?.string })
         }
     }
 
-    public func preview(at observedNanos: UInt64, eventRadiusNanos: UInt64 = 100_000_000) throws -> RecordingPreview? {
+    public func preview(at observedNanos: UInt64, surfaceID: String? = nil, eventRadiusNanos: UInt64 = 100_000_000) throws -> RecordingPreview? {
         try lock.withLock {
             guard observedNanos <= UInt64(Int64.max), eventRadiusNanos <= 5_000_000_000 else {
                 throw AstraError("recording.previewTime", "The recording preview interval is outside supported bounds.")
             }
-            guard let row = try database.query("SELECT id,observed,source_time,shard,offset,length,CASE WHEN length(block)<=65536 THEN block ELSE NULL END AS block FROM frames WHERE observed<=? ORDER BY observed DESC,id DESC LIMIT 1", [.integer(Int64(observedNanos))]).first else { return nil }
+            let predicate = surfaceID == nil ? "" : " AND json_extract(CAST(block AS TEXT),'$.metadata.surface.id')=?"
+            let arguments: [SQLValue] = [.integer(Int64(observedNanos))] + (surfaceID.map { [.text($0)] } ?? [])
+            guard let row = try database.query("SELECT id,observed,source_time,shard,offset,length,CASE WHEN length(block)<=65536 THEN block ELSE NULL END AS block FROM frames WHERE observed<=?\(predicate) ORDER BY observed DESC,id DESC LIMIT 1", arguments).first else { return nil }
             guard let bytes = row["block"]?.data, let shard = row["shard"]?.string,
                   shard.range(of: #"^frames-[0-9]{5,}\.astraframes$"#, options: .regularExpression) != nil else {
                 throw AstraError("recording.previewIndex", "The preview index contains an invalid block or shard path.")
@@ -86,7 +90,8 @@ public final class RecordingReader: @unchecked Sendable {
                   row["observed"]?.integer.flatMap(UInt64.init(exactly:)) == block.metadata.observedNanos,
                   row["source_time"]?.integer.flatMap(UInt64.init(exactly:)) == block.metadata.eventNanos,
                   row["offset"]?.integer.flatMap(UInt64.init(exactly:)) == block.offset,
-                  row["length"]?.integer.flatMap(UInt64.init(exactly:)) == block.length else {
+                  row["length"]?.integer.flatMap(UInt64.init(exactly:)) == block.length,
+                  surfaceID == nil || block.metadata.surface.id == surfaceID else {
                 throw AstraError("recording.previewIdentity", "The preview frame disagrees with its indexed time or identity.")
             }
             let descriptor = open(directory.appendingPathComponent(shard).path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)

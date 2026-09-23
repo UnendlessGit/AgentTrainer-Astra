@@ -17,6 +17,9 @@ public struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
     public var storedBytes: UInt64
     public var issue: String?
     public var recordedForAgentID: UUID?
+    /// Fixed model-role order for this recording; absent in legacy single-source files.
+    public var surfaceIDs: [String]?
+    public var correction: CorrectionReference?
     /// Recovery publishes a new index without altering the original source
     /// database or its WAL. Nil is the original `index.sqlite` location.
     public var indexPath: String?
@@ -24,15 +27,23 @@ public struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
         guard let firstObservedNanos, let stoppedNanos, stoppedNanos >= firstObservedNanos else { return 0 }
         return Double(stoppedNanos - firstObservedNanos) / 1_000_000_000
     }
-    public init(id: UUID = UUID(), name: String, environment: EnvironmentDocument, recordedForAgentID: UUID? = nil) {
+    public init(id: UUID = UUID(), name: String, environment: EnvironmentDocument, recordedForAgentID: UUID? = nil,
+                surfaceIDs: [String]? = nil) {
         self.id = id; self.name = name; self.environment = environment; self.recordedForAgentID = recordedForAgentID
         createdAt = Date(); status = .recording; frameCount = 0; eventCount = 0; storedBytes = 0
+        self.surfaceIDs = surfaceIDs
     }
 
     public func validated() throws -> Self {
         var value = self
         value.name = try DocumentNames.validated(name)
         value.environment = try environment.validated()
+        if let surfaceIDs {
+            guard (1...16).contains(surfaceIDs.count), Set(surfaceIDs).count == surfaceIDs.count,
+                  surfaceIDs.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 256 }) else {
+                throw AstraError("recording.surfaces", "A recording needs a fixed, unique order of one to sixteen captured surfaces.")
+            }
+        }
         guard schemaVersion == AstraVersion.dataVersion, createdAt.timeIntervalSince1970.isFinite,
               frameCount >= 0, eventCount >= 0, (issue?.utf8.count ?? 0) <= 65_536,
               [firstObservedNanos, stoppedNanos, firstInvalidObservedNanos].compactMap({ $0 }).allSatisfy({ $0 <= UInt64(Int64.max) }),
@@ -46,6 +57,7 @@ public struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
         if status == .complete, frameCount == 0 || firstInvalidObservedNanos != nil || issue != nil {
             throw AstraError("recording.completion", "A complete recording must contain frames and have no invalid interval.")
         }
+        _ = try correction?.validated()
         _ = try indexComponents()
         return value
     }
@@ -126,9 +138,12 @@ private enum RecordingFiles {
         try database.transaction {
             try database.execute("CREATE TABLE frames (id TEXT PRIMARY KEY, observed INTEGER NOT NULL, source_time INTEGER NOT NULL, shard TEXT NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, block BLOB NOT NULL)")
             try database.execute("CREATE INDEX frames_observed ON frames(observed,id)")
+            try database.execute("CREATE INDEX frames_surface_observed ON frames(json_extract(CAST(block AS TEXT),'$.metadata.surface.id'),observed,id)")
             try database.execute("CREATE TABLE events (sequence INTEGER PRIMARY KEY, observed INTEGER NOT NULL, source_time INTEGER NOT NULL, event BLOB NOT NULL)")
             try database.execute("CREATE INDEX events_observed ON events(observed,sequence)")
             try database.execute("CREATE TABLE health (observed INTEGER NOT NULL, status TEXT NOT NULL, message TEXT)")
+            try database.execute("CREATE TABLE coverage (observed INTEGER NOT NULL, surface_id TEXT NOT NULL, frame_id TEXT NOT NULL, proof BLOB NOT NULL)")
+            try database.execute("CREATE INDEX coverage_observed ON coverage(observed,surface_id)")
         }
     }
 
@@ -137,7 +152,8 @@ private enum RecordingFiles {
               [event.x, event.y, event.dx, event.dy, event.scrollX, event.scrollY].compactMap({ $0 }).allSatisfy(\.isFinite),
               event.keyCode.map({ (0...127).contains($0) }) ?? true,
               event.button.map({ (0...31).contains($0) }) ?? true,
-              (event.rawPlatformData?.count ?? 0) <= 65_536, (event.detail?.utf8.count ?? 0) <= 65_536 else {
+              (event.rawPlatformData?.count ?? 0) <= 65_536, (event.detail?.utf8.count ?? 0) <= 65_536,
+              event.surfaceID.map({ !$0.isEmpty && $0.utf8.count <= 256 }) ?? true else {
             throw AstraError("recording.input", "Input contains invalid values or an oversized native event.")
         }
         switch event.kind {
@@ -355,11 +371,40 @@ enum RecordingRecovery {
                 }
             }
         }
+        if FileManager.default.fileExists(atPath: sourceURL.path) {
+            do {
+                let previous = try SQLiteDatabase(url: sourceURL, readOnly: true)
+                if !(try previous.query("SELECT name FROM sqlite_master WHERE type='table' AND name='coverage'")).isEmpty {
+                    var cursor: Int64 = 0
+                    while true {
+                        let rows = try previous.query("SELECT rowid,observed,surface_id,frame_id,CASE WHEN length(proof)<=16384 THEN proof ELSE NULL END AS proof FROM coverage WHERE rowid>? ORDER BY rowid LIMIT 512", [.integer(cursor)])
+                        if rows.isEmpty { break }
+                        for row in rows {
+                            guard let rowID = row["rowid"]?.integer else { throw AstraError("recording.coverage", "A coverage row has no identity.") }
+                            cursor = rowID
+                            do {
+                                guard let data = row["proof"]?.data else { throw AstraError("recording.coverage", "Capture proof is missing or oversized.") }
+                                let proof = try JSONDecoder().decode(CaptureFrameCoverage.self, from: data)
+                                guard proof.verifiedAtNanos <= UInt64(Int64.max), proof.kind == .unchanged,
+                                      row["observed"]?.integer == Int64(proof.verifiedAtNanos), row["surface_id"]?.string == proof.surface.id,
+                                      row["frame_id"]?.string == proof.frameID.uuidString,
+                                      let block = try database.query("SELECT block FROM frames WHERE id=?", [.text(proof.frameID.uuidString)]).first?["block"]?.data else {
+                                    throw AstraError("recording.coverage", "Capture proof has no matching recovered source frame.")
+                                }
+                                _ = try proof.validated(frame: JSONDecoder().decode(FrameBlock.self, from: block).metadata, cutoffNanos: proof.verifiedAtNanos)
+                                try database.execute("INSERT INTO coverage VALUES(?,?,?,?)", [.integer(Int64(proof.verifiedAtNanos)), .text(proof.surface.id), .text(proof.frameID.uuidString), .blob(data)])
+                                latestObserved = max(latestObserved, proof.verifiedAtNanos)
+                            } catch { invalid("Capture coverage could not be recovered: \(error.localizedDescription)", at: UInt64(max(0, row["observed"]?.integer ?? 0))) }
+                        }
+                    }
+                }
+            } catch { invalid("The previous capture coverage could not be fully read: \(error.localizedDescription)") }
+        }
         // A frame reaching disk does not prove input delivery had caught up.
         // Conservatively exclude the crash tail beyond the last durable event;
         // a future explicit input watermark may establish a stronger bound.
-        if let lastFrame = previousFrameObserved, lastFrame > (inputThrough ?? 0) {
-            invalid("Frames after the last durable input evidence require exclusion from training.", at: inputThrough ?? manifest.firstObservedNanos ?? 0)
+        if manifest.frameCount > 0, latestObserved > (inputThrough ?? 0) {
+            invalid("Visual evidence after the last durable input evidence requires exclusion from training.", at: inputThrough ?? manifest.firstObservedNanos ?? 0)
         }
         manifest.stoppedNanos = max(original.stoppedNanos ?? 0, latestObserved)
         manifest.status = manifest.frameCount == 0 ? .failed : .interrupted
@@ -389,6 +434,7 @@ public final class RecordingWriter: @unchecked Sendable {
     private var shardIndex = 0
     private var pendingFrames: [StoredFrame] = []
     private var pendingEvents: [RawInputEvent] = []
+    private var pendingCoverage: [CaptureFrameCoverage] = []
     private var finished = false
     private var writeFailure: String?
     private var finalizationError: AstraError?
@@ -424,10 +470,25 @@ public final class RecordingWriter: @unchecked Sendable {
 
     public var snapshot: RecordingManifest { lock.withLock { manifest } }
 
+    public func attachCorrection(_ seed: CorrectionRecordingSeed, supervisionStartNanos: UInt64) throws {
+        try lock.withLock {
+            try requireAccepting()
+            guard manifest.correction == nil, manifest.frameCount == 0, manifest.eventCount == 0, pendingEvents.isEmpty else {
+                throw AstraError("correction.started", "Correction provenance must be attached before expert observation starts.")
+            }
+            manifest.correction = try CorrectionPrelude.write(seed, supervisionStartNanos: supervisionStartNanos, in: directory)
+            latestObservedNanos = max(latestObservedNanos, supervisionStartNanos)
+            try RecordingFiles.writeManifest(manifest, in: directory)
+        }
+    }
+
     public func append(_ frame: PreparedFrame) throws {
         try lock.withLock {
             try requireAccepting()
             _ = try integer(frame.metadata.observedNanos); _ = try integer(frame.metadata.eventNanos)
+            guard manifest.surfaceIDs.map({ $0.contains(frame.metadata.surface.id) }) ?? true else {
+                throw AstraError("recording.surface", "The frame belongs to an unbound recording surface.")
+            }
             guard latestFrameObservedNanos.map({ frame.metadata.observedNanos >= $0 }) ?? true,
                   !pendingFrames.contains(where: { $0.block.metadata.id == frame.metadata.id }),
                   try database.query("SELECT id FROM frames WHERE id=?", [.text(frame.metadata.id.uuidString)]).isEmpty else {
@@ -472,6 +533,23 @@ public final class RecordingWriter: @unchecked Sendable {
         }
     }
 
+    public func append(coverage: CaptureFrameCoverage) throws {
+        try lock.withLock {
+            try requireAccepting()
+            guard pendingCoverage.count < 4_096, coverage.kind == .unchanged,
+                  [coverage.eventNanos, coverage.observedNanos, coverage.throughNanos, coverage.verifiedAtNanos]
+                    .allSatisfy({ $0 <= UInt64(Int64.max) }),
+                  coverage.eventNanos <= coverage.observedNanos, coverage.observedNanos <= coverage.throughNanos,
+                  coverage.throughNanos <= coverage.verifiedAtNanos,
+                  manifest.surfaceIDs.map({ $0.contains(coverage.surface.id) }) ?? true else {
+                throw AstraError("recording.coverage", "Capture coverage is invalid or its bounded recording queue is full.")
+            }
+            _ = try coverage.surface.validated()
+            pendingCoverage.append(coverage)
+            latestObservedNanos = max(latestObservedNanos, coverage.verifiedAtNanos)
+        }
+    }
+
     public func health(observedNanos: UInt64, status: String, message: String? = nil) throws {
         try lock.withLock {
             try requireAccepting()
@@ -497,6 +575,7 @@ public final class RecordingWriter: @unchecked Sendable {
             do {
             // Index references become durable only after their frame bytes.
             try file?.synchronize()
+            var remainingCoverage: [CaptureFrameCoverage] = []
             try database.transaction {
                 for frame in pendingFrames {
                     try database.execute("INSERT INTO frames VALUES(?,?,?,?,?,?,?)", [
@@ -511,8 +590,20 @@ public final class RecordingWriter: @unchecked Sendable {
                         .blob(try JSONEncoder().encode(event))
                     ])
                 }
+                for proof in pendingCoverage {
+                    // Coverage can arrive while its immutable frame is still
+                    // compressing. Publish only after that frame is durable.
+                    guard let data = try database.query("SELECT block FROM frames WHERE id=?", [.text(proof.frameID.uuidString)]).first?["block"]?.data else {
+                        remainingCoverage.append(proof); continue
+                    }
+                    let frame = try JSONDecoder().decode(FrameBlock.self, from: data).metadata
+                    _ = try proof.validated(frame: frame, cutoffNanos: proof.verifiedAtNanos)
+                    try database.execute("INSERT INTO coverage VALUES(?,?,?,?)", [try integer(proof.verifiedAtNanos),
+                        .text(proof.surface.id), .text(proof.frameID.uuidString), .blob(try JSONEncoder().encode(proof))])
+                }
             }
             pendingFrames.removeAll(keepingCapacity: true); pendingEvents.removeAll(keepingCapacity: true)
+            pendingCoverage = remainingCoverage
             try RecordingFiles.writeManifest(manifest, in: directory)
             } catch { recordFailure(error, at: latestObservedNanos); throw error }
         }
@@ -529,6 +620,7 @@ public final class RecordingWriter: @unchecked Sendable {
                 // The on-disk manifest remains recoverable until every frame,
                 // event and index transaction is durable and the archive closed.
                 try flush()
+                guard pendingCoverage.isEmpty else { throw AstraError("recording.coverage", "Capture proof references a frame that never reached storage.") }
                 try file?.close(); file = nil
                 try database.checkpoint()
                 try database.execute("PRAGMA journal_mode=DELETE")

@@ -14,7 +14,7 @@ public struct RecordingProgress: Sendable {
 /// The UI receives snapshots and never owns capture buffers or disk I/O.
 public final class RecordingSession: @unchecked Sendable {
     private let lock = NSLock()
-    private let capture = ScreenCapture()
+    private let capture = ScreenCaptureGroup()
     private let input = PhysicalInputMonitor()
     private let writerQueue = DispatchQueue(label: "astra.recording.writer", qos: .userInitiated)
     private let compressors: OperationQueue = {
@@ -23,7 +23,9 @@ public final class RecordingSession: @unchecked Sendable {
         return queue
     }()
     private let writer: RecordingWriter
+    private let correction: CorrectionRecordingSeed?
     private let source: CaptureSource
+    private let surfaceIDs: Set<String>
     private let fps: Int
     private let showsCursor: Bool
     private let onProgress: @Sendable (RecordingProgress) -> Void
@@ -39,20 +41,27 @@ public final class RecordingSession: @unchecked Sendable {
     private var admittedFrames = 0
     private var reservedBytes = 0
     private var admittedEvents = 0
+    private var admittedCoverage = 0
+    private var receivedSurfaceIDs: Set<String> = []
     private var frameSequence: UInt64 = 0
     private var captureRequestedAt: UInt64?
     // The following fields are owned only by writerQueue.
     private var nextWrittenSequence: UInt64 = 0
     private var completedFrames: [UInt64: (Result<PreparedFrame, any Error>, Int)] = [:]
-    private var healthWasAvailable: Bool?
+    private var healthWasAvailable: [String: Bool] = [:]
     private var finalized = false
 
-    public init(directory: URL, manifest: RecordingManifest, source: CaptureSource,
+    public init(directory: URL, manifest: RecordingManifest, source: CaptureSource, correction: CorrectionRecordingSeed? = nil,
                 onProgress: @escaping @Sendable (RecordingProgress) -> Void,
                 onFault: @escaping @Sendable (String) -> Void) throws {
+        self.correction = correction
         self.source = source; fps = manifest.environment.captureFPS; showsCursor = manifest.environment.showsCursor
+        let bindings = try source.captureBindings()
+        surfaceIDs = Set(bindings.map(\.id))
         self.onProgress = onProgress; self.onFault = onFault
-        writer = try RecordingWriter(directory: directory, manifest: manifest)
+        var boundManifest = manifest
+        boundManifest.surfaceIDs = bindings.map(\.id)
+        writer = try RecordingWriter(directory: directory, manifest: boundManifest)
     }
 
     deinit {
@@ -76,6 +85,14 @@ public final class RecordingSession: @unchecked Sendable {
         defer { startingCompletion.finish() }
         do {
             try checkDisk()
+            if let correction {
+                let gate = try lock.withLock {
+                    guard acceptingFrames, finishTask == nil else { throw CancellationError() }
+                    return MonotonicClock.now
+                }
+                try await Task.detached { [writer] in try writer.attachCorrection(correction, supervisionStartNanos: gate) }.value
+                try requireStarting()
+            }
             try await input.start(source: source, onEvents: { [weak self] in self?.admitEvents($0) },
                                   onFault: { [weak self] in self?.fail($0.localizedDescription) },
                                   onEmergency: { [weak self] in self?.fail("Recording stopped by the emergency shortcut.") },
@@ -84,7 +101,7 @@ public final class RecordingSession: @unchecked Sendable {
             lock.withLock { captureRequestedAt = MonotonicClock.now }
             try await capture.start(source: source, fps: fps, showsCursor: showsCursor,
                                     onFrame: { [weak self] in self?.admitFrame($0) },
-                                    onHealth: { [weak self] in self?.captureHealth($0) })
+                                    onHealth: { [weak self] in self?.captureHealth($1, surfaceID: $0) })
             try requireStarting()
             let timer = DispatchSource.makeTimerSource(queue: writerQueue)
             timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250), leeway: .milliseconds(25))
@@ -150,7 +167,8 @@ public final class RecordingSession: @unchecked Sendable {
         let cost = frame.surface.pixelWidth * frame.surface.pixelHeight * 4 * 3
         let sequence: UInt64? = lock.withLock {
             guard acceptingFrames else { return nil }
-            guard admittedFrames < 8, reservedBytes + cost <= 512 * 1_024 * 1_024 else { return UInt64.max }
+            guard surfaceIDs.contains(frame.surface.id), admittedFrames < max(8, surfaceIDs.count * 2), reservedBytes + cost <= 512 * 1_024 * 1_024 else { return UInt64.max }
+            receivedSurfaceIDs.insert(frame.surface.id)
             admittedFrames += 1; reservedBytes += cost
             let value = frameSequence; frameSequence += 1
             return value
@@ -220,7 +238,22 @@ public final class RecordingSession: @unchecked Sendable {
         }
     }
 
-    private func captureHealth(_ health: CaptureHealth) {
+    private func captureHealth(_ health: CaptureHealth, surfaceID: String) {
+        if case .coverage(let proof) = health {
+            let admission = lock.withLock { () -> Bool? in
+                guard acceptingFrames, stopAt.map({ proof.verifiedAtNanos <= $0 }) ?? true else { return nil }
+                guard admittedCoverage < 512 else { return false }
+                admittedCoverage += 1; return true
+            }
+            guard let admission else { return }
+            guard admission else { fail("Capture coverage storage could not keep up. The recorded prefix is preserved."); return }
+            writerQueue.async { [self] in
+                defer { lock.withLock { admittedCoverage -= 1 } }
+                guard !finalized else { return }
+                do { try writer.append(coverage: proof) } catch { fail(error.localizedDescription) }
+            }
+            return
+        }
         let available: Bool
         switch health {
         case .live, .idle: available = true
@@ -229,21 +262,22 @@ public final class RecordingSession: @unchecked Sendable {
         }
         let time = MonotonicClock.now
         writerQueue.async { [self] in
-            guard !finalized, healthWasAvailable != available else { return }
-            healthWasAvailable = available
+            guard !finalized, healthWasAvailable[surfaceID] != available else { return }
+            healthWasAvailable[surfaceID] = available
             if !available { writer.markInvalid(from: time, message: "Capture became unavailable.") }
-            do { try writer.health(observedNanos: time, status: available ? "available" : "unavailable") }
+            do { try writer.health(observedNanos: time, status: available ? "available" : "unavailable", message: surfaceID) }
             catch { fail(error.localizedDescription) }
         }
     }
 
     private func flushAndPublish() {
         guard !finalized else { return }
-        let missingFirstFrame = lock.withLock {
-            captureRequestedAt.map { MonotonicClock.now - $0 >= 10_000_000_000 && frameSequence == 0 && stopAt == nil } ?? false
+        let missingFirstFrame = lock.withLock { () -> Bool in
+            guard let requested = captureRequestedAt, stopAt == nil else { return false }
+            return MonotonicClock.now - requested >= 10_000_000_000 && receivedSurfaceIDs != surfaceIDs
         }
         if missingFirstFrame {
-            fail("Screen capture started but supplied no complete frame within 10 seconds. Check that the target is visible and Screen Recording access is still enabled.")
+            fail("A bound capture surface supplied no complete frame within 10 seconds. Check that every target is visible and Screen Recording access is still enabled.")
         }
         do { try checkDisk(); try writer.flush() }
         catch { fail(error.localizedDescription) }

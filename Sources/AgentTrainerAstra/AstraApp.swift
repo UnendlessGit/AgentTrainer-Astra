@@ -203,6 +203,8 @@ struct WorkspaceView: View {
 }
 
 private struct AgentWorkspace: View {
+    @State private var showingContexts = false
+    @State private var showingCheckpoints = false
     let agent: AgentDocument
     @Bindable var model: WorkspaceModel
 
@@ -220,9 +222,12 @@ private struct AgentWorkspace: View {
                             Text(checkpoint.name).tag(Optional(checkpoint.id))
                         }
                     }.frame(maxWidth: 400, alignment: .leading).disabled(model.checkpointLinks[agent.id]?.isEmpty != false)
+                    Button("Manage Checkpoints…") { showingCheckpoints = true }.buttonStyle(.link)
                 }
                 Spacer()
                 Menu {
+                    Button("Contexts…", systemImage: "tag") { showingContexts = true }
+                        .disabled(model.isRunningAgent || model.isLearning || model.isRecording || model.recordingStarting || model.recordingStopping)
                     Button("Duplicate Agent") { Task { await model.duplicateSelectedAgent() } }
                 } label: { Image(systemName: "ellipsis.circle").imageScale(.large) }
                 .menuStyle(.borderlessButton).fixedSize().help("Agent actions")
@@ -253,20 +258,23 @@ private struct AgentWorkspace: View {
                 case .evaluation:
                     LearningEvaluationView(agent: agent, model: model).id(agent.id)
                 case .run:
-                    RunView(coordinator: model.inference,
+                    RunView(coordinator: model.inference, agentID: agent.id,
                             checkpoints: model.checkpoints.filter { model.checkpointLinks[agent.id]?.contains($0.id) == true },
                             sources: model.sources, refreshingSources: model.refreshingSources, sourceIssue: model.sourceIssue,
-                            unavailableReason: model.inferenceUnavailableReason, contextSizes: model.checkpointContextSizes,
+                            unavailableReason: model.inferenceUnavailableReason, contextSizes: model.checkpointContextSizes, contextVocabulary: model.checkpointContextVocabulary,
                             selectedCheckpointID: agent.selectedCheckpointID,
                             refreshSources: { Task { await model.refreshPermissionsAndSources() } },
                             selectCheckpoint: { id in Task { await model.selectCheckpoint(id, agentID: agent.id) } },
                             start: { checkpoint, source, options in model.startInference(agent: agent, checkpoint: checkpoint, source: source, options: options) },
+                            recordCorrection: { Task { await model.recordCorrection() } }, correctionStarting: model.correctionStarting,
                             acknowledgeCleanup: { try await model.acknowledgeInferenceCleanup() })
                         .task(id: agent.selectedCheckpointID) { await model.inspectCheckpointContexts(agent.selectedCheckpointID, agentID: agent.id) }
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding(28)
+        .sheet(isPresented: $showingContexts) { ContextEditor(agent: agent, model: model) }
+        .sheet(isPresented: $showingCheckpoints) { CheckpointManager(agent: agent, model: model) }
     }
 
     private var environmentName: String {

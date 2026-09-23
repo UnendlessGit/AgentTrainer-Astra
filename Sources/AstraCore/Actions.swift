@@ -137,16 +137,22 @@ public struct ActionPacket: Codable, Hashable, Sendable, Identifiable {
         self.durationMs = durationMs; self.commands = commands
     }
 
-    public func validated(capabilities: ActionCapabilities, surfaces: [SurfaceDescriptor], capacity: Int) throws -> Self {
+    public func validated(capabilities: ActionCapabilities, surfaces: [SurfaceDescriptor], capacity: Int, expectedGeometryRevision: UInt64? = nil) throws -> Self {
         _ = try capabilities.validated()
         guard [16, 32, 64].contains(capacity), commands.count <= capacity,
-              (1...1_000).contains(durationMs), !surfaces.isEmpty,
+              (1...1_000).contains(durationMs), (1...16).contains(surfaces.count),
               Set(surfaces.map(\.id)).count == surfaces.count else {
             throw AstraError("actions.packet", "Invalid command packet size, cadence, or surfaces.")
         }
-        for surface in surfaces {
-            _ = try surface.validated()
-            guard surface.geometryRevision == geometryRevision else {
+        for surface in surfaces { _ = try surface.validated() }
+        if let expectedGeometryRevision {
+            guard geometryRevision == expectedGeometryRevision else {
+                throw AstraError("actions.geometryChanged", "The observation binding changed after this action was planned.")
+            }
+        } else {
+            // Legacy callers bind a single geometry epoch. A group owner must
+            // supply its own scope epoch; native revisions remain independent.
+            guard surfaces.allSatisfy({ $0.geometryRevision == geometryRevision }) else {
                 throw AstraError("actions.geometryChanged", "The surface moved after this action was planned.")
             }
         }
@@ -219,16 +225,19 @@ public struct RawInputEvent: Codable, Hashable, Sendable {
     public var isDown: Bool?
     public var detail: String?
     public var rawPlatformData: Data?
+    /// Present only when the observed recipient resolves to a captured surface.
+    public var surfaceID: String?
 
     public init(sequence: UInt64, eventNanos: UInt64, observedNanos: UInt64, origin: InputOrigin,
                 kind: RawInputKind, keyCode: Int? = nil, button: Int? = nil,
                 x: Double? = nil, y: Double? = nil, dx: Double? = nil, dy: Double? = nil,
                 scrollX: Double? = nil, scrollY: Double? = nil, modifiers: UInt64? = nil,
-                isDown: Bool? = nil, detail: String? = nil, rawPlatformData: Data? = nil) {
+                isDown: Bool? = nil, detail: String? = nil, rawPlatformData: Data? = nil, surfaceID: String? = nil) {
         self.sequence = sequence; self.eventNanos = eventNanos; self.observedNanos = observedNanos
         self.origin = origin; self.kind = kind; self.keyCode = keyCode; self.button = button
         self.x = x; self.y = y; self.dx = dx; self.dy = dy; self.scrollX = scrollX; self.scrollY = scrollY
         self.modifiers = modifiers; self.isDown = isDown; self.detail = detail
         self.rawPlatformData = rawPlatformData
+        self.surfaceID = surfaceID
     }
 }

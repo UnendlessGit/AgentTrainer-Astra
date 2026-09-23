@@ -72,15 +72,26 @@ def _rect(value: dict) -> tuple[float, float, float, float]:
 
 def validate_surface(value: dict) -> dict:
     required = {"id", "globalBounds", "pixelWidth", "pixelHeight", "contentBounds", "geometryRevision"}
-    if not isinstance(value, dict) or set(value) != required or not isinstance(value["id"], str) or not 1 <= len(value["id"].encode()) <= 256:
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"nativeWindowID", "nativeDisplayID"} or not isinstance(value["id"], str) or not 1 <= len(value["id"].encode()) <= 256:
         raise RecordingError("Invalid surface descriptor")
     width, height = _integer(value["pixelWidth"], 1, 32768), _integer(value["pixelHeight"], 1, 32768)
     _integer(value["geometryRevision"], maximum=2**64 - 1)
+    for name in ("nativeWindowID", "nativeDisplayID"):
+        if name in value:
+            _integer(value[name], maximum=2**32 - 1)
     _rect(value["globalBounds"])
     x, y, w, h = _rect(value["contentBounds"])
     if x < 0 or y < 0 or x + w > width or y + h > height or width * height * 4 > MAXIMUM_FRAME_BYTES:
         raise RecordingError("Surface content is outside its native pixel buffer")
     return value
+
+
+def validate_surface_ids(value: list) -> tuple[str, ...]:
+    if (not isinstance(value, list) or not 1 <= len(value) <= 16 or
+            any(type(item) is not str or not 1 <= len(item.encode()) <= 256 for item in value) or
+            len(set(value)) != len(value)):
+        raise RecordingError("Recording surface roles require 1–16 distinct ordered identifiers")
+    return tuple(value)
 
 
 def validate_frame(value: dict, *, maximum_timestamp: int = 2**63 - 1) -> dict:
@@ -119,6 +130,8 @@ def validate_event(value: dict, *, maximum_timestamp: int = 2**63 - 1) -> dict:
         _integer(value["button"], maximum=31)
     if "modifiers" in value:
         _integer(value["modifiers"], maximum=2**64 - 1)
+    if "surfaceID" in value and (type(value["surfaceID"]) is not str or not 1 <= len(value["surfaceID"].encode()) <= 256):
+        raise RecordingError("Invalid observed input surface hint")
     if "isDown" in value and type(value["isDown"]) is not bool:
         raise RecordingError("Invalid physical input state")
     required = {"keyDown": ("keyCode",), "keyUp": ("keyCode",), "keyRepeat": ("keyCode",),
@@ -126,6 +139,22 @@ def validate_event(value: dict, *, maximum_timestamp: int = 2**63 - 1) -> dict:
                 "scroll": ("scrollX", "scrollY"), "flags": ("modifiers",), "gap": ()}
     if any(value.get(field) is None for field in required[value["kind"]]):
         raise RecordingError("Raw input is missing its operation arguments")
+    return value
+
+
+def validate_frame_coverage(value: dict, *, frame: dict | None = None, cutoff: int | None = None) -> dict:
+    required = {"streamID", "frameID", "surface", "eventNanos", "observedNanos", "throughNanos", "verifiedAtNanos", "kind"}
+    if not isinstance(value, dict) or set(value) != required or value["kind"] != "unchanged":
+        raise RecordingError("Invalid recorded unchanged-frame evidence")
+    uuid.UUID(value["streamID"]); uuid.UUID(value["frameID"])
+    validate_surface(value["surface"])
+    times = [_integer(value[name]) for name in ("eventNanos", "observedNanos", "throughNanos", "verifiedAtNanos")]
+    if times != sorted(times) or (cutoff is not None and times[-1] > cutoff):
+        raise RecordingError("Unchanged-frame evidence is noncausal")
+    if frame is not None and (uuid.UUID(value["frameID"]) != uuid.UUID(frame["id"]) or
+            value["surface"] != frame["surface"] or value["eventNanos"] != frame["eventNanos"] or
+            value["observedNanos"] != frame["observedNanos"]):
+        raise RecordingError("Unchanged-frame evidence does not match its immutable frame")
     return value
 
 
@@ -180,6 +209,7 @@ class RecordingReader:
         self._connection = None
         self._shards = OrderedDict()
         self._decoder = FrameDecoder()
+        self.correction = None
         try:
             if self.directory.is_symlink() or not self.directory.is_dir():
                 raise RecordingError("A recording package must be a local directory")
@@ -203,6 +233,13 @@ class RecordingReader:
             for field in ("firstObservedNanos", "firstInvalidObservedNanos"):
                 if field in manifest:
                     _integer(manifest[field])
+            if "surfaceIDs" in manifest:
+                validate_surface_ids(manifest["surfaceIDs"])
+            if "correction" in manifest:
+                from .corrections import read_prelude
+                self.correction = read_prelude(self.directory, manifest["correction"])
+                if self.correction["supervisionStartNanos"] > manifest["stoppedNanos"]:
+                    raise RecordingError("Correction recording ended before its expert supervision gate")
             parts = manifest.get("indexPath", "index.sqlite").split("/")
             if parts != ["index.sqlite"]:
                 if len(parts) != 3 or parts[0] != "Recovery" or parts[2] != "index.sqlite":
@@ -263,6 +300,27 @@ class RecordingReader:
         for row in self._rows("SELECT * FROM frames ORDER BY observed,id"):
             yield self._frame_row(row)
 
+    def coverage(self) -> Iterator[dict]:
+        """Only explicit durable source proofs extend a static frame's lifetime."""
+        if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='coverage'").fetchone() is None:
+            return
+        for row in self._rows("SELECT * FROM coverage ORDER BY observed,surface_id,rowid"):
+            proof = validate_frame_coverage(_json(row["proof"], limit=16384))
+            if (row["observed"] != proof["verifiedAtNanos"] or row["surface_id"] != proof["surface"]["id"] or
+                    uuid.UUID(row["frame_id"]) != uuid.UUID(proof["frameID"])):
+                raise RecordingError("Recorded source coverage disagrees with its index")
+            yield proof
+
+    def contains_coverage(self, proof: dict) -> bool:
+        if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='coverage'").fetchone() is None:
+            return False
+        for row in self._rows("SELECT proof,frame_id FROM coverage WHERE observed=? AND surface_id=?",
+                              (proof["verifiedAtNanos"], proof["surface"]["id"])):
+            if (_json(row["proof"], limit=16384) == proof and
+                    uuid.UUID(row["frame_id"]) == uuid.UUID(proof["frameID"])):
+                return True
+        return False
+
     def frame_at(self, observed_nanos: int, *, surface_id: str) -> dict | None:
         _integer(observed_nanos)
         row = self.connection.execute("SELECT * FROM frames WHERE observed<=? AND json_extract(CAST(block AS TEXT),'$.metadata.surface.id')=? ORDER BY observed DESC,id DESC LIMIT 1",
@@ -300,6 +358,30 @@ class RecordingReader:
         if block != reference["block"]:
             raise RecordingError("Decoded frame disagrees with its indexed identity, geometry or checksum")
         return pixels
+
+    @property
+    def supervision_start_nanos(self) -> int:
+        return 0 if self.correction is None else self.correction["supervisionStartNanos"]
+
+    def correction_pixels(self, observation_index: int, surface_index: int) -> np.ndarray:
+        """Original lead-up pixels for review only, never an expert label source."""
+        self.connection
+        if self.correction is None:
+            raise RecordingError("This recording has no retained correction lead-up")
+        rows = self.correction["observations"]
+        _integer(observation_index, 0, len(rows) - 1)
+        frames = rows[observation_index]["frames"]
+        _integer(surface_index, 0, len(frames) - 1)
+        reference = frames[surface_index]
+        from .corrections import _open, MAXIMUM_PIXELS, MAXIMUM_PRELUDE_BYTES
+        descriptor, _ = _open(self.directory, "frames.astraframes", MAXIMUM_PIXELS + MAXIMUM_PRELUDE_BYTES)
+        try:
+            block, pixels = self._decoder.read(descriptor, reference["block"]["offset"])
+            if block != reference["block"]:
+                raise RecordingError("Correction pixels changed from their saved identity")
+            return pixels
+        finally:
+            os.close(descriptor)
 
     def events(self, start: int = 0, end: int = 2**63 - 1, *, time_axis: str = "observed") -> Iterator[dict]:
         _integer(start); _integer(end)

@@ -8,9 +8,19 @@ import AstraPlatform
 struct InferenceCollectedObservation: Sendable {
     let runID: UUID
     let actorInput: JSONValue
-    let frame: FrameMetadata
-    let pixels: Data
-    var coverage: CaptureFrameCoverage? = nil
+    let frames: [PolicyActorOwnedObservation.Frame]
+    var pixelByteCount: Int { frames.reduce(0) { $0 + $1.pixels.count } }
+    init(runID: UUID, actorInput: JSONValue, frames: [PolicyActorOwnedObservation.Frame]) {
+        self.runID = runID; self.actorInput = actorInput; self.frames = frames
+    }
+    init(runID: UUID, actorInput: JSONValue, frame: FrameMetadata, pixels: Data, coverage: CaptureFrameCoverage? = nil) {
+        self.init(runID: runID, actorInput: actorInput, frames: [.init(metadata: frame, pixels: pixels, coverage: coverage)])
+    }
+    // Compatibility for explicitly single-source callers; never discard a source.
+    private var single: PolicyActorOwnedObservation.Frame { precondition(frames.count == 1); return frames[0] }
+    var frame: FrameMetadata { single.metadata }
+    var pixels: Data { single.pixels }
+    var coverage: CaptureFrameCoverage? { single.coverage }
 }
 
 enum InferenceCollectionEvent: Sendable {

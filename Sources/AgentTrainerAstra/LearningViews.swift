@@ -126,6 +126,17 @@ struct BehaviorTrainingView: View {
                         }
                     }.padding(8)
                 } label: { Text("Demonstrations").font(.headline) }
+                if options.initialCheckpointID == nil, let contexts = try? model.contextVocabulary(for: agent), !contexts.fields.isEmpty {
+                    GroupBox("Contexts") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(contexts.fields.map(\.name).joined(separator: " · "))
+                            Text(options.source == .recordings
+                                 ? "Set values in Demonstrations → Review Recording. The selected contexts and values are frozen into this model and dataset."
+                                 : "Generated practice demonstrations use Unknown for every context field.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                    }
+                }
                 GroupBox {
                     VStack(alignment: .leading, spacing: 14) {
                         Picker("Starting point", selection: $options.initialCheckpointID) {
@@ -338,8 +349,9 @@ struct LearningRunList: View {
                         Spacer()
                         if let checkpointID = run.checkpointID {
                             let selected = model.agents.first(where: { $0.id == run.agentID })?.selectedCheckpointID == checkpointID
-                            Button(selected ? "Selected" : "Select Checkpoint") { Task { await model.selectCheckpoint(checkpointID, agentID: run.agentID) } }
-                                .disabled(selected)
+                            let available = model.checkpointLinks[run.agentID]?.contains(checkpointID) == true
+                            Button(!available ? "Checkpoint Removed" : selected ? "Selected" : "Select Checkpoint") { Task { await model.selectCheckpoint(checkpointID, agentID: run.agentID) } }
+                                .disabled(selected || !available || model.saving)
                         }
                     }.padding(12).background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
                         .accessibilityElement(children: .contain)

@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 
+from .contexts import ContextField, vocabulary
+
 MAXIMUM_PARAMETERS = 500_000_000
 
 
@@ -31,8 +33,13 @@ class ModelConfig:
     backbone_depths: tuple[int, ...] = (3, 3, 9, 3)
     context_sizes: tuple[int, ...] = ()
     context_width: int = 32
+    context_vocabulary: tuple[ContextField, ...] = ()
 
     def validate(self) -> ModelConfig:
+        if type(self.context_vocabulary) is not tuple:
+            raise ValueError("Context vocabulary must be immutable")
+        if self.context_vocabulary:
+            vocabulary([field.to_dict() for field in self.context_vocabulary], self.context_sizes)
         if self.schema_version != 2:
             raise ValueError("Unsupported model schema; version 2 requires internal visual padding masks")
         if any(type(value) is not tuple for value in
@@ -108,6 +115,16 @@ class ModelConfig:
         value = asdict(self)
         for field in ("detail_channels", "backbone_dims", "backbone_depths", "context_sizes"):
             value[field] = list(value[field])
+        if self.context_vocabulary:
+            value["context_vocabulary"] = [field.to_dict() for field in self.context_vocabulary]
+        else:
+            value.pop("context_vocabulary")  # Keep existing checkpoint/config signatures.
+        return value
+
+    def semantic_dict(self) -> dict:
+        value = self.to_dict()
+        if self.context_vocabulary:
+            value["context_vocabulary"] = [field.semantic_dict() for field in self.context_vocabulary]
         return value
 
     @classmethod
@@ -121,11 +138,13 @@ class ModelConfig:
         for key in ("detail_channels", "backbone_dims", "backbone_depths", "context_sizes"):
             if key in copied:
                 copied[key] = tuple(copied[key])
+        if "context_vocabulary" in copied:
+            copied["context_vocabulary"] = vocabulary(copied["context_vocabulary"], copied.get("context_sizes", ()))
         return cls(**copied).validate()
 
     @property
     def signature(self) -> str:
-        return hashlib.sha256(json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return hashlib.sha256(json.dumps(self.semantic_dict(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     @classmethod
     def test_small(cls) -> ModelConfig:

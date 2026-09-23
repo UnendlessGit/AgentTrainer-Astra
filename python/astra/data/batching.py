@@ -43,12 +43,21 @@ def stack_observations(rows: Sequence[Sequence[ObservationBatch]]) -> Observatio
         raise ValueError("Observation batching needs a nonempty rectangular lane/time grid")
     batch, time = len(rows), len(rows[0])
     flat = [sample for row in rows for sample in row]
-    count = len(flat[0].surfaces)
-    if any(sample.shape != (1, 1) or len(sample.surfaces) != count for sample in flat):
-        raise ValueError("Each sample must have one step and consistent surface roles")
+    count = max(len(sample.surfaces) for sample in flat)
+    if not 1 <= count <= 16 or any(sample.shape != (1, 1) or not sample.surfaces for sample in flat):
+        raise ValueError("Each sample must have one step and bounded nonempty surface roles")
     result = []
     for index in range(count):
-        surfaces = [sample.surfaces[index] for sample in flat]
+        # Slots keep the recording's declared order. A shorter source has no
+        # observations for trailing slots: masked padding cannot become a target.
+        template = next(sample.surfaces[index] for sample in flat if index < len(sample.surfaces))
+        absent = SurfaceBatch(
+            global_image=mx.zeros((1, 1, 32, 32, 3)), detail_image=mx.zeros((1, 1, 32, 32, 3)),
+            cursor_image=mx.zeros_like(template.cursor_image),
+            global_content_rect=mx.array([[[0., 0., 1., 1.]]]), content_rect=mx.array([[[0., 0., 1., 1.]]]),
+            cursor_rect=mx.array([[[2., 2., 1., 1.]]]), global_bounds=mx.array([[[0., 0., 1., 1.]]]),
+            available=mx.array([[False]]))
+        surfaces = [sample.surfaces[index] if index < len(sample.surfaces) else absent for sample in flat]
         images = {}
         rectangles = {}
         for image_name, rect_name in (("global_image", "global_content_rect"), ("detail_image", "content_rect"), ("cursor_image", None)):

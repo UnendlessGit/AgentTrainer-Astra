@@ -1,0 +1,11 @@
+# Categorical contexts
+
+Contexts supply optional categorical information to the existing policy embeddings. They are generic fields chosen for an agent, with saved field and value UUIDs. Index zero always means **Unknown / not specified**; authored values occupy indices 1 onward. Contexts do not change the temporal model.
+
+The agent's Contexts editor manages reusable definitions and selects up to 32 fields. Names can change without changing identity. Add a new value when its meaning changes. A new model freezes the selected fields, value order and labels in `model.context_vocabulary`, alongside `context_sizes`. Dataset and checkpoint manifests already carry this complete configuration, so no catalog lookup can reinterpret historical data. Model equality and signatures include ordered UUID meaning while excluding display labels. Configurations without an authored vocabulary retain their original serialization and signatures.
+
+Recording links store context assignments by UUID in their training selection. Review Recording can use today's agent vocabulary or any linked checkpoint's frozen vocabulary, including values later removed from the catalog. Behavioral training resolves assignments against the actual starting model before preparing an immutable dataset. Unassigned fields resolve to Unknown; missing values fail with a request to choose again. Session splits and intervals remain unchanged. Generated practice demonstrations use Unknown.
+
+Run and reinforcement views use named choices from the selected checkpoint; fresh RL uses the agent's current fields. The configuration is captured before work starts and remains fixed through the run. Resume restores saved values. Definitions cannot be edited during active recording, learning or control. Changing contexts requires ending the current run and starting another confirmed boundary; there is no live in-place embedding change. Older numeric-only checkpoints retain numeric controls without guessed names.
+
+Focused evidence: Core catalog save/reopen and assignment round-trip; native dataset/configuration snapshot and exact resume; small-model checkpoint vocabulary and practice Unknown samples; semantic rename/order tests. This verifies configuration flow, not learned context quality. Full installed workflow qualification remains a release gate.

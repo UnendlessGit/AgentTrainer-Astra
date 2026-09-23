@@ -12,6 +12,7 @@ private struct PreviewEvent: Identifiable {
     var preview: RecordingPreview?
     var image: NSImage?
     var issue: String?
+    var selectedSurfaceID: String?
     var seconds: Double = 0
     var loading = false
     private var reader: RecordingReader?
@@ -32,7 +33,7 @@ private struct PreviewEvent: Identifiable {
                 return (reader, try reader.inspect())
             }.value
             guard generation == token, !Task.isCancelled else { return }
-            reader = pair.0; inspection = pair.1
+            reader = pair.0; inspection = pair.1; selectedSurfaceID = pair.1.surfaceIDs.first
             seek(0)
         } catch {
             if generation == token { issue = error.localizedDescription; loading = false }
@@ -55,7 +56,8 @@ private struct PreviewEvent: Identifiable {
                 do {
                     try await Task.sleep(for: .milliseconds(35))
                     if generation != token { continue }
-                    let result = try await Task.detached { try reader.preview(at: first + offset) }.value
+                    let surfaceID = selectedSurfaceID
+                    let result = try await Task.detached { try reader.preview(at: first + offset, surfaceID: surfaceID) }.value
                     if Task.isCancelled { return }
                     if generation != token { continue }
                     preview = result; image = result.flatMap(Self.previewImage); issue = nil
@@ -92,6 +94,8 @@ struct RecordingInspector: View {
     @State private var selectionDirty = false
     @State private var selectionSaving = false
     @State private var confirmingDiscard = false
+    @State private var contextVocabulary: ContextVocabulary?
+    @State private var contextsLoading = true
 
     var body: some View {
         GeometryReader { geometry in
@@ -109,6 +113,17 @@ struct RecordingInspector: View {
             if let issue = recording.issue {
                 AttentionLabel(message: issue).font(.callout).textSelection(.enabled)
             }
+            if let surfaces = model.inspection?.surfaceIDs, surfaces.count > 1 {
+                Picker("Observed surface", selection: Binding(get: { model.selectedSurfaceID }, set: { value in
+                    model.selectedSurfaceID = value; model.seek(model.seconds)
+                })) {
+                    ForEach(Array(surfaces.enumerated()), id: \.element) { index, id in
+                        Text("Surface \(index + 1) · \(id)").tag(Optional(id))
+                    }
+                }
+                Text("Each source keeps its own capture time. Select a surface to inspect its latest image at the playhead.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             ZStack {
                 RoundedRectangle(cornerRadius: 10).fill(.quaternary)
                 if let image = model.image {
@@ -116,8 +131,8 @@ struct RecordingInspector: View {
                         .accessibilityLabel("Recorded screen at \(model.seconds.formatted(.number.precision(.fractionLength(2)))) seconds")
                 } else if let issue = model.issue {
                     ContentUnavailableView("Preview unavailable", systemImage: "exclamationmark.triangle", description: Text(issue))
-                } else if recording.frameCount == 0 {
-                    ContentUnavailableView("No complete frames", systemImage: "photo", description: Text("The captured source has been preserved for inspection."))
+                } else if !model.loading {
+                    ContentUnavailableView("No frame at this time", systemImage: "photo", description: Text("This source has not produced an image at the selected time."))
                 }
                 if model.loading { ProgressView().controlSize(.large) }
             }.frame(height: agentID == nil ? min(300, max(180, geometry.size.height * 0.4))
@@ -133,13 +148,20 @@ struct RecordingInspector: View {
                 Text("\(model.seconds, specifier: "%.2f") / \(model.maximumSeconds, specifier: "%.2f") s")
                     .font(.callout.monospacedDigit()).frame(minWidth: 110, alignment: .trailing)
             }
+            if let reference = recording.correction {
+                CorrectionPreludeReview(reference: reference, directory: directory)
+            }
             if let workspace, let agentID, let agent = workspace.agents.first(where: { $0.id == agentID }) {
+                RecordingContextPicker(agent: agent, workspace: workspace, vocabulary: $contextVocabulary, loading: $contextsLoading)
+                    .disabled(selectionSaving)
                 RecordingSelectionEditor(recording: recording, agentName: agent.name,
                     selection: workspace.recordingSelections[agentID]?[recording.id], playheadSeconds: model.seconds,
+                    contextVocabulary: contextVocabulary ?? .empty,
                     onSave: { selection in
                         await workspace.saveRecordingSelection(selection, recordingID: recording.id, agentID: agentID) ? nil
                             : (workspace.errorMessage ?? "The selection could not be saved.")
                     }, onDirty: { selectionDirty = $0 }, onSaving: { selectionSaving = $0 })
+                    .disabled(contextsLoading || contextVocabulary == nil)
             }
             if let preview = model.preview {
                 HStack {

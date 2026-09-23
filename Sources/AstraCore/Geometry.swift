@@ -50,19 +50,26 @@ public struct SurfaceDescriptor: Codable, Hashable, Sendable, Identifiable {
     public var pixelHeight: Int
     public var contentBounds: Rect2D
     public var geometryRevision: UInt64
+    /// Native recipient identity, independent of the model's ordered surface role.
+    public var nativeWindowID: UInt32?
+    public var nativeDisplayID: UInt32?
 
     public init(id: String, globalBounds: Rect2D, pixelWidth: Int, pixelHeight: Int,
-                contentBounds: Rect2D? = nil, geometryRevision: UInt64 = 0) {
+                contentBounds: Rect2D? = nil, geometryRevision: UInt64 = 0,
+                nativeWindowID: UInt32? = nil, nativeDisplayID: UInt32? = nil) {
         self.id = id; self.globalBounds = globalBounds
         self.pixelWidth = pixelWidth; self.pixelHeight = pixelHeight
         self.contentBounds = contentBounds ?? Rect2D(x: 0, y: 0, width: Double(pixelWidth), height: Double(pixelHeight))
         self.geometryRevision = geometryRevision
+        self.nativeWindowID = nativeWindowID; self.nativeDisplayID = nativeDisplayID
     }
 
     public func validated() throws -> Self {
         guard !id.isEmpty, id.utf8.count <= 256, globalBounds.isValid, contentBounds.isValid,
               (1...32_768).contains(pixelWidth), (1...32_768).contains(pixelHeight),
               contentBounds.x >= 0, contentBounds.y >= 0,
+              nativeWindowID.map({ $0 > 0 }) ?? true, nativeDisplayID.map({ $0 > 0 }) ?? true,
+              nativeWindowID == nil || nativeDisplayID == nil,
               contentBounds.x + contentBounds.width <= Double(pixelWidth),
               contentBounds.y + contentBounds.height <= Double(pixelHeight) else {
             throw AstraError("geometry.invalidSurface", "The capture surface has invalid dimensions or bounds.")

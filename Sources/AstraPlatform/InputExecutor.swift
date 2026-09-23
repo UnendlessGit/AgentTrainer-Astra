@@ -67,11 +67,13 @@ public protocol ControlInputBackend: Sendable {
     /// Called on the independent watchdog; read cached proofs only, without OS IPC.
     func checkHealth() throws
     func validate(_ scope: ControlScope, pointer: Point2D?) throws
+    func validate(_ scope: ControlScope, pointer: Point2D?, surfaceID: String?) throws
     func post(_ emission: InputEmission) throws
 }
 
 public extension ControlInputBackend {
     func cleanupPhysicalState() -> ControlState { physicalState() }
+    func validate(_ scope: ControlScope, pointer: Point2D?, surfaceID: String?) throws { try validate(scope, pointer: pointer) }
 }
 
 /// One lease for this macOS user, independent of the selected Astra library.
@@ -391,7 +393,8 @@ public final class InputExecutor: @unchecked Sendable {
                 if command.operation == .pointerAbsolute, let surface = request.scope.surfaces.first(where: { $0.id == command.surfaceID }) {
                     location = try surface.globalBounds.globalPoint(normalized: Point2D(x: command.x!, y: command.y!))
                 } else if command.operation == .pointerRelative { location.x += command.dx!; location.y += command.dy! }
-                try backend.validate(request.scope, pointer: command.operation.isMotion || command.operation == .buttonDown || command.operation == .scroll ? location : nil)
+                try backend.validate(request.scope, pointer: command.operation.isMotion || command.operation == .buttonDown || command.operation == .scroll ? location : nil,
+                    surfaceID: command.operation == .pointerAbsolute ? command.surfaceID : nil)
                 if clock() - event.time > maximumLateness {
                     terminalLate(event.packet); disarm(reason: "Target verification missed the action deadline.", cause: .fault); return
                 }
@@ -446,7 +449,8 @@ public final class InputExecutor: @unchecked Sendable {
                             historyCovered = false; historyOverflow = true; observed.valid = false
                         } else {
                             executedEvents.append(Self.rawEvent(emission, sequence: nextEventSequence, sourceNanos: postedAt,
-                                                               observedNanos: observed.observedNanos, modifiers: observed.modifiers))
+                                                               observedNanos: observed.observedNanos, modifiers: observed.modifiers,
+                                                               surfaceID: command.operation == .pointerAbsolute ? command.surfaceID : nil))
                             nextEventSequence += 1
                         }
                     }
@@ -531,7 +535,7 @@ public final class InputExecutor: @unchecked Sendable {
     }
 
     private static func rawEvent(_ emission: InputEmission, sequence: UInt64, sourceNanos: UInt64,
-                                 observedNanos: UInt64, modifiers: UInt64) -> RawInputEvent {
+                                 observedNanos: UInt64, modifiers: UInt64, surfaceID: String?) -> RawInputEvent {
         let kind: RawInputKind
         switch emission.operation {
         case .keyDown: kind = .keyDown
@@ -546,7 +550,7 @@ public final class InputExecutor: @unchecked Sendable {
             kind: kind, keyCode: emission.keyCode, button: emission.button, x: emission.location.x, y: emission.location.y,
             dx: emission.operation.isMotion ? emission.delta.x : nil, dy: emission.operation.isMotion ? emission.delta.y : nil,
             scrollX: kind == .scroll ? emission.delta.x : nil, scrollY: kind == .scroll ? emission.delta.y : nil,
-            modifiers: modifiers, detail: kind == .scroll ? "scroll units: points" : nil)
+            modifiers: modifiers, detail: kind == .scroll ? "scroll units: points" : nil, surfaceID: surfaceID)
     }
 
     private static func expand(_ packet: ActionPacket) -> [Scheduled] {
@@ -717,15 +721,26 @@ public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendab
         }
     }
     public func validate(_ scope: ControlScope, pointer: Point2D?) throws {
+        try validate(scope, pointer: pointer, surfaceID: nil)
+    }
+    public func validate(_ scope: ControlScope, pointer: Point2D?, surfaceID: String?) throws {
         try requirePermissionProof()
         if let pointer, !scope.surfaces.contains(where: { InputScopeSnapshot.contains($0.globalBounds, pointer) }) {
             throw AstraError("control.pointerScope", "The planned pointer leaves the observed control surfaces.")
         }
         if scope.applicationPID == nil {
             for surface in scope.surfaces {
-                guard surface.id.hasPrefix("display:"), let id = UInt32(surface.id.dropFirst(8)),
+                guard let id = surface.nativeDisplayID ?? (surface.id.hasPrefix("display:") ? UInt32(surface.id.dropFirst(8)) : nil),
                       CGDisplayIsActive(id) != 0, Rect2D(CGDisplayBounds(id)) == surface.globalBounds else {
                     throw AstraError("control.display", "The observed display changed or its identity is missing.")
+                }
+            }
+            if scope.wholeDesktop {
+                var ids = [CGDirectDisplayID](repeating: 0, count: 32), count: UInt32 = 0
+                let bound = Set(scope.surfaces.compactMap { $0.nativeDisplayID ?? ($0.id.hasPrefix("display:") ? UInt32($0.id.dropFirst(8)) : nil) })
+                guard CGGetActiveDisplayList(UInt32(ids.count), &ids, &count) == .success,
+                      Set(ids.prefix(Int(count))) == bound else {
+                    throw AstraError("control.desktopTopology", "The desktop display set changed after arming.")
                 }
             }
             // A display-scoped pointer is authorized by the observed display,
@@ -748,10 +763,16 @@ public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendab
                   application.launchDate == lock.withLock({ launchDate }) else {
                 throw AstraError("control.focus", "The selected application lost focus or restarted.")
             }
-            for surface in scope.surfaces where surface.id.hasPrefix("window:") {
-                guard let id = UInt32(surface.id.dropFirst(7)), let window = windows.first(where: { $0.0 == id }),
+            for surface in scope.surfaces {
+                guard let id = surface.nativeWindowID ?? (surface.id.hasPrefix("window:") ? UInt32(surface.id.dropFirst(7)) : nil), let window = windows.first(where: { $0.0 == id }),
                       window.1 == pid, window.3 == surface.globalBounds else {
                     throw AstraError("control.geometry", "An observed application window moved, resized, or disappeared.")
+                }
+            }
+            if scope.windowID == nil {
+                let bound = Set(scope.surfaces.compactMap { $0.nativeWindowID ?? ($0.id.hasPrefix("window:") ? UInt32($0.id.dropFirst(7)) : nil) })
+                guard Set(windows.filter { $0.1 == pid && $0.2 == 0 && $0.3.width > 1 && $0.3.height > 1 }.map { $0.0 }) == bound else {
+                    throw AstraError("control.applicationTopology", "The application's window set changed after arming.")
                 }
             }
             if let windowID = scope.windowID {
@@ -766,6 +787,12 @@ public final class CGEventControlBackend: ControlInputBackend, @unchecked Sendab
                       hit.1 == pid, scope.windowID == nil || hit.0 == scope.windowID else {
                     throw AstraError("control.pointerTarget", "The planned pointer reaches another window or an unobserved overlay.")
                 }
+                try NativeSurfaceRouting.verifyWindowRecipient(hit.0, scope: scope, requestedSurfaceID: surfaceID)
+            } else if scope.windowID == nil {
+                guard let target = windows.first(where: { $0.1 == pid && $0.2 == 0 }) else {
+                    throw AstraError("control.keyboardScope", "Keyboard focus has no observed application window.")
+                }
+                try NativeSurfaceRouting.verifyWindowRecipient(target.0, scope: scope, requestedSurfaceID: nil)
             }
         } else {
             if !scope.wholeDesktop {

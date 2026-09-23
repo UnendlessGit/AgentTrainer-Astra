@@ -30,11 +30,14 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private(set) var refreshingSources = false
     private(set) var sourceIssue: String?
     private(set) var checkpointContextSizes: [Int] = []
+    private(set) var checkpointContextVocabulary: ContextVocabulary?
+    private(set) var contextFields: [ContextFieldDocument] = []
     private var checkpointContextGeneration = UUID()
     private(set) var isClosing = false
     private(set) var sources: [CaptureSource] = []
     private(set) var permissions = PermissionSnapshot.current()
     private(set) var recordingProgress: RecordingProgress?
+    private(set) var correctionStarting = false
     private(set) var recordingStarting = false
     private(set) var recordingCountdown: Int?
     private(set) var recordingStopping = false
@@ -61,6 +64,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     private var acknowledgedUnconfirmedControlRun: UUID?
     private var recorder: RecordingSession?
     private var recordingAgentID: UUID?
+    private var recordingCorrectionContexts: [UUID: UUID]?
     private var activeRecordingID: UUID?
     private(set) var recordingLinks: [UUID: Set<UUID>] = [:]
     private(set) var recordingSelections: [UUID: [UUID: RecordingTrainingSelection]] = [:]
@@ -147,6 +151,25 @@ enum AgentSection: String, CaseIterable, Identifiable {
         } catch { errorMessage = error.localizedDescription }
     }
 
+    func contextVocabulary(for agent: AgentDocument) throws -> ContextVocabulary {
+        let fields = try (agent.contextFieldIDs ?? []).map { id in
+            guard let field = contextFields.first(where: { $0.id == id }) else {
+                throw AstraError("context.unavailable", "A context field for this agent is unavailable. Review its Contexts settings.")
+            }
+            return field
+        }
+        return try ContextVocabulary(fields: fields).validated()
+    }
+
+    func saveContexts(_ fields: [ContextFieldDocument], selectedIDs: [UUID], for agentID: UUID) async throws {
+        guard let store, !isClosing, !isRunningAgent, !isLearning, !isRecording, !recordingStarting, !recordingStopping else {
+            throw AstraError("context.busy", "Finish the current recording, run or training session before changing its context definitions.")
+        }
+        saving = true; defer { saving = false }
+        try await store.saveContexts(fields, selectedIDs: selectedIDs, for: agentID)
+        try await refresh()
+    }
+
     func saveRewardProgram(_ document: RewardProgram, for agentID: UUID) async throws {
         guard let store, !isClosing else { throw AstraError("reward.workspace", "The workspace is not ready to save this definition.") }
         try await store.saveRewardProgram(document, for: agentID)
@@ -167,8 +190,9 @@ enum AgentSection: String, CaseIterable, Identifiable {
         catch { sources = []; sourceIssue = error.localizedDescription }
     }
 
-    func startRecording(source: CaptureSource, name: String, fps: Int) async {
-        guard let store, !isClosing, !isRunningAgent, !recordingStarting, !recordingStopping, recorder == nil else { return }
+    func startRecording(source: CaptureSource, name: String, fps: Int, correction: InferenceCorrection? = nil) async {
+        guard let store, !isClosing, !saving, !isRunningAgent, !recordingStarting, !recordingStopping, recorder == nil,
+              !correctionStarting || correction != nil else { return }
         permissions = PermissionSnapshot.current()
         guard permissions.screenRecording && permissions.inputMonitoring else {
             errorMessage = "Screen Recording and Input Monitoring permissions are required to record a demonstration."
@@ -176,7 +200,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
         }
         recordingStarting = true
         defer { recordingStarting = false; recordingCountdown = nil }
-        let agentID = selectedAgent?.id
+        let agentID = correction?.agentID ?? selectedAgent?.id
         let environment = EnvironmentDocument(name: String(source.name.prefix(160)), kind: source.kind, displayID: source.displayID,
                                               windowID: source.windowID, applicationBundleID: source.applicationBundleID, captureFPS: fps)
         let manifest = RecordingManifest(name: name, environment: environment, recordedForAgentID: agentID)
@@ -196,7 +220,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
                 }
             }
             let created = try await Task.detached {
-                try RecordingSession(directory: directory, manifest: manifest, source: source,
+                try RecordingSession(directory: directory, manifest: manifest, source: source, correction: correction?.seed,
                                      onProgress: progressHandler, onFault: faultHandler)
             }.value
             guard activeRecordingID == manifest.id else {
@@ -205,7 +229,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
                 try await refresh()
                 return
             }
-            recorder = created; recordingAgentID = agentID
+            recorder = created; recordingAgentID = agentID; recordingCorrectionContexts = correction?.contextValues
             try await store.save(environment)
             if let agentID, var agent = agents.first(where: { $0.id == agentID }) {
                 agent.environmentID = environment.id; agent.modifiedAt = Date()
@@ -233,6 +257,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
             recordingCountdown = nil
             guard activeRecordingID == manifest.id, !recordingStopping else { return }
             try await created.start()
+            if correction != nil { inference?.discardCorrectionHistory() }
         } catch {
             errorMessage = error.localizedDescription
             if recorder != nil { await stopRecording(issue: error.localizedDescription) }
@@ -247,6 +272,11 @@ enum AgentSection: String, CaseIterable, Identifiable {
         do {
             let manifest = try await recorder.stop(issue: issue)
             try await store.saveRecording(manifest, linkTo: recordingAgentID)
+            if let values = recordingCorrectionContexts, let agentID = recordingAgentID, manifest.frameCount > 0 {
+                do { try await store.saveRecordingSelection(.init(contextValues: values), recordingID: manifest.id, agentID: agentID) }
+                catch { errorMessage = "The correction was saved. Review its context assignment before training: \(error.localizedDescription)" }
+            }
+            recordingCorrectionContexts = nil
             self.recorder = nil; recordingProgress = nil; recordingAgentID = nil; activeRecordingID = nil
             try await refresh()
             if let issue { errorMessage = issue }
@@ -255,6 +285,27 @@ enum AgentSection: String, CaseIterable, Identifiable {
             self.recorder = nil; recordingProgress = nil; recordingAgentID = nil; activeRecordingID = nil
             try? await refresh()
         }
+    }
+
+    func recordCorrection() async {
+        guard let inference, let store, let agentID = selectedAgent?.id, !correctionStarting, !isClosing, !isRecording,
+              !recordingStarting, !recordingStopping, !isLearning, !saving, !controlHistoryBusy, controlStartupWork == nil else { return }
+        let requested = MonotonicClock.now
+        correctionStarting = true; defer { correctionStarting = false }
+        do {
+            let correction = try await inference.prepareCorrection(for: agentID, requestedAtNanos: requested)
+            guard selectedAgent?.id == correction.agentID else { throw AstraError("correction.agent", "Open the agent that produced this run to record its correction.") }
+            guard controlOwner.priorCleanupJoined else { throw AstraError("correction.cleanup", "Resolve the previous control cleanup before recording a correction.") }
+            guard try await store.checkpointIDs(for: agentID).contains(correction.checkpoint.id) else {
+                throw AstraError("correction.checkpoint", "The source checkpoint is no longer linked to this agent.")
+            }
+            let sourceManifest = try await LearningFiles.read(supportRoot.appendingPathComponent("Models/\(correction.checkpoint.id.uuidString.lowercased())/manifest.json"))
+            guard sourceManifest.fields?["id"]?.uuid == correction.checkpoint.id,
+                  sourceManifest.fields?["policySignature"]?.text == correction.checkpoint.policySignature else {
+                throw AstraError("correction.checkpoint", "The source checkpoint is unavailable or its identity changed.")
+            }
+            await startRecording(source: correction.source, name: "Correction · " + String(correction.checkpoint.name.prefix(120)), fps: 30, correction: correction)
+        } catch { errorMessage = error.localizedDescription }
     }
 
     var isRecording: Bool { recorder != nil }
@@ -266,6 +317,8 @@ enum AgentSection: String, CaseIterable, Identifiable {
 
     var inferenceUnavailableReason: String? {
         if isClosing { return "The workspace is closing." }
+        if correctionStarting { return "Preparing the correction recording…" }
+        if saving { return "Finish saving library changes before running an agent." }
         if controlHistoryBusy { return "Checking previous control cleanup…" }
         if let controlHistoryBlockReason { return controlHistoryBlockReason }
         if isRecording || recordingStarting || recordingStopping { return "Finish recording before running an agent." }
@@ -284,7 +337,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     func inspectCheckpointContexts(_ id: UUID?, agentID: UUID) async {
-        let generation = UUID(); checkpointContextGeneration = generation; checkpointContextSizes = []
+        let generation = UUID(); checkpointContextGeneration = generation; checkpointContextSizes = []; checkpointContextVocabulary = nil
         guard let id, checkpointLinks[agentID]?.contains(id) == true else { return }
         do {
             let metadata = try await LearningFiles.read(supportRoot.appendingPathComponent("Models").appendingPathComponent(id.uuidString.lowercased()).appendingPathComponent("manifest.json"))
@@ -292,7 +345,10 @@ enum AgentSection: String, CaseIterable, Identifiable {
                   sizes.allSatisfy({ $0.int.map { (1...65_536).contains($0) } == true }) else {
                 throw AstraError("inference.contexts", "The selected checkpoint's context configuration is invalid.")
             }
-            if checkpointContextGeneration == generation { checkpointContextSizes = sizes.compactMap(\.int) }
+            let vocabulary = try ContextVocabulary.from(model: metadata.required("model"))
+            if checkpointContextGeneration == generation {
+                checkpointContextSizes = sizes.compactMap(\.int); checkpointContextVocabulary = vocabulary
+            }
         } catch {
             if checkpointContextGeneration == generation { errorMessage = error.localizedDescription }
         }
@@ -300,8 +356,10 @@ enum AgentSection: String, CaseIterable, Identifiable {
 
     func startBehaviorTraining(agent: AgentDocument, options: BehaviorOptions) {
         do {
-            guard !isClosing, !isRunningAgent, !saving else { throw AstraError("learning.closing", "Finish saving library changes and stop live control before starting another learning operation.") }
+            guard !isClosing, !isRunningAgent, !saving, !correctionStarting else { throw AstraError("learning.closing", "Finish saving library changes and stop live control before starting another learning operation.") }
             guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
+            var options = options
+            if options.initialCheckpointID == nil { options.contextVocabulary = try contextVocabulary(for: agent) }
             try learning.start(agent: agent, options: options,
                                recordings: recordings.filter { recordingLinks[agent.id]?.contains($0.id) == true },
                                selections: recordingSelections[agent.id] ?? [:])
@@ -310,7 +368,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
 
     func evaluateCheckpoint(_ checkpoint: CheckpointDocument, agentID: UUID, split: String) {
         do {
-            guard !isClosing, !isRunningAgent else { throw AstraError("learning.closing", "Stop live control before starting evaluation.") }
+            guard !isClosing, !isRunningAgent, !saving, !correctionStarting else { throw AstraError("learning.closing", "Finish saving library changes and stop live control before starting evaluation.") }
             guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
             try learning.evaluate(checkpoint: checkpoint, agentID: agentID, split: split)
         }
@@ -319,15 +377,17 @@ enum AgentSection: String, CaseIterable, Identifiable {
 
     func evaluateCheckpoints(_ checkpoints: [CheckpointDocument], agentID: UUID, datasetCheckpoint: CheckpointDocument, split: String) {
         do {
-            guard !isClosing, !isRunningAgent else { throw AstraError("learning.closing", "Stop live control before starting evaluation.") }
+            guard !isClosing, !isRunningAgent, !saving, !correctionStarting else { throw AstraError("learning.closing", "Finish saving library changes and stop live control before starting evaluation.") }
             guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
             try learning.evaluate(checkpoints: checkpoints, agentID: agentID, datasetCheckpoint: datasetCheckpoint, split: split)
         } catch { errorMessage = error.localizedDescription }
     }
 
     func startReinforcementTraining(agent: AgentDocument, options: ReinforcementOptions) throws {
-        guard !isClosing, !isRunningAgent else { throw AstraError("learning.closing", "Stop live control before starting learning.") }
+        guard !isClosing, !isRunningAgent, !saving, !correctionStarting else { throw AstraError("learning.closing", "Finish saving library changes and stop live control before starting learning.") }
         guard let learning else { throw AstraError("learning.workspace", "The workspace is still opening.") }
+        var options = options
+        if options.initialCheckpointID == nil { options.contextVocabulary = try contextVocabulary(for: agent) }
         try learning.startReinforcement(agent: agent, options: options)
     }
 
@@ -337,25 +397,27 @@ enum AgentSection: String, CaseIterable, Identifiable {
         }
         guard let desktopLearning else { throw AstraError("desktop.workspace", "The workspace is still opening.") }
         if let controlHistoryBlockReason { throw AstraError("history.reviewRequired", controlHistoryBlockReason) }
+        var options = options
+        if options.initialCheckpointID == nil { options.contextVocabulary = try contextVocabulary(for: agent) }
         try startAfterHistoryReview {
             try desktopLearning.start(agent: agent, source: source, program: program, options: options)
         }
     }
 
-    func reopenFeedback(_ document: PendingFeedbackDocument, source: CaptureSource? = nil) throws {
+    func reopenFeedback(_ document: PendingFeedbackDocument, source: CaptureSource? = nil, surfaceBindings: [String: String] = [:]) throws {
         guard !isClosing, !isRunningAgent, !isLearning, !isRecording, !saving,
               let desktopLearning, let agent = agents.first(where: { $0.id == document.agentID }),
               let saved = pendingFeedback.first(where: { $0.id == document.id }), saved == document else {
             throw AstraError("feedback.workspace", "Finish the current workflow and choose the latest saved feedback item.")
         }
         try startAfterHistoryReview {
-            if let source { try desktopLearning.continueFeedback(saved, agent: agent, source: source) }
+            if let source { try desktopLearning.continueFeedback(saved, agent: agent, source: source, surfaceBindings: surfaceBindings) }
             else { try desktopLearning.resumeFeedback(saved, agent: agent) }
         }
     }
 
     func selectCheckpoint(_ id: UUID?, agentID: UUID) async {
-        guard let store, var agent = agents.first(where: { $0.id == agentID }) else { return }
+        guard let store, !saving, var agent = agents.first(where: { $0.id == agentID }) else { return }
         if let id, checkpointLinks[agentID]?.contains(id) != true || !checkpoints.contains(where: { $0.id == id }) {
             errorMessage = "This checkpoint is not linked to the selected agent."; return
         }
@@ -364,6 +426,48 @@ enum AgentSection: String, CaseIterable, Identifiable {
             try await store.save(agent); try await refresh()
             await inspectCheckpointContexts(id, agentID: agentID)
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    var checkpointManagementUnavailableReason: String? {
+        if loading || isClosing || saving { return "Wait for the current library operation to finish." }
+        if correctionStarting { return "Finish the correction recording handoff before managing checkpoints." }
+        if isLearning || isRunningAgent || controlStartupWork != nil { return "Stop training, evaluation and running agents before managing checkpoints." }
+        if isRecording || recordingStarting || recordingStopping || correctionStarting { return "Finish recording before managing checkpoints." }
+        return nil
+    }
+
+    func updateCheckpoint(_ checkpoint: CheckpointDocument, name: String, pinned: Bool) async throws {
+        guard let store, checkpointManagementUnavailableReason == nil else {
+            throw AstraError("checkpoint.busy", checkpointManagementUnavailableReason ?? "The workspace is still opening.")
+        }
+        saving = true; defer { saving = false }
+        try await store.updateCheckpointPresentation(id: checkpoint.id, name: name, pinned: pinned)
+        try await refresh()
+    }
+
+    func previewCheckpointCleanup(agentID: UUID, keepNewest: Int) async throws -> CheckpointRetentionPreview {
+        guard let store, checkpointManagementUnavailableReason == nil else {
+            throw AstraError("checkpoint.busy", checkpointManagementUnavailableReason ?? "The workspace is still opening.")
+        }
+        saving = true; defer { saving = false }
+        let retained = Set([inference?.retainedCorrectionCheckpointID].compactMap { $0 })
+        return try await store.previewCheckpointRetention(agentID: agentID, keepNewest: keepNewest, activeCheckpointIDs: retained)
+    }
+
+    func applyCheckpointCleanup(_ preview: CheckpointRetentionPreview) async throws -> CheckpointCleanupResult {
+        guard let store, checkpointManagementUnavailableReason == nil else {
+            throw AstraError("checkpoint.busy", checkpointManagementUnavailableReason ?? "The workspace is still opening.")
+        }
+        saving = true; defer { saving = false }
+        do {
+            let retained = Set([inference?.retainedCorrectionCheckpointID].compactMap { $0 })
+            let result = try await store.applyCheckpointRetention(preview, activeCheckpointIDs: retained)
+            try await refresh()
+            return result
+        } catch {
+            try? await refresh()
+            throw error
+        }
     }
 
     func stopLearningAndWait() async {
@@ -382,7 +486,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
         async let inferenceStop: Void = inference?.stopAndWait() ?? ()
         _ = await (recording, learning, inferenceStop)
         await starting?.value
-        while recordingStarting || recordingStopping || saving || controlHistoryBusy {
+        while recordingStarting || recordingStopping || correctionStarting || saving || controlHistoryBusy {
             try? await Task.sleep(for: .milliseconds(50))
         }
         if let inference, let run = inference.runID, inference.requiresManualControlCleanupAcknowledgement,
@@ -402,7 +506,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     func duplicateSelectedAgent() async {
-        guard let store, let selectedAgent else { return }
+        guard let store, !saving, !isClosing, let selectedAgent else { return }
         do {
             let copy = try await store.duplicateAgent(selectedAgent)
             try await refresh(); destination = .agent(copy.id)
@@ -567,7 +671,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
         agents = snapshot.agents; environments = snapshot.environments; recordings = snapshot.recordings; issues = snapshot.issues
         learningRuns = snapshot.learningRuns; checkpoints = snapshot.checkpoints; evaluations = snapshot.evaluations
         pendingFeedback = snapshot.pendingFeedback
-        rewardPrograms = snapshot.rewardPrograms
+        rewardPrograms = snapshot.rewardPrograms; contextFields = snapshot.contextFields
         recordingSelections = snapshot.recordingSelections
         var links: [UUID: Set<UUID>] = [:]
         for agent in agents { links[agent.id] = try await store.recordingIDs(for: agent.id) }

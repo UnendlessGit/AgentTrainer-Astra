@@ -242,10 +242,10 @@ public final class NativeResetDriver: ResetControlDriver, @unchecked Sendable {
             let snapshot = try InputScopeSnapshot.current(for: source)
             try snapshot.verifyTarget(source)
             for surface in scope.surfaces {
-                if surface.id.hasPrefix("window:"), let id = UInt32(surface.id.dropFirst(7)) {
+                if let id = surface.nativeWindowID ?? (surface.id.hasPrefix("window:") ? UInt32(surface.id.dropFirst(7)) : nil) {
                     guard let window = snapshot.windows.first(where: { $0.id == id }), window.pid == source.applicationPID,
                           window.bounds == surface.globalBounds else { throw AstraError("reset.geometry", "A reset window moved, resized or changed ownership.") }
-                } else if surface.id.hasPrefix("display:"), let id = UInt32(surface.id.dropFirst(8)) {
+                } else if let id = surface.nativeDisplayID ?? (surface.id.hasPrefix("display:") ? UInt32(surface.id.dropFirst(8)) : nil) {
                     guard CGDisplayIsActive(id) != 0, Rect2D(CGDisplayBounds(id)) == surface.globalBounds else {
                         throw AstraError("reset.geometry", "A reset display disconnected or changed geometry.")
                     }

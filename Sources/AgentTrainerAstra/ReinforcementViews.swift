@@ -3,6 +3,8 @@ import Charts
 import AstraCore
 
 struct ReinforcementOptions: Sendable {
+    var contextVocabulary = ContextVocabulary.empty
+    var contextIDs: [Int] = []
     var initialCheckpointID: UUID?
     var resume = false
     var iterations = 20
@@ -34,6 +36,7 @@ struct ReinforcementOptions: Sendable {
     }
 
     func validated() throws -> Self {
+        _ = try contextVocabulary.validated()
         if resume {
             guard initialCheckpointID != nil, (1...100_000).contains(iterations) else {
                 throw AstraError("reinforcement.resume", "Choose a saved reinforcement checkpoint and a valid total iteration target.")
@@ -52,8 +55,8 @@ struct ReinforcementOptions: Sendable {
     }
 
     var model: JSONValue {
-        .object(["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
-                 "packet_capacity": .integer(Int64(packetCapacity))])
+        contextVocabulary.applying(to: .object(["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
+                 "packet_capacity": .integer(Int64(packetCapacity))]))
     }
     var actions: JSONValue {
         .object(["keyCodes": .array((task == "delayed_memory" ? [123, 124] : []).map { .integer(Int64($0)) }),
@@ -161,6 +164,12 @@ struct PracticeReinforcementTrainingView: View {
     }
     private var ownsRun: Bool { model.learning?.activeRun?.agentID == agent.id && model.learning?.activeRun?.kind == .reinforcement }
 
+    private var activeVocabulary: ContextVocabulary? {
+        options.initialCheckpointID == nil ? (try? model.contextVocabulary(for: agent)) : model.checkpointContextVocabulary
+    }
+    private var activeContextSizes: [Int] {
+        options.initialCheckpointID == nil ? (activeVocabulary?.sizes ?? []) : model.checkpointContextSizes
+    }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -214,6 +223,9 @@ struct PracticeReinforcementTrainingView: View {
                              ? "Resume with the checkpoint's saved environment and training settings. The iteration target includes already completed iterations; the practice world starts with a confirmed reset."
                              : "A new run learns all model layers. Starting checkpoints must use controls compatible with the selected practice task.")
                             .font(.caption).foregroundStyle(.secondary)
+                        if !options.resume {
+                            ContextValuePickers(vocabulary: activeVocabulary, sizes: activeContextSizes, indices: $options.contextIDs)
+                        }
                         Stepper(options.resume ? "Total iteration target: \(options.iterations)" : "Iterations: \(options.iterations)", value: $options.iterations, in: 1...100_000)
                         Text(options.resume ? "The saved configuration determines rollout size, recurrent sequences and PPO epochs."
                              : "Each iteration collects at least \(options.rolloutDecisions.formatted()) decisions and finishes the current episode, then trains on contiguous sequences for up to \(options.epochs) PPO epochs.")
@@ -257,6 +269,11 @@ struct PracticeReinforcementTrainingView: View {
                 LearningRunList(runs: model.learningRuns.filter { $0.agentID == agent.id }, model: model, compact: true)
             }.padding(.trailing, 8).padding(.bottom, 20)
         }.sheet(isPresented: $showingRewards) { RewardEditor(agent: agent, model: model) }
+            .task(id: options.initialCheckpointID) {
+                await model.inspectCheckpointContexts(options.initialCheckpointID, agentID: agent.id)
+                options.contextIDs = activeContextSizes.map { _ in 0 }
+            }
+            .onChange(of: activeVocabulary) { _, _ in options.contextIDs = activeContextSizes.map { _ in 0 } }
     }
     private func numberField(_ title: String, value: Binding<Double>) -> some View {
         TextField(title, value: value, format: .number.precision(.fractionLength(1...6))).textFieldStyle(.roundedBorder)

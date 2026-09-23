@@ -55,6 +55,9 @@ public struct CheckpointDocument: Codable, Hashable, Identifiable, Sendable {
     public var trainingStep: Int
     public var policySignature: String
     public var parameterCount: Int
+    /// Catalog presentation only; absent in older catalogs and immutable model files.
+    public var pinned: Bool?
+    public var isPinned: Bool { pinned == true }
 
     public init(id: UUID, agentID: UUID, runID: UUID?, name: String, kind: String,
                 trainingStep: Int, policySignature: String, parameterCount: Int) {

@@ -1,11 +1,10 @@
 import Foundation
-import AstraCore
 
 /// Evidence about one immutable source frame. Availability is distinct from
 /// source time: a delayed callback cannot prove that pixels stayed unchanged
 /// until callback arrival. Silence never advances this evidence.
-public struct CaptureFrameCoverage: Sendable, Equatable {
-    public enum Kind: String, Sendable { case frame, unchanged }
+public struct CaptureFrameCoverage: Codable, Sendable, Equatable {
+    public enum Kind: String, Codable, Sendable { case frame, unchanged }
     public let streamID: UUID
     public let frameID: UUID
     public let surface: SurfaceDescriptor

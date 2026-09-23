@@ -55,7 +55,7 @@ import AstraPlatform
         guard !isBusy, !learner.isBusy, dependencies.controlOwner.priorCleanupJoined else {
             throw AstraError("desktop.busy", "Finish learning and resolve any previous control cleanup before starting desktop training.")
         }
-        _ = try options.validated(); _ = try program.validated()
+        _ = try options.validated(); _ = try program.validated(); _ = try source.captureBindings()
         // The live manual source and retrospective-review workflow are wired
         // separately; missing feedback must never silently become zero reward.
         guard !program.signals.contains(where: { $0.kind == .manual }) else {
@@ -128,7 +128,7 @@ import AstraPlatform
                          generation expected: UUID, signals: DesktopHostSignals, continuation: PendingFeedbackDocument? = nil) async {
         let runID = UUID()
         let directory = root.appendingPathComponent("DesktopRuns/\(runID.uuidString.lowercased())", isDirectory: true)
-        let inbox = InferenceFrameInbox()
+        let inbox = InferenceFrameInbox(sourceIDs: source.bindings?.map(\.id) ?? [source.id])
         var capture: InferenceCapture?
         var actor: PolicyActorSession?
         var completed: DesktopLearningLoopResult?
@@ -155,10 +155,11 @@ import AstraPlatform
             phase = "Observing the selected environment…"
             let stream = dependencies.capture(source); capture = stream
             try await stream.start({ inbox.receive($0) }, { inbox.health($0) })
-            let frame = try await firstFrame(inbox, signals: signals)
-            let scope = try ControlScope(surfaces: [frame.metadata.surface], applicationPID: source.applicationPID, windowID: source.windowID,
-                wholeDesktop: source.kind == .desktop, stopOnPhysicalInput: true, geometryRevision: frame.metadata.surface.geometryRevision).validated()
-            let reward = try RewardProgramBinding.singleSource(program, surface: frame.metadata.surface, scope: scope)
+            let frames = try await firstFrames(inbox, signals: signals)
+            let surfaces = frames.map(\.metadata.surface)
+            let scope = try ControlScope(surfaces: surfaces, applicationPID: source.applicationPID, windowID: source.windowID,
+                wholeDesktop: source.kind == .desktop, stopOnPhysicalInput: true, geometryRevision: surfaces.count == 1 ? surfaces[0].geometryRevision : 0).validated()
+            let reward = try RewardProgramBinding.bound(program, sourceIDs: options.surfaceBindings, scope: scope)
             var resumed: JSONValue?
             if options.resume, let savedRun = prepared.checkpoint.document.runID {
                 resumed = try await LearningFiles.read(root.appendingPathComponent("Jobs/\(savedRun.uuidString.lowercased())/configuration.json"))
@@ -180,7 +181,7 @@ import AstraPlatform
             try signals.check()
             let runtime = dependencies.runtime("actor", { _ in }, { signals.fail($0) })
             let policyActor = PolicyActorSession(runID: runID, ringURL: directory.appendingPathComponent("actor.astraring"),
-                slotCapacity: frame.metadata.byteCount, runtime: runtime)
+                slotCapacity: frames[0].metadata.byteCount, slotCapacities: frames.map(\.metadata.byteCount), runtime: runtime)
             actor = policyActor
             let previous: JSONValue?
             let mode: PolicyActorPreparation
@@ -197,8 +198,8 @@ import AstraPlatform
             try signals.check()
             let observations = try await DesktopResetObservations.prepare(program: configuration.program, scope: scope,
                 assetRoot: root.appendingPathComponent("RewardAssets"), frames: {
-                    guard let image = try inbox.read() else { throw AstraError("desktop.capture", "The reset has no current frame.") }
-                    return [image]
+                    guard let images = try inbox.readAll() else { throw AstraError("desktop.capture", "The reset has no complete observation.") }
+                    return images
                 }, detector: detector)
             let owner = dependencies.controlOwner, controlFactory = controlFactory, verify = verifyScope
             let collectorFactory = collectorFactory, detector = detector, assetRoot = root.appendingPathComponent("RewardAssets")
@@ -208,7 +209,7 @@ import AstraPlatform
                     configuration: configuration.collector(identity: identity, checkpoint: checkpoint, destination: destination,
                         previousActorProgress: prior, continuation: checkpoint.id == continuation?.checkpoint.id ? continuation : nil),
                     journalURL: directory.appendingPathComponent("collector-\(id.uuidString.lowercased()).ndjson"),
-                    ringURL: directory.appendingPathComponent("collector-\(id.uuidString.lowercased()).astraring"), slotCapacity: frame.metadata.byteCount,
+                    ringURL: directory.appendingPathComponent("collector-\(id.uuidString.lowercased()).astraring"), slotCapacity: frames[0].metadata.byteCount, slotCapacities: frames.map(\.metadata.byteCount),
                     factory: collectorFactory, onFault: { signals.fail($0) })
             }, reset: { [weak self] episode, cancellation in
                 guard let self else { throw CancellationError() }
@@ -219,7 +220,7 @@ import AstraPlatform
             }, episode: { [weak self] ready, checkpoint, collector in
                 DesktopEpisodeRunner(actor: policyActor, checkpoint: checkpoint, reset: ready, identity: identity,
                     collector: collector, sequence: sequence, program: configuration.program, assetRoot: assetRoot,
-                    captureRead: { try inbox.read() }, verifyScope: { try await verify(source, scope) }, controlFactory: controlFactory,
+                    captureRead: { nil }, captureReadAll: { try inbox.readAll() }, verifyScope: { try await verify(source, scope) }, controlFactory: controlFactory,
                     controlOwner: owner, recoveryDirectory: directory, deferManualFeedback: configuration.retrospective,
                     detector: detector, onPhase: { [weak self] value in
                         Task { @MainActor [weak self] in
@@ -412,7 +413,7 @@ import AstraPlatform
         }
     }
 
-    func continueFeedback(_ document: PendingFeedbackDocument, agent: AgentDocument, source: CaptureSource) throws {
+    func continueFeedback(_ document: PendingFeedbackDocument, agent: AgentDocument, source: CaptureSource, surfaceBindings: [String: String] = [:]) throws {
         guard document.agentID == agent.id, ![.completed, .discarded].contains(document.status),
               let minimum = document.configuration.fields?["training"]?.fields?["rollout_decisions"]?.int,
               document.collectedDecisions < minimum else {
@@ -421,6 +422,7 @@ import AstraPlatform
         let binding = try document.configuration.required("rewardBinding").decode(RewardProgramBinding.self)
         var options = DesktopLearningOptions()
         options.initialCheckpointID = document.checkpoint.id
+        options.surfaceBindings = surfaceBindings
         options.iterations = document.configuration.fields?["targetUpdates"]?.int ?? 20
         try start(agent: agent, source: source, program: binding.definition, options: options, continuation: document)
     }
@@ -465,11 +467,11 @@ import AstraPlatform
         } else { try dependencies.activate(source) }
         countdown = nil; try signals.check()
     }
-    private func firstFrame(_ inbox: InferenceFrameInbox, signals: DesktopHostSignals) async throws -> InferenceImage {
+    private func firstFrames(_ inbox: InferenceFrameInbox, signals: DesktopHostSignals) async throws -> [InferenceImage] {
         let deadline = ContinuousClock.now + .seconds(5)
         while ContinuousClock.now < deadline {
             try signals.check()
-            if let image = try inbox.read() { return image }
+            if let images = try inbox.readAll() { return images }
             try await Task.sleep(for: .milliseconds(20))
         }
         throw AstraError("desktop.captureTimeout", "The selected environment did not produce a screen observation.")
@@ -479,14 +481,14 @@ import AstraPlatform
         guard let binding = await actor.binding, binding.isAvailable else { throw AstraError("desktop.warmup", "The actor is not ready for isolated warmup.") }
         for index in 0..<3 {
             try signals.check()
-            guard let image = try inbox.read(), scope.surfaces.contains(image.metadata.surface) else { throw AstraError("desktop.capture", "The environment changed before policy warmup.") }
-            let cutoff = MonotonicClock.now, bounds = image.metadata.surface.globalBounds
+            guard let images = try inbox.readAll(), images.map(\.metadata.surface) == scope.surfaces else { throw AstraError("desktop.capture", "The environment changed before policy warmup.") }
+            let cutoff = MonotonicClock.now, bounds = scope.surfaces[0].globalBounds
             var warmState = ControlState(); warmState.valid = true; warmState.observedNanos = cutoff
             warmState.pointer = .init(x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2)
             let observation = ControlObservation(controlState: warmState, executedEvents: [], intervalCovered: true,
                 cutoffNanos: cutoff, lastSequence: nil)
             let started = MonotonicClock.now
-            _ = try await actor.warmup(.init(frame: image, controls: observation))
+            _ = try await actor.warmup(.init(frames: images, geometryRevision: scope.geometryRevision, controls: observation))
             let elapsed = Double(MonotonicClock.now - started) / 1_000_000
             let budget = Double(min(binding.policy.periodMS, binding.policy.leadMS))
             if index > 0, elapsed > budget - max(5, budget * 0.1) {

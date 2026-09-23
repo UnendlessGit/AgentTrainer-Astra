@@ -11,6 +11,8 @@ private actor CollectorHarness {
     var collectionID: UUID?
     var requests: [(String, JSONValue)] = []
     var ringPath: String?
+    var ringPaths: [UUID: String] = [:]
+    var deliveredGroupPixels: [Data] = []
     var firstLease: SharedFrameReference?
     var deliveredPixels: Data?
     var blocked = false
@@ -33,7 +35,9 @@ private actor CollectorHarness {
         if kind == "collector.prepare" {
             let path = try payload.required("destination").decode(String.self)
             collectionID = UUID(uuidString: URL(fileURLWithPath: path).lastPathComponent)
-            ringPath = try payload.required("rings").decode([[String: String]].self)[0]["path"]
+            let transports = try payload.required("rings").decode([[String: String]].self)
+            ringPath = transports[0]["path"]
+            ringPaths = Dictionary(uniqueKeysWithValues: transports.map { (UUID(uuidString: $0["ringID"]!)!, $0["path"]!) })
             if mode == "cancelPrepare" {
                 blocked = true
                 await withCheckedContinuation { suspended = $0 }
@@ -50,20 +54,23 @@ private actor CollectorHarness {
         }
         if kind == "collector.actor" {
             let frames = try payload.required("observation").required("frames").decode([JSONValue].self)
-            let reference = try frames[0].required("reference").decode(SharedFrameReference.self)
-            guard try frames[0].required("metadata").decode(FrameMetadata.self) == reference.metadata else {
-                throw AstraError("fixture.frameMetadata", "Outer frame metadata differs from the leased raw pixels")
+            for frame in frames {
+                let reference = try frame.required("reference").decode(SharedFrameReference.self)
+                guard try frame.required("metadata").decode(FrameMetadata.self) == reference.metadata else {
+                    throw AstraError("fixture.frameMetadata", "Outer frame metadata differs from the leased raw pixels")
+                }
+                firstLease = firstLease ?? reference
+                let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: ringPaths[reference.ringID]!)); defer { try? file.close() }
+                try file.seek(toOffset: UInt64(reference.offset)); deliveredPixels = try file.read(upToCount: reference.size)
+                deliveredGroupPixels.append(deliveredPixels!)
+                if mode == "transportFailure" { throw AstraError("fixture.transport", "Fixture collector pipe closed") }
+                let release = WireMessage(kind: "collector.framesConsumed", sequence: 2, runID: run,
+                    payload: .object(["collectionID": .string(collectionID!.uuidString),
+                        "observationID": try payload.required("observation").required("id"),
+                        "acknowledgements": try .encode([reference.acknowledgement])]))
+                events?(release)
+                if mode == "duplicateRelease" { events?(release) }
             }
-            firstLease = reference
-            let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: ringPath!)); defer { try? file.close() }
-            try file.seek(toOffset: UInt64(reference.offset)); deliveredPixels = try file.read(upToCount: reference.size)
-            if mode == "transportFailure" { throw AstraError("fixture.transport", "Fixture collector pipe closed") }
-            let release = WireMessage(kind: "collector.framesConsumed", sequence: 2, runID: run,
-                payload: .object(["collectionID": .string(collectionID!.uuidString),
-                    "observationID": try payload.required("observation").required("id"),
-                    "acknowledgements": try .encode([reference.acknowledgement])]))
-            events?(release)
-            if mode == "duplicateRelease" { events?(release) }
         }
         if kind == "collector.finish" {
             events?(WireMessage(kind: "collector.audited", sequence: 4, runID: run,
@@ -109,14 +116,14 @@ private actor CollectorHarness {
     #expect(!FileManager.default.fileExists(atPath: path))
 }
 
-private func collectorFixture(_ harness: CollectorHarness, maximumItems: Int = 128) async throws -> (CollectorSession, URL) {
+private func collectorFixture(_ harness: CollectorHarness, maximumItems: Int = 128, capacities: [Int]? = nil) async throws -> (CollectorSession, URL) {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("AstraCollectorTests-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let destination = root.appendingPathComponent(UUID().uuidString.lowercased())
     do {
         let session = try await CollectorSession.start(runID: UUID(), configuration: .object(["schemaVersion": .integer(1), "destination": .string(destination.path)]),
             journalURL: root.appendingPathComponent("native.jsonl"), ringURL: root.appendingPathComponent("frames.astraring"),
-            slotCapacity: 4096, maximumQueuedItems: maximumItems, factory: harness.factory, onFault: { _ in })
+            slotCapacity: 4096, slotCapacities: capacities, maximumQueuedItems: maximumItems, factory: harness.factory, onFault: { _ in })
         return (session, root)
     } catch { try? FileManager.default.removeItem(at: root); throw error }
 }
@@ -229,4 +236,21 @@ func collectorControlCoveragePreservesSilentStateAndRejectsMissingProof(covered:
         #expect(await harness.firstLease == nil)
         #expect(!(await harness.requests.contains { $0.0 == "collector.actor" }))
     }
+}
+
+@Test func collectorJoinsIndependentSurfaceAcknowledgementsWithoutDroppingPixels() async throws {
+    let harness = CollectorHarness(), (session, root) = try await collectorFixture(harness, capacities: [4096, 2048])
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = try collectorObservation(run: session.runID)
+    var secondMetadata = first.frame
+    secondMetadata.id = UUID(); secondMetadata.surface.id = "second"
+    secondMetadata.surface.pixelWidth = 16; secondMetadata.surface.contentBounds.width = 16; secondMetadata.byteCount = 2048
+    secondMetadata.surface.geometryRevision = 9
+    let second = PolicyActorOwnedObservation.Frame(metadata: secondMetadata, pixels: Data(repeating: 23, count: 2048), coverage: nil)
+    let observation = InferenceCollectedObservation(runID: session.runID, actorInput: first.actorInput, frames: first.frames + [second])
+    try session.offer(.actor(sourceID: UUID(), response: .object([:]), observation: observation))
+    _ = try await session.finish()
+    #expect(await harness.deliveredGroupPixels == [first.pixels, second.pixels])
+    #expect(await harness.exited)
+    for path in await harness.ringPaths.values { #expect(!FileManager.default.fileExists(atPath: path)) }
 }

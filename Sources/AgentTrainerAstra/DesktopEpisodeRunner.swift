@@ -41,6 +41,7 @@ struct DesktopEpisodeRunResult: Sendable {
 /// end here. The actor's original sampled result is drained before closure.
 final class DesktopEpisodeRunner: @unchecked Sendable {
     typealias CaptureRead = @Sendable () throws -> InferenceImage?
+    typealias CaptureReadAll = @Sendable () throws -> [InferenceImage]?
     typealias ScopeVerification = @Sendable () async throws -> UInt64
     let generationID = UUID()
     let episodeID: UUID
@@ -54,6 +55,7 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
     private let program: RewardProgram
     private let assetRoot: URL
     private let captureRead: CaptureRead
+    private let captureReadAll: CaptureReadAll?
     private let verifyScope: ScopeVerification
     private let factory: NativeControlRuntimeFactory
     private let controlOwner: NativeControlOwner
@@ -79,7 +81,7 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
 
     init(actor: PolicyActorSession, checkpoint: CheckpointDocument, reset: ResetResult,
          identity: DesktopEvidenceIdentity, collector: CollectorSession, sequence: DesktopEnvironmentSequence,
-         program: RewardProgram, assetRoot: URL, captureRead: @escaping CaptureRead,
+         program: RewardProgram, assetRoot: URL, captureRead: @escaping CaptureRead, captureReadAll: CaptureReadAll? = nil,
          verifyScope: @escaping ScopeVerification, controlFactory: NativeControlRuntimeFactory,
          controlOwner: NativeControlOwner = .shared, recoveryDirectory: URL,
          manualProducer: DesktopEpisodeManualProducer? = nil, deferManualFeedback: Bool = false,
@@ -89,7 +91,7 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
          onPhase: @escaping @Sendable (DesktopEpisodePhase) -> Void = { _ in }) {
         self.actor = actor; self.checkpoint = checkpoint; ready = reset; scope = reset.context.scope
         episodeID = reset.context.nextEpisodeID; self.identity = identity; self.collector = collector; self.sequence = sequence
-        self.program = program; self.assetRoot = assetRoot; self.captureRead = captureRead; self.verifyScope = verifyScope
+        self.program = program; self.assetRoot = assetRoot; self.captureRead = captureRead; self.captureReadAll = captureReadAll; self.verifyScope = verifyScope
         factory = controlFactory; self.controlOwner = controlOwner; self.recoveryDirectory = recoveryDirectory
         manual = manualProducer; limits = evidenceLimits; self.detector = detector; self.clock = clock; self.onPhase = onPhase
         self.deferManualFeedback = deferManualFeedback
@@ -185,7 +187,7 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
             setPhase(.preparing)
             _ = try checkpoint.validated(); _ = try scope.validated(); _ = try program.validated()
             let requiresManual = program.signals.contains { $0.kind == .manual } || (!deferManualFeedback && program.rules.contains { $0.kind == .manualMarker })
-            guard !requiresManual || manual != nil, scope.surfaces.count == 1, ready.status == .ready, ready.cleanupConfirmed,
+            guard !requiresManual || manual != nil, !scope.surfaces.isEmpty, scope.surfaces.count <= 16, ready.status == .ready, ready.cleanupConfirmed,
                   ready.context.environmentID == identity.environmentID, collector.runID == identity.runID,
                   sequence.identity == identity, controlOwner.priorCleanupJoined,
                   let binding = await actor.binding, binding.collecting, binding.isAvailable,
@@ -197,12 +199,19 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
             }
             try checkAdmission()
             try await verifyCurrentScope()
-            let image = try await firstFreshFrame()
-            let warm = try await Task.detached { RewardImageFrame(metadata: image.metadata, pixels: try image.pixels()) }.value
-            guard warm.pixels.count == warm.metadata.byteCount else { throw AstraError("desktop.captureBytes", "The captured image does not match its declared byte size.") }
+            let images = try await firstFreshFrames()
+            let warm = try await Task.detached {
+                try images.map { image in
+                    let frame = RewardImageFrame(metadata: image.metadata, pixels: try image.pixels())
+                    guard frame.pixels.count == frame.metadata.byteCount else {
+                        throw AstraError("desktop.captureBytes", "A captured image does not match its declared byte size.")
+                    }
+                    return frame
+                }
+            }.value
             let evidence = try await DesktopEpisodeEvidence.prepare(identity: identity, episodeID: episodeID, generationID: generationID,
                 policyID: checkpoint.id, policySignature: checkpoint.policySignature, collector: collector, sequence: sequence,
-                program: program, scope: scope, assetRoot: assetRoot, warmupFrames: [warm], limits: limits, deferManualFeedback: deferManualFeedback, detector: detector,
+                program: program, scope: scope, assetRoot: assetRoot, warmupFrames: warm, limits: limits, deferManualFeedback: deferManualFeedback, detector: detector,
                 onTerminal: { [weak self] in self?.receivedTerminal($0) },
                 onFault: { [weak self] in self?.sourceFailed($0.error, generation: $0.generationID) })
             lock.withLock { bridge = evidence }
@@ -228,22 +237,22 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
             }
             _ = try await native.start()
             try checkAdmission(); try await verifyCurrentScope()
-            _ = try currentFrame()
+            _ = try currentFrames()
             watchdog = startWatchdog(native)
             setPhase(.running)
             var nextCutoff = clock(), cursor: UInt64?
             while lock.withLock({ ending == nil }) {
                 try await sleepUntil(nextCutoff); try checkAdmission()
-                let frame = try currentFrame()
+                let frames = try currentFrames()
                 let controls = try await settledObservation(native, after: cursor)
                 try checkAdmission()
                 let cutoff = controls.cutoffNanos
                 let deadline = cutoff.addingReportingOverflow(UInt64(binding.policy.leadMS) * 1_000_000)
                 guard !deadline.overflow else { throw AstraError("desktop.clock", "The episode decision clock is exhausted.") }
                 lock.withLock { predictionDeadline = deadline.partialValue }
-                let ticket = try await actor.beginPrediction(PolicyActorSnapshot(frame: frame, controls: controls), onObservation: { [weak self, evidence] owned in
+                let ticket = try await actor.beginPrediction(PolicyActorSnapshot(frames: frames, geometryRevision: scope.geometryRevision, controls: controls), onObservation: { [weak self, evidence] owned in
                     guard let self else { throw AstraError("desktop.episodeOwner", "The episode owner was retired before observation retention.") }
-                    let observation = try owned.singleSource()
+                    let observation = owned.collected()
                     try evidence.offer(.observation(observation), generation: self.generationID)
                     if let manual = self.manual {
                         let context = DesktopManualObservation(generationID: self.generationID, episodeID: self.episodeID,
@@ -339,28 +348,40 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
         }
         try checkAdmission()
     }
-    private func currentFrame() throws -> InferenceImage {
-        guard let image = try captureRead(), image.metadata.surface == scope.surfaces[0] else {
-            throw AstraError("desktop.capture", "The bound capture is unavailable or changed geometry.")
+    private func currentFrames() throws -> [InferenceImage] {
+        let images: [InferenceImage]?
+        if let captureReadAll { images = try captureReadAll() }
+        else { images = try captureRead().map { [$0] } }
+        guard let images, images.map({ $0.metadata.surface }) == scope.surfaces,
+              Set(images.map { $0.metadata.id }).count == images.count else {
+            throw AstraError("desktop.capture", "The complete bound capture is unavailable or changed geometry.")
         }
-        _ = try image.metadata.validated()
         let now = clock()
-        if let coverage = image.coverage { try coverage.validated(frame: image.metadata, cutoffNanos: now, maximumAgeMS: 250) }
-        else {
-            guard image.metadata.eventNanos <= image.metadata.observedNanos, image.metadata.observedNanos <= now,
-                  now - image.metadata.eventNanos <= 250_000_000 else { throw AstraError("desktop.captureAge", "No recent source evidence is available.") }
+        for image in images {
+            _ = try image.metadata.validated()
+            if let coverage = image.coverage { try coverage.validated(frame: image.metadata, cutoffNanos: now, maximumAgeMS: 250) }
+            else {
+                guard image.metadata.eventNanos <= image.metadata.observedNanos, image.metadata.observedNanos <= now,
+                      now - image.metadata.eventNanos <= 250_000_000 else { throw AstraError("desktop.captureAge", "A bound surface has no recent source evidence.") }
+            }
         }
-        return image
+        return images
     }
-    private func firstFreshFrame() async throws -> InferenceImage {
+    private func firstFreshFrames() async throws -> [InferenceImage] {
         let deadline = clock().addingReportingOverflow(5_000_000_000)
         guard !deadline.overflow else { throw AstraError("desktop.clock", "The source wait clock is exhausted.") }
         let barrier = ready.readyObservation?.observedNanos ?? UInt64.max
         while true {
             try checkAdmission()
-            let image = try currentFrame()
-            if (image.coverage?.throughNanos ?? image.metadata.eventNanos) >= barrier { return image }
-            guard clock() < deadline.partialValue else { throw AstraError("desktop.startingFrame", "No source evidence arrived after Ready.") }
+            let images = try currentFrames()
+            // A frame callback proves availability, not that the source stayed
+            // unchanged until callback delivery. Only explicit idle coverage
+            // may advance source evidence beyond the original event time.
+            if images.allSatisfy({ image in
+                let sourceTime = image.coverage?.kind == .unchanged ? image.coverage!.throughNanos : image.metadata.eventNanos
+                return sourceTime >= barrier
+            }) { return images }
+            guard clock() < deadline.partialValue else { throw AstraError("desktop.startingFrame", "Every bound surface must supply source evidence after Ready.") }
             try await Task.sleep(for: .milliseconds(5))
         }
     }
@@ -392,7 +413,7 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
             while !Task.isCancelled {
                 guard let self, lock.withLock({ ending == nil }) else { return }
                 do {
-                    try native.checkHealth(); _ = try currentFrame()
+                    try native.checkHealth(); _ = try currentFrames()
                     if let deadline = lock.withLock({ predictionDeadline }), clock() >= deadline {
                         throw AstraError("desktop.policyDeadline", "The actor missed its immutable execution lead; waiting for its original result.")
                     }

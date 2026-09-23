@@ -21,7 +21,9 @@ def main():
     parser.add_argument('--bundle',type=Path,help='Optional assembled app; defaults to locked source workers')
     parser.add_argument('--output',type=Path)
     parser.add_argument('--feedback',action='store_true',help='Exercise original-frame review through the native UI model before PPO')
+    parser.add_argument('--multi-surface',action='store_true',help='Exercise two independent generated source streams through native actor/collector/PPO')
     args=parser.parse_args()
+    if args.multi_surface and args.feedback:parser.error('Choose the focused multi-source or feedback workflow, not both')
     output=(args.output or ROOT/'.local/verification'/('desktop-host-'+str(uuid.uuid4()))).resolve()
     if output.exists():parser.error('Choose a new output directory to preserve evidence')
     output.mkdir(parents=True)
@@ -56,6 +58,7 @@ def main():
         'parameterCount':policy.config.parameter_count}))
     environment={**os.environ,'ASTRA_HOST_QUALIFICATION_ROOT':str(output),'ASTRA_HOST_QUALIFICATION_BUNDLE':str(bundle)}
     if args.feedback:environment['ASTRA_HOST_QUALIFICATION_FEEDBACK']='1'
+    if args.multi_surface:environment['ASTRA_HOST_QUALIFICATION_MULTI_SURFACE']='1'
     suite='DesktopFeedbackQualificationTests' if args.feedback else 'DesktopHostQualificationTests'
     with (output/'swift-test.log').open('wb') as log:
         process=subprocess.Popen([str(ROOT/'script/swift.sh'),'test','--filter',suite],
@@ -69,7 +72,9 @@ def main():
             except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait()
             raise
     report_path=output/'desktop-host-report.json'
-    if report_path.exists():print(report_path.read_text(),flush=True)
+    if report_path.exists():
+        preview=json.loads(report_path.read_text());preview.pop('sourceFrames',None)
+        print(json.dumps(preview,indent=2,sort_keys=True),flush=True)
     if returncode:
         print((output/'swift-test.log').read_text()[-16000:],flush=True)
         raise SystemExit(returncode)
@@ -105,6 +110,32 @@ def main():
             reviewedWeightsChanged=True,reopenedWeightsChanged=True,continuedWeightsChanged=True,
             combinedDecisions=batch['decisions'],originalRunAndClockPreserved=True,
             reviewMethod='original-frame UI-model presentation acknowledgement and explicit per-interval judgments')
+        report_path.write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+        return
+    if args.multi_surface:
+        assert report['multiSurface'] and len(report['sourceSurfaces'])==2
+        assert len({value['geometryRevision'] for value in report['sourceSurfaces']})==2
+        assert learned.training_state['learner']['optimizerUpdates']>0
+        assert learned.manifest['artifacts']['policy.safetensors']!=manifest['artifacts']['policy.safetensors']
+        from astra.learning.rollout_artifacts import inspect_package
+        packages=[path.parent for path in (output/'Library/DesktopRuns').glob('*/Collections/*/manifest.json')
+            if json.loads(path.read_text())['status']=='sealed']
+        assert len(packages)==1
+        rollout=inspect_package(packages[0]);assert rollout['decisions']>=6
+        originals={value['id'].lower():value for value in report['sourceFrames']}
+        observations=0
+        with (packages[0]/'decisions.ndjson').open() as stream:
+            for line in stream:
+                decision=json.loads(line);observation=decision['observation'];images=observation['images']
+                assert [image['metadata']['surface'] for image in images]==report['sourceSurfaces']
+                assert all(image['metadata']==originals[image['metadata']['id'].lower()] for image in images)
+                assert all(image['metadata']['eventNanos']<=image['metadata']['observedNanos']<=observation['cutoff_nanos'] for image in images)
+                assert all(image['metadata']['surface']['geometryRevision']!=observation['geometry_revision'] for image in images)
+                observations+=1
+        assert observations==rollout['decisions']
+        report.update(bundle=str(bundle),model=policy.config.to_dict(),verificationModel='numerical_test_small',
+            learnedWeightsChanged=True,admittedDecisions=observations,originalSourceMetadataPreserved=True,
+            orderedSourcesPerObservation=2,independentGeometryRevisions=True)
         report_path.write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
         return
     stopped=load_checkpoint(output/'Library/Models'/report['stoppedCheckpointID'],include_training=True)
