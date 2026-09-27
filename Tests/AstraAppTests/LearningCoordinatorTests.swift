@@ -94,6 +94,10 @@ def perform(request, job):
         if mode=='waitForCancel' and not value.get('resume',False):cancel.wait(10)
         initial=json.loads((pathlib.Path(value['checkpointPath'])/'manifest.json').read_text())
         manifest=artifact(value['destination'],'reinforcement' if reinforcement else 'behavioral',initial['model'],initial['actions'])
+        if not reinforcement and value['dataset']['kind']=='recordings':
+            # Real behavioral checkpoints retain the prepared dataset UUID;
+            # a random fixture ID must not bypass resume identity validation.
+            manifest['datasetID']=pathlib.Path(value['dataset']['path']).name
         manifest['trainingConfig']=value['training']
         (pathlib.Path(value['destination'])/'manifest.json').write_text(json.dumps(manifest))
         if reinforcement:manifest['metrics']=dict(iteration=1,optimizer_updates=1,decisions=2,elapsed_seconds=1.5)

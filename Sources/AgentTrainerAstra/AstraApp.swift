@@ -20,16 +20,16 @@ import AstraPlatform
             CommandGroup(after: .newItem) {
                 Button("New Agent…") { model.showingNewAgent = true }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
-                    .disabled(model.loading)
+                    .disabled(!model.workspaceReady)
                 Button("Import Astra Archive…") { model.showingArtifactTransfer = .importArchive }
                     .disabled(model.artifactUnavailableReason != nil)
                 Button("Export Astra Archive…") { model.showingArtifactTransfer = .exportArchive }
                     .disabled(model.artifactUnavailableReason != nil || model.selectedAgent == nil)
                 Button("Duplicate Agent") { Task { await model.duplicateSelectedAgent() } }
-                    .disabled(model.selectedAgent == nil)
+                    .disabled(!model.workspaceReady || model.selectedAgent == nil)
             }
         }
-        Settings { StorageSettingsView(model: model) }
+        Settings { StorageSettingsView(model: model).disabled(!model.workspaceReady) }
         MenuBarExtra("AgentTrainer Astra", systemImage: model.isRecording ? "record.circle.fill" : "cpu") {
             StatusMenu(model: model)
         }
@@ -110,17 +110,31 @@ struct WorkspaceView: View {
                         .tag(WorkspaceDestination.activity)
                 }
             }
+            .disabled(!model.workspaceReady)
             .navigationSplitViewColumnWidth(min: 190, ideal: 230, max: 320)
             .safeAreaInset(edge: .bottom) {
                 Button { model.showingNewAgent = true } label: {
                     Label("New Agent", systemImage: "plus")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .buttonStyle(.plain).padding(16).disabled(model.loading)
+                .buttonStyle(.plain).padding(16).disabled(!model.workspaceReady)
             }
         } detail: {
             if model.loading {
                 ProgressView("Opening your workspace…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let failure = model.openingFailure {
+                ContentUnavailableView {
+                    Label("Unable to Open Workspace", systemImage: "externaldrive.badge.exclamationmark")
+                } description: {
+                    VStack(spacing: 12) {
+                        Text(failure.root.path).font(.callout.monospaced()).textSelection(.enabled)
+                        Text(failure.message).textSelection(.enabled)
+                    }.frame(maxWidth: 560)
+                } actions: {
+                    Button("Try Again") { Task { await model.retryOpening() } }
+                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                        .disabled(model.isClosing)
+                }
             } else {
                 VStack(spacing: 0) {
                     if model.artifactTransferBusy { ArtifactTransferBanner(model: model) }
@@ -145,7 +159,7 @@ struct WorkspaceView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button { model.showingNewAgent = true } label: { Label("New Agent", systemImage: "plus") }
-                    .help("Create an agent").disabled(model.loading)
+                    .help("Create an agent").disabled(!model.workspaceReady)
             }
         }
         .sheet(item: $model.showingArtifactTransfer) { ArtifactTransferView(model: model, mode: $0) }
@@ -171,7 +185,7 @@ struct WorkspaceView: View {
         ContentUnavailableView {
             Label("Your agents, learning locally", systemImage: "cpu")
         } description: { Text("Create an agent to organize demonstrations, training, and evaluation.") }
-        actions: { Button("Create Agent…") { model.showingNewAgent = true }.buttonStyle(.borderedProminent) }
+        actions: { Button("Create Agent…") { model.showingNewAgent = true }.buttonStyle(.borderedProminent).disabled(!model.workspaceReady) }
     }
 
     private var recoveryBanner: some View {
@@ -331,12 +345,12 @@ private struct NewAgentSheet: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Create Agent") { create() }.keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.saving || (try? DocumentNames.validated(name)) == nil)
+                    .disabled(!model.workspaceReady || model.saving || (try? DocumentNames.validated(name)) == nil)
             }
         }.padding(24).frame(width: 390).onAppear { focused = true }
     }
     private func create() {
-        guard !model.saving, (try? DocumentNames.validated(name)) != nil else { return }
+        guard model.workspaceReady, !model.saving, (try? DocumentNames.validated(name)) != nil else { return }
         Task { await model.createAgent(name: name) }
     }
 }

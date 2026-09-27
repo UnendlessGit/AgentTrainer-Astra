@@ -44,7 +44,7 @@ class ModelConfig:
         if self.context_vocabulary:
             vocabulary([field.to_dict() for field in self.context_vocabulary], self.context_sizes)
         if self.schema_version not in (2, 3):
-            raise ValueError("Unsupported model schema; schema 3 explicitly adds causal queued-control features")
+            raise ValueError("Unsupported model schema; version 2 or explicit queued-control version 3 is required")
         if any(type(value) is not int or not 8 <= value <= 512 for value in (self.queued_command_width, self.queued_packet_width)):
             raise ValueError("Queued-control GRU widths must be bounded positive integers")
         if self.schema_version == 2 and (self.queued_command_width, self.queued_packet_width) != (64, 128):

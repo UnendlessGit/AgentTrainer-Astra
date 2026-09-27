@@ -116,7 +116,8 @@ def _ranges(manifest: dict, selection: RecordingSelection, supervision_start_nan
         elif start < supervision_start_nanos:
             raise RecordingError("Explicit correction range starts before expert supervision; review its start time")
         if start >= end:
-            raise RecordingError("The recording has no source interval after expert supervision begins")
+            suffix = " after expert supervision begins" if supervision_start_nanos > 0 else ""
+            raise RecordingError("Selected recording has no complete causal observation/action interval" + suffix)
         return (RecordingRange(start, end),)
     if any(item.start_nanos < supervision_start_nanos for item in selection.ranges):
         raise RecordingError("Explicit correction range starts before expert supervision; review its start time")

@@ -14,6 +14,11 @@ enum AgentSection: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+struct WorkspaceOpeningFailure {
+    let root: URL
+    let message: String
+}
+
 @MainActor @Observable final class WorkspaceModel {
     private(set) var agents: [AgentDocument] = []
     private(set) var environments: [EnvironmentDocument] = []
@@ -47,6 +52,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     var recordingInspectionAgentID: UUID?
     var recordingLinkRequest: RecordingLinkRequest?
     private(set) var loading = true
+    private(set) var openingFailure: WorkspaceOpeningFailure?
     private(set) var saving = false
     var destination: WorkspaceDestination? = .library
     var section: AgentSection = .demonstrations
@@ -105,23 +111,53 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     func start() async {
-        guard !started else { return }
-        started = true
+        guard !started, !isClosing else { return }
+        started = true; loading = true
+        let root = supportRoot
+        defer { loading = false }
         do {
-            let root = supportRoot
             let opened = try await Task.detached {
                 let lease = try LibraryLease(root: root)
                 return (lease, try LibraryStore(root: root))
             }.value
+            guard !isClosing else { return }
             libraryLease = opened.0; installCoordinators(store: opened.1)
             do { _ = try await store?.recoverInterruptedRecordings() }
             catch { errorMessage = error.localizedDescription }
             try await store?.markAbandonedLearningRunsInterrupted()
             try await store?.inspectPriorInferenceRuns()
             try await refresh()
+            guard !isClosing else { await releaseFailedOpening(); return }
             if let first = agents.first { destination = .agent(first.id) }
-        } catch { errorMessage = error.localizedDescription }
-        loading = false
+        } catch {
+            let message = error.localizedDescription
+            await releaseFailedOpening()
+            errorMessage = nil
+            if !isClosing { openingFailure = .init(root: root, message: message) }
+        }
+    }
+
+    var workspaceReady: Bool { !loading && openingFailure == nil && store != nil && !isClosing }
+
+    func retryOpening() async {
+        guard openingFailure != nil, !loading, !isClosing else { return }
+        // Only a deliberate retry clears failure. start() stays latched after
+        // failure so window/task recreation cannot repeatedly request access.
+        openingFailure = nil; errorMessage = nil; started = false
+        await start()
+    }
+
+    private func releaseFailedOpening() async {
+        // Startup can fail after constructing owners or reading part of the
+        // catalog. Join them before releasing the lease and enabling retry.
+        await desktopLearning?.stopAndWait()
+        await inference?.stopAndWait()
+        await learning?.stopAndWait()
+        desktopLearning = nil; inference = nil; learning = nil; store = nil; libraryLease = nil
+        agents = []; environments = []; recordings = []; issues = []; learningRuns = []; checkpoints = []
+        evaluations = []; closedLoopEvaluations = []; pendingFeedback = []; pendingArtifactTransfers = []
+        rewardPrograms = []; contextFields = []; recordingSelections = [:]; recordingLinks = [:]; checkpointLinks = [:]
+        invalidateCheckpointContexts(); destination = .library; showingNewAgent = false
     }
 
     var storageLayout: ArtifactStorageLayout { store?.layout ?? .defaults(catalogRoot: supportRoot) }
@@ -146,7 +182,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     func createAgent(name: String) async {
-        guard let store, !saving, !isClosing else { return }
+        guard workspaceReady, let store, !saving else { return }
         saving = true
         defer { saving = false }
         do {
@@ -159,7 +195,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     func saveAgent(_ document: AgentDocument) async {
-        guard let store, !saving, !isClosing else { return }
+        guard workspaceReady, let store, !saving else { return }
         saving = true
         defer { saving = false }
         do {
@@ -336,6 +372,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
 
     var inferenceUnavailableReason: String? {
         if isClosing { return "The workspace is closing." }
+        if !workspaceReady { return openingFailure == nil ? "The workspace is opening." : "Open the workspace with Try Again before starting live control." }
         if storageRoutingNeedsReload { return "Reload storage routing in Settings before starting another workflow." }
         if correctionStarting { return "Preparing the correction recording…" }
         if saving { return "Finish saving library changes before running an agent." }
@@ -457,6 +494,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     var checkpointManagementUnavailableReason: String? {
+        if openingFailure != nil || store == nil { return "Open the workspace before managing artifacts." }
         if loading || isClosing || saving { return "Wait for the current library operation to finish." }
         if storageRoutingNeedsReload { return "Reload storage routing in Settings before managing artifacts." }
         if correctionStarting { return "Finish the correction recording handoff before managing checkpoints." }
@@ -663,7 +701,7 @@ enum AgentSection: String, CaseIterable, Identifiable {
     }
 
     func duplicateSelectedAgent() async {
-        guard let store, !saving, !isClosing, let selectedAgent else { return }
+        guard workspaceReady, let store, !saving, let selectedAgent else { return }
         do {
             let copy = try await store.duplicateAgent(selectedAgent)
             try await refresh(); destination = .agent(copy.id)
