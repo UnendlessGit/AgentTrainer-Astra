@@ -93,3 +93,12 @@ A real native recording/dataset/paused BC checkpoint was archived, imported and 
 Practice-outcome evaluation now uses the compiled policy against fixed seeds/layouts with per-trial outcomes, saved protocol replay and checkpoint comparisons. It shares no oracle labels with inference and makes no unverified held-out claim. Native persistence and Swift/Python protocol fingerprints agree; a short real compiled small-policy worker run passes. See verification/closed-loop-evaluation.md. These are workflow checks, not proof of production-model learning quality.
 
 The principal remaining implementation is the live state-value source and any changes justified by the queued-action/long-delay reviews. Production ML comparisons, installed physical workflows, final product/accessibility review, broader regression and the final DMG remain required. No Transformers are involved.
+
+
+## September 27 live-state increment
+
+Desktop RL now accepts authenticated local numeric/text/Boolean state values through an explicitly enabled loopback source. The connection is ready before reset/control, observations seal receive-time values at their original actor cutoffs, missing/stale values remain unknown, and known sequence gaps require a fresh binding. Producer closure retires each episode; run closure joins the listener. The UI exposes current values and explicit clipboard actions; the app bundles a local guide/client example without requiring external Python for its core workflows.
+
+A single focused Host run exercised the real socket client, generated capture, virtual native input, actual MLX policy/collector/PPO and joined shutdown. Two episodes/bindings,36 telemetry updates and eight admitted decisions produced two optimizer updates with changed weights. All eight reward deltas and rate integrals matched the original server receipt times exactly. No personal pixels, OS input or privacy permissions were used. Component socket/causality checks and the native build pass. See architecture/live-state-source.md.
+
+The remaining work shifts to the independently reviewed GRU learning diagnostics and authoritative queued-action observation design, then stable-source regression, installed physical/TCC workflows, product/accessibility review and final DMG qualification. Queued action feedback and per-surface age were identified as representational gaps; neither has been silently added to existing checkpoints. The proposed queue channel and three-seed passive-cue study are recorded separately. Transformers remain excluded.

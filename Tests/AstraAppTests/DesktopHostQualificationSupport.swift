@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import AstraCore
 @testable import AstraPlatform
 @testable import AgentTrainerAstra
@@ -230,5 +231,118 @@ final class HostQualificationProcesses: @unchecked Sendable {
         let copy = lock.withLock { workers }; var result: [String: [Int32]] = [:]
         for (role, worker) in copy { result[role, default: []].append(await worker.terminationStatus() ?? -999) }
         return result
+    }
+}
+
+/// Generated numeric telemetry over the real authenticated loopback protocol.
+/// Socket I/O lives off MainActor; the token is never included in reports/errors.
+final class HostQualificationTelemetry: @unchecked Sendable {
+    private let signalID: UUID
+    private let lock = NSLock()
+    private var work: Task<Void, Never>?
+    private var received: [JSONValue] = []
+    private var failure: String?
+    private var finished = false
+    init(signalID: UUID) { self.signalID = signalID }
+    var issue: String? { lock.withLock { failure } }
+    var receipts: [JSONValue] { lock.withLock { received } }
+    var hasJoined: Bool { lock.withLock { finished } }
+
+    func startIfNeeded(_ endpoint: LiveSignalEndpoint) {
+        lock.withLock {
+            guard work == nil else { return }
+            work = Task.detached { [self] in
+                defer { lock.withLock { finished = true } }
+                do {
+                    let connection = try QualificationTelemetrySocket(endpoint)
+                    defer { connection.close() }
+                    while !Task.isCancelled {
+                        let state = try connection.request("binding.get")
+                        if state.fields?["code"]?.text == "liveSignal.closed" { return }
+                        guard state.fields?["ok"] == .bool(true) else { throw AstraError("qualification.telemetry", "The generated telemetry binding request was rejected.") }
+                        if state.fields?["binding"] != .null {
+                            let binding = try state.required("binding").decode(LiveSignalBinding.self)
+                            let sequence = try state.required("nextSequence").decode(UInt64.self)
+                            guard binding.sessionID == endpoint.sessionID, binding.signals.map(\.id) == [signalID] else {
+                                throw AstraError("qualification.telemetry", "The host announced an unexpected generated signal binding.")
+                            }
+                            let value = Double(sequence)
+                            let response = try connection.request("values.put", fields: [
+                                "bindingID": .string(binding.bindingID.uuidString.lowercased()),
+                                "episodeID": .string(binding.episodeID.uuidString.lowercased()), "sequence": .unsigned(sequence),
+                                "values": .array([.object(["signalID": .string(signalID.uuidString.lowercased()), "value": .number(value)])])])
+                            if response.fields?["ok"] == .bool(true) {
+                                let receipt = try response.required("receipt").decode(LiveSignalReceipt.self)
+                                guard receipt.bindingID == binding.bindingID, receipt.sequence == sequence,
+                                      receipt.nextSequence == sequence + 1, receipt.receivedAtNanos >= binding.publishedAtNanos else {
+                                    throw AstraError("qualification.telemetry", "The generated telemetry receipt changed identity or sequence.")
+                                }
+                                try lock.withLock {
+                                    guard received.count < 4096 else { throw AstraError("qualification.telemetry", "The generated telemetry evidence exceeded its bound.") }
+                                    received.append(.object(["bindingID": .string(binding.bindingID.uuidString.lowercased()),
+                                        "episodeID": .string(binding.episodeID.uuidString.lowercased()), "resetID": .string(binding.resetID.uuidString.lowercased()),
+                                        "sequence": .unsigned(sequence), "receivedAtNanos": .unsigned(receipt.receivedAtNanos), "value": .number(value)]))
+                                }
+                            } else if response.fields?["code"]?.text != "liveSignal.binding" {
+                                throw AstraError("qualification.telemetry", "The generated value update was rejected: \(response.fields?["code"]?.text ?? "unknown").")
+                            }
+                        }
+                        try await Task.sleep(for: .milliseconds(50))
+                    }
+                } catch is CancellationError { }
+                catch let error as AstraError where error.code == "qualification.telemetryClosed" { /* Host joins and closes its listener at completion. */ }
+                catch { lock.withLock { failure = error.localizedDescription } }
+            }
+        }
+    }
+    func stopAndJoin() async {
+        let task = lock.withLock { work }; task?.cancel(); await task?.value
+    }
+}
+
+private final class QualificationTelemetrySocket {
+    private let endpoint: LiveSignalEndpoint
+    private var descriptor: Int32
+    init(_ endpoint: LiveSignalEndpoint) throws {
+        guard endpoint.host == "127.0.0.1" else { throw AstraError("qualification.telemetry", "The generated client requires loopback.") }
+        self.endpoint = endpoint; descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw AstraError("qualification.telemetry", "The generated client could not open its socket.") }
+        var timeout = timeval(tv_sec: 2, tv_usec: 0), one: Int32 = 1
+        guard fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0,
+              setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0,
+              setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0,
+              setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            Darwin.close(descriptor); descriptor = -1; throw AstraError("qualification.telemetry", "The generated socket timeouts could not be configured.")
+        }
+        var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET); address.sin_port = endpoint.port.bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard result == 0 else { close(); throw AstraError("qualification.telemetry", "The generated client could not connect to the host listener.") }
+    }
+    deinit { close() }
+    func close() { if descriptor >= 0 { Darwin.close(descriptor); descriptor = -1 } }
+    func request(_ operation: String, fields: [String: JSONValue] = [:]) throws -> JSONValue {
+        var value = fields
+        value["version"] = .integer(1); value["op"] = .string(operation)
+        value["sessionID"] = .string(endpoint.sessionID.uuidString.lowercased()); value["token"] = .string(endpoint.token)
+        var bytes = try JSONEncoder().encode(JSONValue.object(value)); bytes.append(10)
+        var sent = 0
+        while sent < bytes.count {
+            let count = bytes.withUnsafeBytes { Darwin.send(descriptor, $0.baseAddress!.advanced(by: sent), $0.count - sent, 0) }
+            guard count > 0 else { throw AstraError("qualification.telemetryClosed", "The host closed its telemetry connection.") }
+            sent += count
+        }
+        var response = Data(), byte: UInt8 = 0
+        while response.count < 256 * 1024 {
+            let count = Darwin.recv(descriptor, &byte, 1, 0)
+            if count == 0 { throw AstraError("qualification.telemetryClosed", "The host closed its telemetry connection.") }
+            guard count == 1 else { throw AstraError("qualification.telemetry", "The generated client timed out receiving a local response.") }
+            if byte == 10 { return try JSONDecoder().decode(JSONValue.self, from: response) }
+            response.append(byte)
+        }
+        throw AstraError("qualification.telemetry", "The generated client received an oversized response.")
     }
 }

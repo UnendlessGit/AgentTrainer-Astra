@@ -10,6 +10,7 @@ public final class ResetCancellation: @unchecked Sendable {
     private var consumed = false
     private var cancellation: (@Sendable () -> Void)?
     public init(resetID: UUID = UUID()) { self.resetID = resetID }
+    public var isCancelled: Bool { lock.withLock { requested } }
 
     public func cancel() {
         let callback = lock.withLock { requested = true; return cancellation }

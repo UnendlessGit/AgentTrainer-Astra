@@ -2,6 +2,7 @@ import Foundation
 import AstraCore
 
 struct DesktopLearningOptions: Sendable {
+    var connectLiveSignals = false
     var contextVocabulary = ContextVocabulary.empty
     var initialCheckpointID: UUID?
     var resume = false

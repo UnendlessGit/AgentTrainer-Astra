@@ -21,7 +21,7 @@ def source_information() -> dict:
     checksum = hashlib.sha256()
     for name in sorted(set(paths)):
         if not name or not (name.startswith(("Sources/", "python/astra/", "Resources/", "assets/", "packaging/"))
-                            or name in {"Package.swift", "pyproject.toml", "uv.lock", "scripts/apple_toolchain.py"}
+                            or name in {"Package.swift", "pyproject.toml", "uv.lock", "scripts/apple_toolchain.py", "scripts/live_signal_client.py"}
                             or (name.startswith("scripts/") and Path(name).name.startswith(("build_", "bundle_", "check_")))):
             continue
         path = ROOT / name
@@ -74,6 +74,9 @@ def main() -> None:
         "pythonVersion": platform.python_version(), "buildOSVersion": platform.mac_ver()[0],
         "architecture": platform.machine(), "sdkVersion": subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], env=environment, text=True).strip(),
     }, indent=2, sort_keys=True) + "\n")
+    (resources / "Examples").mkdir()
+    shutil.copy2(ROOT / "scripts/live_signal_client.py", resources / "Examples/live_signal_client.py")
+    shutil.copy2(ROOT / "Resources/Guides/LiveStateSource.md", resources / "Examples/LiveStateSource.md")
     (resources / "Weights").mkdir()
     shutil.copy2(weights, resources / "Weights" / weight_spec["artifact"])
     shutil.copy2(ROOT / "assets/weights.json", resources / "Weights" / "manifest.json")

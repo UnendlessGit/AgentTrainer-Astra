@@ -25,6 +25,7 @@ import AstraCore
             parameterCount: try initialInfo.required("parameterCount").decode(Int.self))
         try await store.saveCheckpoint(initial)
         let multiple = environment["ASTRA_HOST_QUALIFICATION_MULTI_SURFACE"] == "1"
+        let liveValues = environment["ASTRA_HOST_QUALIFICATION_LIVE_VALUES"] == "1"
         let capture = HostQualificationCapture(multiSurface: multiple), owner = NativeControlOwner()
         let controls = HostQualificationControls(surfaces: capture.surfaces)
         let processes = HostQualificationProcesses(executable: bundle.bundleURL.appendingPathComponent("Contents/Helpers/AstraCompute.app/Contents/MacOS/AstraCompute"))
@@ -39,17 +40,26 @@ import AstraCore
                 }
                 return MonotonicClock.now
             }, detector: { signals, _, _, _ in
-                guard signals.allSatisfy({ $0.kind == .elapsedSeconds }) else {
+                guard signals.allSatisfy({ $0.kind == .elapsedSeconds || (liveValues && $0.kind == .manual) }) else {
                     throw AstraError("qualification.detector", "This fixture never reads a real or visual detector.")
                 }
                 return []
             }, changed: {})
         let elapsed = RewardSignal(name: "Episode time", kind: .elapsedSeconds)
+        var score = RewardSignal(name: "Generated live score", kind: .manual); score.maximumAgeMS = 250
+        let telemetry = liveValues ? HostQualificationTelemetry(signalID: score.id) : nil
         var program = RewardProgram(name: "Generated timed episodes", signals: [elapsed],
             rules: [.init(name: "Time reward", kind: .ratePerSecond, amount: 1)])
+        if liveValues {
+            let available = RewardPredicate(conditions: [.init(signalID: score.id, comparison: .atLeast, number: 0)])
+            program.signals.append(score); program.ready = available
+            program.rules = [.init(name: "Generated score delta", kind: .scoreDelta, amount: 0.25, signalID: score.id),
+                .init(name: "Known live state rate", kind: .ratePerSecond, amount: 2, predicate: available)]
+        }
         program.maximumEpisodeMS = 1000
         program.success = .init(conditions: [.init(signalID: elapsed.id, comparison: .atLeast, number: 0.35)])
         var options = DesktopLearningOptions(); options.initialCheckpointID = initial.id; options.iterations = 1
+        options.connectLiveSignals = liveValues
         options.training.rolloutDecisions = 6; options.training.epochs = 1
         options.training.sequenceLength = 2; options.training.burnIn = 1; options.training.effectiveBatchDecisions = 4
         var phases: [String] = [], readyConfirmations = 0
@@ -57,7 +67,7 @@ import AstraCore
         var failure: String?
         do {
             try host.start(agent: agent, source: capture.source, program: program, options: options)
-            try await wait(host, phases: &phases, confirmations: &readyConfirmations)
+            try await wait(host, phases: &phases, confirmations: &readyConfirmations, telemetry: telemetry)
             try #require(host.failure == nil, "Host: \(host.failure ?? "") / learner: \(learner.failure ?? "")")
             let saved = try #require(host.checkpoint); learned = saved
             try #require(saved.id != initial.id && saved.trainingStep > 0, "No real PPO optimizer update was published")
@@ -66,7 +76,7 @@ import AstraCore
             try #require(snapshot.agents.first?.selectedCheckpointID == saved.id)
             try #require(snapshot.learningRuns.contains { $0.checkpointID == saved.id && $0.status == .completed })
             try #require(readyConfirmations >= 2 && owner.priorCleanupJoined && capture.hasJoined)
-            if !multiple {
+            if !multiple && !liveValues {
                 let previousChildren = controls.all.count
                 options.initialCheckpointID = saved.id; options.resume = true; options.iterations = 2
                 try host.start(agent: agent, source: capture.source, program: program, options: options)
@@ -80,19 +90,31 @@ import AstraCore
             try #require(owner.priorCleanupJoined && controls.all.allSatisfy { $0.hasJoined && $0.backend.clean })
             try #require(capture.hasJoined && capture.produced > 0)
             let ended = await processes.statuses()
-            try #require(ended["actor"]?.count == (multiple ? 1 : 2) && ended["collector"]?.count == (multiple ? 1 : 2))
+            let expectedWorkers = multiple || liveValues ? 1 : 2
+            try #require(ended["actor"]?.count == expectedWorkers && ended["collector"]?.count == expectedWorkers)
             try #require(ended.values.flatMap { $0 }.allSatisfy { $0 == 0 })
             let executed = controls.all.flatMap(\.receipts).filter { $0.status == .executed }
             try #require(!executed.isEmpty && controls.all.reduce(0) { $0 + $1.backend.posted } > 0)
+            if let telemetry {
+                try #require(telemetry.issue == nil, "Generated telemetry: \(telemetry.issue ?? "")")
+                try #require(Set(telemetry.receipts.compactMap { $0.fields?["bindingID"]?.uuid }).count >= 2)
+                try #require(host.liveSignalEndpoint == nil && host.liveSignalBinding == nil)
+            }
         } catch {
             failure = host.failure ?? learner.failure ?? error.localizedDescription
             await host.stopAndWait(); await learner.stopAndWait()
         }
+        await telemetry?.stopAndJoin()
+        if failure == nil, let issue = telemetry?.issue { failure = issue }
         let statuses = await processes.statuses()
         let sourceFrames = try capture.metadata.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) }
         let sourceSurfaces = try capture.surfaces.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) }
         let report: [String: Any] = ["completed": failure == nil, "issue": failure ?? NSNull(),
-            "multiSurface": multiple, "sourceFrames": sourceFrames, "sourceSurfaces": sourceSurfaces,
+            "multiSurface": multiple, "liveValues": liveValues, "sourceFrames": sourceFrames, "sourceSurfaces": sourceSurfaces,
+            "liveSignalID": liveValues ? score.id.uuidString.lowercased() : NSNull(),
+            "telemetryReceipts": try JSONSerialization.jsonObject(with: JSONEncoder().encode(telemetry?.receipts ?? [])),
+            "telemetryJoined": telemetry?.hasJoined ?? true,
+            "telemetryIssue": telemetry?.issue ?? NSNull(),
             "privacyPermissionsUsed": false, "physicalInputPosted": false, "personalPixelsRead": false,
             "initialCheckpointID": initial.id.uuidString.lowercased(), "learnedCheckpointID": learned?.id.uuidString.lowercased() ?? NSNull(),
             "stoppedCheckpointID": stopped?.id.uuidString.lowercased() ?? NSNull(), "trainingUpdates": learned?.trainingStep ?? 0,
@@ -107,11 +129,14 @@ import AstraCore
     }
 
     private func wait(_ host: DesktopLearningHost, phases: inout [String], confirmations: inout Int,
+                      telemetry: HostQualificationTelemetry? = nil,
                       shouldStop: () -> Bool = { false }) async throws {
         let deadline = ContinuousClock.now + .seconds(90)
         var confirmed: Set<UUID> = [], requested = false
         while host.isBusy {
             if phases.last != host.phase { phases.append(host.phase) }
+            if let endpoint = host.liveSignalEndpoint { telemetry?.startIfNeeded(endpoint) }
+            if let issue = telemetry?.issue { throw AstraError("qualification.telemetry", issue) }
             if let reset = host.awaitingReady, confirmed.insert(reset).inserted {
                 confirmations += 1; host.confirmReady()
             }

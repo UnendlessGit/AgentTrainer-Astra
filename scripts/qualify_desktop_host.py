@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -22,8 +23,9 @@ def main():
     parser.add_argument('--output',type=Path)
     parser.add_argument('--feedback',action='store_true',help='Exercise original-frame review through the native UI model before PPO')
     parser.add_argument('--multi-surface',action='store_true',help='Exercise two independent generated source streams through native actor/collector/PPO')
+    parser.add_argument('--live-values',action='store_true',help='Exercise authenticated loopback state values through native readiness, reward sealing and PPO')
     args=parser.parse_args()
-    if args.multi_surface and args.feedback:parser.error('Choose the focused multi-source or feedback workflow, not both')
+    if sum((args.multi_surface,args.feedback,args.live_values))>1:parser.error('Choose one focused multi-source, feedback or live-value workflow')
     output=(args.output or ROOT/'.local/verification'/('desktop-host-'+str(uuid.uuid4()))).resolve()
     if output.exists():parser.error('Choose a new output directory to preserve evidence')
     output.mkdir(parents=True)
@@ -57,8 +59,11 @@ def main():
     (output/'initial.json').write_text(json.dumps({'id':manifest['id'],'policySignature':manifest['policySignature'],
         'parameterCount':policy.config.parameter_count}))
     environment={**os.environ,'ASTRA_HOST_QUALIFICATION_ROOT':str(output),'ASTRA_HOST_QUALIFICATION_BUNDLE':str(bundle)}
+    for flag in ('ASTRA_HOST_QUALIFICATION_FEEDBACK','ASTRA_HOST_QUALIFICATION_MULTI_SURFACE','ASTRA_HOST_QUALIFICATION_LIVE_VALUES'):
+        environment.pop(flag,None)
     if args.feedback:environment['ASTRA_HOST_QUALIFICATION_FEEDBACK']='1'
     if args.multi_surface:environment['ASTRA_HOST_QUALIFICATION_MULTI_SURFACE']='1'
+    if args.live_values:environment['ASTRA_HOST_QUALIFICATION_LIVE_VALUES']='1'
     suite='DesktopFeedbackQualificationTests' if args.feedback else 'DesktopHostQualificationTests'
     with (output/'swift-test.log').open('wb') as log:
         process=subprocess.Popen([str(ROOT/'script/swift.sh'),'test','--filter',suite],
@@ -73,7 +78,7 @@ def main():
             raise
     report_path=output/'desktop-host-report.json'
     if report_path.exists():
-        preview=json.loads(report_path.read_text());preview.pop('sourceFrames',None)
+        preview=json.loads(report_path.read_text());preview.pop('sourceFrames',None);preview.pop('telemetryReceipts',None)
         print(json.dumps(preview,indent=2,sort_keys=True),flush=True)
     if returncode:
         print((output/'swift-test.log').read_text()[-16000:],flush=True)
@@ -82,6 +87,48 @@ def main():
     if not report['completed'] or report['privacyPermissionsUsed'] or not report['controlCleanupConfirmed']:
         raise RuntimeError('Real desktop host qualification did not complete')
     learned=load_checkpoint(output/'Library/Models'/report['learnedCheckpointID'],include_training=True)
+    if args.live_values:
+        assert report['liveValues'] and report['telemetryJoined']
+        assert learned.training_state['learner']['optimizerUpdates']>0
+        assert learned.manifest['artifacts']['policy.safetensors']!=manifest['artifacts']['policy.safetensors']
+        from astra.learning.rollout_artifacts import inspect_package
+        packages=[path.parent for path in (output/'Library/DesktopRuns').glob('*/Collections/*/manifest.json')
+            if json.loads(path.read_text())['status']=='sealed']
+        assert len(packages)==1
+        rollout=inspect_package(packages[0]);assert rollout['decisions']>=6
+        receipts=report['telemetryReceipts']
+        episodes={row['episodeID'] for row in receipts}
+        assert len(episodes)>=2 and report['readyConfirmations']>=2
+        assert len({row['bindingID'] for row in receipts})==len(episodes)
+        for episode in episodes:
+            rows=[row for row in receipts if row['episodeID']==episode]
+            assert [row['sequence'] for row in rows]==list(range(len(rows)))
+            assert all(row['value']==row['sequence'] for row in rows)
+            assert all(a['receivedAtNanos']<=b['receivedAtNanos'] for a,b in zip(rows,rows[1:]))
+        decisions=0;nonzero_deltas=0;total_reward=0.0
+        with (packages[0]/'decisions.ndjson').open() as stream:
+            for line in stream:
+                decision=json.loads(line);transition=decision['transition'];reward=transition['reward']
+                values=[row for row in receipts if row['episodeID']==transition['episode_id']]
+                before=[row for row in values if row['receivedAtNanos']<=reward['start_nanos']]
+                after=[row for row in values if row['receivedAtNanos']<=reward['end_nanos']]
+                assert before and after
+                assert reward['start_nanos']-before[-1]['receivedAtNanos']<=250_000_000
+                assert reward['end_nanos']-after[-1]['receivedAtNanos']<=250_000_000
+                delta=after[-1]['value']-before[-1]['value']
+                expected=.25*delta+2*(reward['end_nanos']-reward['start_nanos'])/1e9
+                assert math.isclose(reward['value'],expected,rel_tol=1e-10,abs_tol=1e-10)
+                decisions+=1;nonzero_deltas+=delta>0;total_reward+=reward['value']
+        assert decisions==rollout['decisions'] and nonzero_deltas>0
+        sessions=[json.loads(path.read_text()) for path in (output/'Library/DesktopRuns').glob('*/results.json')]
+        assert len(sessions)==1 and sessions[0]['completedUpdates']==1 and sessions[0]['episodes']>=2
+        assert sessions[0]['controlCleanupConfirmed'] and sessions[0]['issue'] is None
+        report.update(bundle=str(bundle),model=policy.config.to_dict(),verificationModel='numerical_test_small',
+            learnedWeightsChanged=True,admittedDecisions=decisions,telemetryUpdates=len(receipts),
+            liveBindings=len(episodes),rewardLabelsMatchReceivedValues=True,nonzeroDeltaIntervals=nonzero_deltas,
+            totalAdmittedReward=total_reward,liveClientIntervalMS=50)
+        report_path.write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+        return
     if args.feedback:
         assert learned.training_state['learner']['optimizerUpdates']>0
         assert learned.manifest['artifacts']['policy.safetensors']!=manifest['artifacts']['policy.safetensors']

@@ -94,6 +94,9 @@ struct DesktopTrainingView: View {
                                 }
                                 if item.collectedDecisions < (item.configuration.fields?["training"]?.fields?["rollout_decisions"]?.int ?? 0), let source {
                                     if let savedProgram = savedProgram(item) {
+                                        if savedProgram.signals.contains(where: { $0.kind == .manual }) {
+                                            Text("Collect More opens a new local state connection for the saved manual signals.").font(.caption).foregroundStyle(.secondary)
+                                        }
                                         RewardSourceBindingsView(program: savedProgram, source: source, choices: Binding(
                                             get: { pendingSurfaceBindings[item.id] ?? [:] },
                                             set: { pendingSurfaceBindings[item.id] = $0 }))
@@ -122,6 +125,7 @@ struct DesktopTrainingView: View {
                         }.padding(8)
                     }
                 }
+                if let host, host.liveSignalEndpoint != nil { LiveSignalConnectionView(host: host) }
                 GroupBox("Environment & feedback") {
                     VStack(alignment: .leading, spacing: 14) {
                         Picker("Environment", selection: $sourceID) {
@@ -138,6 +142,11 @@ struct DesktopTrainingView: View {
                             ForEach(model.rewardPrograms) { Text($0.name).tag(Optional($0.id)) }
                         }
                         if let program {
+                            if program.signals.contains(where: { $0.kind == .manual }) {
+                                Toggle("Connect a local state source", isOn: $options.connectLiveSignals)
+                                Text("A local telemetry client supplies this definition's numeric, text or Boolean values. Connection settings appear when the run starts, before control is armed.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                             if let source { RewardSourceBindingsView(program: program, source: source, choices: $options.surfaceBindings) }
                             Text(program.resetPlan == nil ? "You confirm Ready after resetting each episode. Physical keyboard or pointer input takes over immediately."
                                  : "The saved reset runs between episodes. Physical keyboard or pointer input takes over immediately.")

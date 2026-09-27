@@ -18,6 +18,10 @@ import AstraPlatform
     private(set) var countdown: Int?
     private(set) var cleanupWarning: NativeControlCompletion?
     private(set) var completedReportRunID: UUID?
+    private(set) var liveSignalEndpoint: LiveSignalEndpoint?
+    private(set) var liveSignalBinding: LiveSignalBinding?
+    private(set) var liveSignalValues: [DesktopLiveValue] = []
+    private(set) var liveSignalStatus = ""
     private(set) var reviewPresentation: FeedbackReviewPresentation?
     private var feedbackWorkflow: PendingFeedbackWorkflow?
     private var feedbackCancellation: Task<Void, Never>?
@@ -58,8 +62,8 @@ import AstraPlatform
         _ = try options.validated(); _ = try program.validated(); _ = try source.captureBindings()
         // The live manual source and retrospective-review workflow are wired
         // separately; missing feedback must never silently become zero reward.
-        guard !program.signals.contains(where: { $0.kind == .manual }) else {
-            throw AstraError("desktop.feedbackSource", "Manual state signals need a connected value source. Use visual signals and reviewable feedback rules for this session.")
+        guard options.connectLiveSignals || !program.signals.contains(where: { $0.kind == .manual }) else {
+            throw AstraError("desktop.feedbackSource", "Enable the local state source for this reward definition's manual signals.")
         }
         if controlFactory.protectsPhysicalInputs {
             let privacy = PermissionSnapshot.current()
@@ -71,6 +75,7 @@ import AstraPlatform
         let signals = DesktopHostSignals(); self.signals = signals
         isBusy = true; isStopping = false; agentID = agent.id; failure = nil; progress = nil; metrics = []; checkpoint = nil
         awaitingReady = nil; countdown = nil; cleanupWarning = nil; completedReportRunID = nil; phase = "Preparing desktop learning…"
+        liveSignalEndpoint = nil; liveSignalBinding = nil; liveSignalValues = []; liveSignalStatus = ""
         work = Task { await perform(agent: agent, source: source, program: program, options: options,
             generation: generation, signals: signals, continuation: continuation) }
     }
@@ -132,7 +137,24 @@ import AstraPlatform
         var capture: InferenceCapture?
         var actor: PolicyActorSession?
         var completed: DesktopLearningLoopResult?
+        var liveSource: LiveSignalStore?
+        var liveServer: LoopbackLiveSignalServer?
+        var sourceDisplay: Task<Void, Never>?
         do {
+            let manualSignals = program.signals.filter { $0.kind == .manual }
+            if !manualSignals.isEmpty {
+                let source = try LiveSignalStore(sessionID: runID, signals: manualSignals, clock: { MonotonicClock.now })
+                let server = try await LoopbackLiveSignalServer.start(store: source)
+                liveSource = source; liveServer = server; liveSignalEndpoint = server.endpoint
+                sourceDisplay = Task { [weak self] in
+                    while !Task.isCancelled {
+                        self?.refreshLiveSignals(source: source, server: server)
+                        do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
+                    }
+                }
+                try signals.check()
+            }
+            let liveValues = liveSource
             let selected: CheckpointDocument?
             if let id = options.initialCheckpointID {
                 selected = try await store.snapshot().checkpoints.first { $0.id == id }
@@ -174,7 +196,9 @@ import AstraPlatform
                 "rewardBinding": try .encode(reward), "scope": try .encode(scope), "training": configuration.training,
                 "model": configuration.model, "contextIDs": try .encode(configuration.contextIDs),
                 "initialCheckpointID": .string(prepared.checkpoint.document.id.uuidString.lowercased()),
-                "resume": .bool(options.resume), "targetUpdates": .integer(Int64(options.iterations))])
+                "resume": .bool(options.resume), "targetUpdates": .integer(Int64(options.iterations)),
+                "liveStateSource": liveValues == nil ? .null : .object(["kind": .string("authenticatedLoopback"),
+                    "schemaVersion": .integer(1), "sessionID": .string(runID.uuidString.lowercased())])])
             try await LearningFiles.write(metadata, to: directory.appendingPathComponent("configuration.json"), exclusive: true)
             let collectionsDirectory = directory.appendingPathComponent("Collections", isDirectory: true)
             try await Task.detached { try FileManager.default.createDirectory(at: collectionsDirectory, withIntermediateDirectories: false) }.value
@@ -200,6 +224,11 @@ import AstraPlatform
                 assetRoot: root, frames: {
                     guard let images = try inbox.readAll() else { throw AstraError("desktop.capture", "The reset has no complete observation.") }
                     return images
+                }, manual: { context, cutoff in
+                    guard let liveValues else { return [] }
+                    guard let binding = liveValues.status.binding, binding.episodeID == context.nextEpisodeID,
+                          binding.resetID == context.resetID else { throw AstraError("liveSignal.reset", "The reset has no matching live value binding.") }
+                    return try liveValues.readings(binding: binding, cutoffNanos: cutoff)
                 }, detector: detector)
             let owner = dependencies.controlOwner, controlFactory = controlFactory, verify = verifyScope
             let collectorFactory = collectorFactory, detector = detector, assetRoot = root
@@ -214,14 +243,17 @@ import AstraPlatform
             }, reset: { [weak self] episode, cancellation in
                 guard let self else { throw CancellationError() }
                 return try await self.performReset(episode: episode, cancellation: cancellation, source: source, configuration: configuration,
-                    scope: scope, observations: observations, actor: policyActor, directory: directory, signals: signals, generation: expected)
+                    scope: scope, observations: observations, actor: policyActor, directory: directory, signals: signals, generation: expected,
+                    liveValues: liveValues)
             }, warmup: { ready in
                 try await Self.warm(policyActor, inbox: inbox, scope: scope, signals: signals)
             }, episode: { [weak self] ready, checkpoint, collector in
                 DesktopEpisodeRunner(actor: policyActor, checkpoint: checkpoint, reset: ready, identity: identity,
                     collector: collector, sequence: sequence, program: configuration.program, assetRoot: assetRoot,
                     captureRead: { nil }, captureReadAll: { try inbox.readAll() }, verifyScope: { try await verify(source, scope) }, controlFactory: controlFactory,
-                    controlOwner: owner, recoveryDirectory: directory, deferManualFeedback: configuration.retrospective,
+                    controlOwner: owner, recoveryDirectory: directory,
+                    manualProducer: try Self.manualProducer(source: liveValues, episodeID: ready.context.nextEpisodeID),
+                    deferManualFeedback: configuration.retrospective,
                     detector: detector, onPhase: { [weak self] value in
                         Task { @MainActor [weak self] in
                             guard let self, generation == expected, isBusy,
@@ -293,6 +325,9 @@ import AstraPlatform
         await feedbackWorkflow?.cancel(); feedbackWorkflow = nil; reviewPresentation = nil
         await actor?.shutdown()
         inbox.close(); await capture?.stop()
+        sourceDisplay?.cancel(); await sourceDisplay?.value
+        liveSource?.close(); await liveServer?.stopAndJoin()
+        liveSignalEndpoint = nil; liveSignalBinding = nil; liveSignalValues = []; liveSignalStatus = ""
         cleanupWarning = dependencies.controlOwner.pendingManualCleanup
         signals.finish()
         do {
@@ -308,6 +343,24 @@ import AstraPlatform
         resetRunner = nil; resetSource = nil; currentResetID = nil; awaitingReady = nil; countdown = nil
         isBusy = false; isStopping = false; work = nil; self.signals = nil
         await changed()
+    }
+
+    private func refreshLiveSignals(source: LiveSignalStore, server: LoopbackLiveSignalServer) {
+        let state = source.status, network = server.status
+        liveSignalBinding = state.binding
+        liveSignalStatus = state.issue ?? (network.listening
+            ? (network.connected ? "Local client connected" : "Waiting for an authenticated local client")
+            : (network.issue ?? "Local source stopped"))
+        if let binding = state.binding {
+            liveSignalValues = (try? DesktopLiveValues.rows(store: source, binding: binding, cutoff: MonotonicClock.now)) ?? []
+        } else { liveSignalValues = [] }
+    }
+    private nonisolated static func manualProducer(source: LiveSignalStore?, episodeID: UUID) throws -> DesktopEpisodeManualProducer? {
+        guard let source else { return nil }
+        guard let binding = source.status.binding, binding.episodeID == episodeID else {
+            throw AstraError("liveSignal.episode", "The next episode has no matching state source.")
+        }
+        return DesktopLiveValueProducer(source: source, binding: binding).producer
     }
 
     private func recordCompletedMetrics(generation expected: UUID) {
@@ -423,13 +476,30 @@ import AstraPlatform
         var options = DesktopLearningOptions()
         options.initialCheckpointID = document.checkpoint.id
         options.surfaceBindings = surfaceBindings
+        options.connectLiveSignals = binding.definition.signals.contains { $0.kind == .manual }
         options.iterations = document.configuration.fields?["targetUpdates"]?.int ?? 20
         try start(agent: agent, source: source, program: binding.definition, options: options, continuation: document)
     }
 
     private func performReset(episode: UUID, cancellation: ResetCancellation, source: CaptureSource,
                               configuration: DesktopLearningConfiguration, scope: ControlScope, observations: DesktopResetObservations,
-                              actor: PolicyActorSession, directory: URL, signals: DesktopHostSignals, generation expected: UUID) async throws -> ResetResult {
+                              actor: PolicyActorSession, directory: URL, signals: DesktopHostSignals, generation expected: UUID,
+                              liveValues: LiveSignalStore?) async throws -> ResetResult {
+        if let liveValues {
+            let binding = try liveValues.bind(episodeID: episode, resetID: cancellation.resetID)
+            liveSignalBinding = binding; phase = "Waiting for current local state values…"
+            while true {
+                try signals.check(); try Task.checkCancellation()
+                if cancellation.isCancelled { throw CancellationError() }
+                let status = liveValues.status
+                if let issue = status.issue { throw AstraError("liveSignal.source", issue) }
+                guard !status.closed else { throw AstraError("liveSignal.closed", "The local state source stopped before reset.") }
+                let rows = try DesktopLiveValues.rows(store: liveValues, binding: binding, cutoff: MonotonicClock.now)
+                liveSignalValues = rows
+                if rows.count == binding.signals.count && rows.allSatisfy(\.current) { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        }
         let owner = dependencies.controlOwner
         let driver = NativeResetDriver(environmentID: configuration.environmentID, source: source,
             observations: { try await observations.observe(context: $0) }, priorOwnersJoined: {
