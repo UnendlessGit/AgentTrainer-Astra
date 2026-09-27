@@ -267,6 +267,7 @@ struct DesktopTrainingView: View {
                 TextField("Experiment seed", value: $options.training.seed, format: .number.grouping(.never)).textFieldStyle(.roundedBorder).labelsHidden().frame(width: 140)
             }
             if options.initialCheckpointID == nil {
+                QueuedActionMemoryOption(enabled: $options.queuedActionMemory)
                 Picker("Decision rate", selection: $options.periodMS) { Text("10 Hz").tag(100); Text("20 Hz").tag(50) }
                 Stepper("Execution lead: \(options.leadMS) ms", value: $options.leadMS, in: 1...2000, step: 5)
                 Picker("Commands per decision", selection: $options.packetCapacity) { ForEach([16, 32, 64], id: \.self) { Text("\($0)").tag($0) } }

@@ -139,6 +139,8 @@ actor PolicyActorSession {
     private var lastEventSequence: UInt64?
     private var episodeSurfaces: [SurfaceDescriptor]?
     private var episodeGeometryRevision: UInt64?
+    private var episodeControlEpochID: UUID?
+    private var lastFeedbackSequence: UInt64?
     private var lastProgress: JSONValue?
     private var progressKnown = true
     private var stopped = false
@@ -327,7 +329,7 @@ actor PolicyActorSession {
             throw AstraError("inference.preparation", "The actor prepared an inconsistent stream or reset state.")
         }
         if collection {
-            guard reply.payload.fields?["collectionVersion"] == .integer(1), let stream = reply.payload.fields?["rngStreamID"]?.uuid else {
+            guard reply.payload.fields?["collectionVersion"]?.int == details.collectionVersion, let stream = reply.payload.fields?["rngStreamID"]?.uuid else {
                 throw AstraError("inference.collectionVersion", "The actor cannot supply categorical collection evidence.")
             }
             rngStreamID = stream
@@ -371,7 +373,7 @@ actor PolicyActorSession {
             throw AstraError("inference.reset", "The actor did not confirm the expected checkpoint, recurrent reset and persistent counters.")
         }
         self.checkpoint = selected; episodeID = episode; stateID = state; self.contexts = contexts
-        resetGeneration = counters.generation; episodeStep = 0; lastEventSequence = nil; episodeSurfaces = nil; episodeGeometryRevision = nil
+        resetGeneration = counters.generation; episodeStep = 0; lastEventSequence = nil; episodeSurfaces = nil; episodeGeometryRevision = nil; episodeControlEpochID = nil; lastFeedbackSequence = nil
         prediction = nil
         return reply
     }
@@ -391,6 +393,29 @@ actor PolicyActorSession {
               episodeGeometryRevision == nil || episodeGeometryRevision == snapshot.geometryRevision else {
             throw AstraError("inference.geometryChanged", "Surface geometry may change only at a confirmed environment reset.")
         }
+        if policy.controlFeedbackVersion != nil {
+            if !warmup {
+                guard let feedback = snapshot.controls.controlFeedback, feedback.unavailableReason == nil,
+                      feedback.coverageNanos == snapshot.controls.cutoffNanos,
+                      feedback.coverageNanos == snapshot.controls.controlCoverageNanos else {
+                    throw AstraError("inference.controlFeedback", "This policy requires complete queued-control evidence at the actual observation cutoff.")
+                }
+                try feedback.validate(cursor: .init(controlEpochID: episodeControlEpochID ?? feedback.controlEpochID,
+                    afterSequence: lastFeedbackSequence), runID: runID, geometryRevision: snapshot.geometryRevision,
+                    cutoffNanos: snapshot.controls.cutoffNanos)
+                if episodeStep == 0 {
+                    guard feedback.packets.isEmpty, feedback.changes.isEmpty, feedback.throughSequence == nil else {
+                        throw AstraError("inference.controlFeedback", "A new policy episode must begin with its verified empty executor epoch.")
+                    }
+                }
+                for row in feedback.packets {
+                    _ = try row.packet.validated(capabilities: policy.capabilities, surfaces: surfaces, capacity: policy.capacity,
+                        expectedGeometryRevision: snapshot.geometryRevision)
+                }
+            }
+        } else if snapshot.controls.controlFeedback != nil {
+            throw AstraError("inference.controlFeedback", "This saved policy does not consume queued-control observations.")
+        }
         let published = try await Task.detached {
             let frames = try snapshot.frames.map { image in
                 PolicyActorOwnedObservation.Frame(metadata: image.metadata, pixels: try image.pixels(), coverage: image.coverage)
@@ -408,6 +433,9 @@ actor PolicyActorSession {
             "controlState": try .encode(snapshot.controls.controlState), "executedEvents": try .encode(snapshot.controls.executedEvents),
             "intervalCovered": .bool(true), "contextIDs": try .encode(contexts)]
         if let coverage = snapshot.controls.controlCoverageNanos { input["controlCoverageNanos"] = .unsigned(coverage) }
+        if policy.controlFeedbackVersion != nil {
+            input["controlFeedback"] = try snapshot.controls.controlFeedback.map(JSONValue.encode) ?? .null
+        }
         let owned = PolicyActorOwnedObservation(runID: runID, actorInput: .object(input), frames: published.1)
         input["frames"] = try .encode(references)
         if forceInterrupted { throw CancellationError() }
@@ -440,13 +468,16 @@ actor PolicyActorSession {
             if collecting {
                 progress = try PolicyActorValidation.collection(reply.payload, packet: packet, checkpoint: checkpoint.document,
                     observation: owned, episodeStep: episodeStep, resetGeneration: resetGeneration,
-                    rngStreamID: rngStreamID, expectedRNG: expectedRNG)
+                    rngStreamID: rngStreamID, expectedRNG: expectedRNG, version: policy.collectionVersion)
                 expectedRNG = try progress?.required("rngState").decode([UInt32].self)
             }
             self.stateID = try reply.payload.requiredUUID("stateID")
             nextSequence += 1; nextDraw += 1; self.episodeStep += 1
             lastCutoff = snapshot.controls.cutoffNanos; lastEventSequence = snapshot.controls.lastSequence
-            episodeSurfaces = surfaces; episodeGeometryRevision = snapshot.geometryRevision; lastProgress = progress; progressKnown = true
+            episodeSurfaces = surfaces; episodeGeometryRevision = snapshot.geometryRevision
+            episodeControlEpochID = snapshot.controls.controlFeedback?.controlEpochID
+            lastFeedbackSequence = snapshot.controls.controlFeedback?.throughSequence
+            lastProgress = progress; progressKnown = true
         }
         return .init(response: reply, packet: packet, observation: owned, actorProgress: progress)
     }

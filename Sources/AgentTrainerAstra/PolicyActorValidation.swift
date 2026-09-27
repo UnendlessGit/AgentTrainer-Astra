@@ -109,7 +109,7 @@ enum PolicyActorValidation {
 
     static func collection(_ value: JSONValue, packet: ActionPacket, checkpoint: CheckpointDocument,
                            observation: PolicyActorOwnedObservation, episodeStep: UInt64, resetGeneration: UInt64,
-                           rngStreamID: UUID?, expectedRNG: [UInt32]?) throws -> JSONValue {
+                           rngStreamID: UUID?, expectedRNG: [UInt32]?, version: Int = 1) throws -> JSONValue {
         let record = try value.required("collectionRecord"), input = observation.actorInput
         let sampler = try record.required("sampler")
         let suppliedCoverage = try record.fields?["controlCoverageNanos"].flatMap { value in
@@ -121,7 +121,7 @@ enum PolicyActorValidation {
         let before = try sampler.required("stateBefore").decode([UInt32].self)
         let after = try sampler.required("stateAfter").decode([UInt32].self)
         let sampleKey = try sampler.required("sampleKey").decode([UInt32].self)
-        guard record.fields?["schemaVersion"] == .integer(1), record.fields?["checkpointID"]?.uuid == checkpoint.id,
+        guard record.fields?["schemaVersion"]?.int == version, record.fields?["checkpointID"]?.uuid == checkpoint.id,
               record.fields?["policySignature"]?.text == checkpoint.policySignature,
               record.fields?["episodeID"]?.uuid == input.fields?["episodeID"]?.uuid,
               record.fields?["observationID"]?.uuid == packet.observationID,
@@ -143,6 +143,14 @@ enum PolicyActorValidation {
               sampler.fields?["temperature"]?.double == 1, sampler.fields?["mixture"] == .string("none"),
               before.count == 2, after.count == 2, sampleKey.count == 2, expectedRNG == nil || expectedRNG == before else {
             throw AstraError("inference.collectionIdentity", "The actor's original packet and collection cursor do not describe the same real draw.")
+        }
+        if version == 2 {
+            guard try record.required("controlFeedback").decode(ControlFeedbackSnapshot.self)
+                == input.required("controlFeedback").decode(ControlFeedbackSnapshot.self) else {
+                throw AstraError("inference.feedbackEcho", "The policy's collected queue differs from its original observation.")
+            }
+        } else if record.fields?["controlFeedback"] != nil || input.fields?["controlFeedback"] != nil {
+            throw AstraError("inference.feedbackEcho", "A legacy policy cannot relabel new queued-control evidence.")
         }
         let progress: JSONValue = .object(["schemaVersion": .integer(1), "runID": .string(observation.runID.uuidString.lowercased()),
             "rngStreamID": .string(stream.uuidString.lowercased()), "drawIndex": .unsigned(packet.sequence),

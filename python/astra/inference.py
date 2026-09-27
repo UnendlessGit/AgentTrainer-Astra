@@ -283,6 +283,7 @@ class InferenceSession:
         self._state = self._state_id = self._episode_id = self._key = None
         self._last_cutoff = self._last_event_sequence = self._geometry_revision = None
         self._last_input_nanos = None
+        self._feedback = None
         self._surfaces = None
         self._sequence = 0
         self._observations = deque(maxlen=1024)
@@ -366,7 +367,7 @@ class InferenceSession:
         self._execution = _PolicyExecution(checkpoint.policy, greedy=deterministic)
         return {**self._identity(), "model": checkpoint.manifest["model"], "actions": checkpoint.manifest["actions"],
                 "ringID": ring_id, "ringIDs": ring_ids, "deterministic": deterministic, "collection": collection,
-                "collectionVersion": 1 if collection else None, "rngStreamID": self._rng_stream_id if collection else None,
+                "collectionVersion": (2 if checkpoint.policy.config.schema_version == 3 else 1) if collection else None, "rngStreamID": self._rng_stream_id if collection else None,
                 "resumedActor": resume or resume_collection is not None, "resumedCollection": resume_collection is not None, "nextPacketSequence": self._sequence, "nextDrawIndex": self._draw_index,
                 "actorResetGeneration": self._environment_resets}
 
@@ -410,6 +411,7 @@ class InferenceSession:
         self._checkpoint, self._episode_id, self._contexts, self._key = checkpoint, episode_id, tuple(contexts), key
         self._state, self._state_id, self._needs_reset = None, str(uuid.uuid4()), False
         self._last_input_nanos = None
+        self._feedback = None
         self._last_event_sequence = self._geometry_revision = self._surfaces = None
         self._episode_step = 0
         self._environment_resets += 1
@@ -429,7 +431,7 @@ class InferenceSession:
             raise InferenceError("inference.warmupActive", "Warmup must finish before the first real actor decision")
         fields = ("_state", "_state_id", "_episode_id", "_key", "_last_cutoff", "_last_event_sequence",
                   "_geometry_revision", "_last_input_nanos", "_surfaces", "_sequence", "_contexts", "_needs_reset",
-                  "_draw_index", "_episode_step", "_environment_resets", "_warming")
+                  "_draw_index", "_episode_step", "_environment_resets", "_warming", "_feedback")
         snapshot = {field: getattr(self, field) for field in fields}
         observations = deque(self._observations, maxlen=self._observations.maxlen)
         try:
@@ -446,8 +448,10 @@ class InferenceSession:
         self._run(run_id)
         if self._needs_reset:
             raise InferenceError("inference.resetRequired", "A confirmed environment reset is required before inference")
+        config = self._checkpoint.policy.config
+        extra_fields = ("controlFeedback",) if config.schema_version == 3 else ()
         _fields(payload, ("observationID", "episodeID", "previousStateID", "cutoffNanos", "geometryRevision",
-                          "frames", "controlState", "executedEvents", "intervalCovered", "contextIDs"), ("controlCoverageNanos",))
+                          "frames", "controlState", "executedEvents", "intervalCovered", "contextIDs") + extra_fields, ("controlCoverageNanos",))
         if _uuid(payload["previousStateID"]) != self._state_id or _uuid(payload["episodeID"]) != self._episode_id:
             raise InferenceError("inference.staleState", "This observation does not continue the current actor state")
         observation_id = _uuid(payload["observationID"])
@@ -511,13 +515,22 @@ class InferenceSession:
                 raise InferenceError("inference.causality", "A frame cannot be available before its source timestamp")
             if self._surfaces is not None and surfaces != self._surfaces and geometry == self._geometry_revision:
                 raise InferenceError("inference.geometry", "Changed surface geometry requires a new aggregate revision")
+            extra = {}
+            if config.schema_version == 3:
+                from astra.control_feedback import validate_control_feedback, validate_feedback_continuation
+                feedback = payload['controlFeedback']
+                if not (self._warming and feedback is None):
+                    validate_control_feedback(feedback, cutoff_nanos=cutoff, geometry_revision=geometry,
+                        run_id=self._run_id, surfaces=surfaces, require_available=True)
+                    validate_feedback_continuation(self._feedback, feedback)
+                extra['control_feedback'] = feedback
             first = self._state is None
             elapsed = config.period_ms / 1000 if first else (cutoff - self._last_cutoff) / 1e9
             observation = make_observation(owned, payload["controlState"], cutoff_nanos=cutoff,
                                           elapsed_seconds=elapsed,
                                           reset=first, config=config, context_ids=self._contexts, executed_events=events,
                                           interval_covered=True, surface_preparer=prepare_metal_surface,
-                                          maximum_timestamp=2**64 - 1, last_input_nanos=self._last_input_nanos)
+                                          maximum_timestamp=2**64 - 1, last_input_nanos=self._last_input_nanos, **extra)
             policy = self._checkpoint.policy
             output = self._execution(observation, self._state, self._key)
             # Materialize one complete result tree, including packet fields and
@@ -543,7 +556,7 @@ class InferenceSession:
                         raise InferenceError("inference.collectionState", "Collection requires finite single-actor FP32 recurrent anchors")
                     state_before.append(array[0].tolist())
                 result["collectionRecord"] = {
-                    "schemaVersion": 1, "checkpointID": self._checkpoint.manifest["id"],
+                    "schemaVersion": 2 if config.schema_version == 3 else 1, "checkpointID": self._checkpoint.manifest["id"],
                     "policySignature": self._checkpoint.manifest["policySignature"], "modelSignature": config.signature,
                     "episodeID": self._episode_id, "episodeStep": self._episode_step,
                     "observationID": observation_id, "cutoffNanos": cutoff, "geometryRevision": geometry,
@@ -558,8 +571,12 @@ class InferenceSession:
                         "stateAfter": np.asarray(output["key"]).tolist()},
                     "environmentResets": self._environment_resets,
                 }
+                if config.schema_version == 3:
+                    result["collectionRecord"]["controlFeedback"] = deepcopy(payload['controlFeedback'])
                 if payload.get("controlCoverageNanos") is not None:
                     result["collectionRecord"]["controlCoverageNanos"] = payload["controlCoverageNanos"]
+            if config.schema_version == 3:
+                self._feedback = deepcopy(payload['controlFeedback'])
             self._state, self._key, self._state_id = output["state"], output["key"], next_state_id
             self._last_cutoff, self._last_event_sequence, self._geometry_revision = cutoff, last_event, geometry
             self._last_input_nanos = last_input_nanos
@@ -586,6 +603,7 @@ class InferenceSession:
         self._run_id = self._state_id = self._episode_id = None
         self._last_cutoff = self._last_event_sequence = self._geometry_revision = None
         self._last_input_nanos = None
+        self._feedback = None
         self._surfaces = None
         self._sequence = 0
         self._contexts = ()

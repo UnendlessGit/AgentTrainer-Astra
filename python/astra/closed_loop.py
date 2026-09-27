@@ -88,6 +88,7 @@ def evaluate(checkpoint_path: Path, protocol, *, cancelled=lambda: False, progre
             pixel_height=trial['pixelHeight'], logical_bounds=tuple(trial['logicalBounds']), period_ms=protocol['periodMS'],
             lead_ms=protocol['leadMS'], delay_ms=protocol['delayMS'], cue_ms=protocol['cueMS'], time_limit_ms=protocol['timeLimitMS'], shaping_scale=0)
         env = PracticeEnvironment(environment)
+        if config.schema_version == 3: env.enable_control_feedback()
         if policy.actions.vocabulary != env.action_vocabulary:
             raise ValueError('Checkpoint controls do not match the selected practice task')
         current = env.reset(seed=trial['seed'])
@@ -100,7 +101,8 @@ def evaluate(checkpoint_path: Path, protocol, *, cancelled=lambda: False, progre
                 observed = make_observation([(mx.array(current.pixels), current.metadata)], current.control_state,
                     cutoff_nanos=current.metadata['observedNanos'], elapsed_seconds=config.period_ms / 1000,
                     reset=decisions == 0, config=config, context_ids=tuple(protocol['contextIDs']), executed_events=events,
-                    last_input_nanos=last_input, surface_preparer=prepare_metal_surface)
+                    last_input_nanos=last_input, surface_preparer=prepare_metal_surface,
+                    **({"control_feedback": current.control_feedback} if config.schema_version == 3 else {}))
                 output = execution(observed, state, key); mx.eval(output)
                 if not bool(output['finite'].item()):
                     outcome = 'numerical_fault'; fault = 'Policy returned nonfinite output'; break

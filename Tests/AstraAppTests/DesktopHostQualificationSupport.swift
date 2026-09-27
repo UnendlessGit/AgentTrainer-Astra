@@ -51,6 +51,8 @@ final class HostQualificationControl: @unchecked Sendable {
     private var requests: [UUID: UUID] = [:]
     private var sequence: UInt64 = 1
     private var recorded: [ExecutionReceipt] = []
+    private var feedbackSnapshots: [ControlFeedbackSnapshot] = []
+    private var originalPackets: [ActionPacket] = []
     private var joined = false
     init(events: @escaping ComputeProcess.EventHandler, surfaces: [SurfaceDescriptor]) {
         self.events = events; backend = HostQualificationBackend(surfaces: surfaces)
@@ -60,11 +62,14 @@ final class HostQualificationControl: @unchecked Sendable {
             })
     }
     var receipts: [ExecutionReceipt] { lock.withLock { recorded } }
+    var feedback: [ControlFeedbackSnapshot] { lock.withLock { feedbackSnapshots } }
+    var packets: [ActionPacket] { lock.withLock { originalPackets } }
     var hasJoined: Bool { lock.withLock { joined } }
     var runtime: NativeControlRuntime {
         .init(start: {
             .init(kind: "hello", sequence: 0, payload: .object(["role": .string("control"),
-                "protocolVersion": .integer(1), "initialPacketSequenceVersion": .integer(1)]))
+                "protocolVersion": .integer(1), "initialPacketSequenceVersion": .integer(1),
+                "controlFeedbackVersions": .array([.integer(1)])]))
         }, request: { kind, payload, run, _ in try await self.request(kind, payload, run) }, shutdown: { await self.shutdown() })
     }
     private func request(_ kind: String, _ payload: JSONValue, _ run: UUID) async throws -> WireMessage {
@@ -75,13 +80,30 @@ final class HostQualificationControl: @unchecked Sendable {
             switch kind {
             case "arm":
                 try executor.arm(payload.decode(ArmRequest.self))
-                value = .object(["armed": .bool(true), "nextPacketSequence": .unsigned(executor.nextPacketSequence)])
+                var fields: [String: JSONValue] = ["armed": .bool(true), "nextPacketSequence": .unsigned(executor.nextPacketSequence)]
+                if let epoch = executor.controlEpochID {
+                    fields["controlFeedbackVersion"] = .integer(1); fields["controlEpochID"] = .string(epoch.uuidString)
+                }
+                value = .object(fields)
             case "heartbeat": try executor.heartbeat(runID: run); value = .object(["alive": .bool(true)])
-            case "observation": value = try .encode(executor.observation(afterSequence: payload.fields?["afterSequence"]?.uint64))
+            case "observation":
+                let cursor: ControlFeedbackCursor?
+                if let raw = payload.fields?["feedbackCursor"], raw != .null { cursor = try raw.decode(ControlFeedbackCursor.self) }
+                else { cursor = nil }
+                let observation = try executor.observation(afterSequence: payload.fields?["afterSequence"]?.uint64, feedbackCursor: cursor)
+                if let feedback = observation.controlFeedback {
+                    try lock.withLock {
+                        guard feedbackSnapshots.count < 4096 else { throw AstraError("qualification.feedback", "Generated feedback evidence exceeded its bound.") }
+                        feedbackSnapshots.append(feedback)
+                    }
+                }
+                value = try .encode(observation)
             case "execute":
                 let packet = try payload.decode(ActionPacket.self)
                 lock.withLock { requests[packet.id] = id }
-                try executor.execute(packet); value = .object(["admitted": .bool(true)])
+                try executor.execute(packet)
+                lock.withLock { originalPackets.append(packet) }
+                value = .object(["admitted": .bool(true)])
             case "disarm":
                 executor.disarm(reason: "Virtual native owner requested release.", cause: .requested)
                 try await settle(executor)

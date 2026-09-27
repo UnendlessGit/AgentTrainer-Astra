@@ -38,7 +38,7 @@ class PolicyCore(nn.Module):
 
     def encode_visual(self, observation: ObservationBatch) -> VisualFeatures:
         batch, time = observation.shape
-        flattened = tree_map(lambda value: value.reshape(batch * time, 1, *value.shape[2:]), observation.as_tensors())
+        flattened = tree_map(lambda value: value.reshape(batch * time, 1, *value.shape[2:]), observation.as_tensors(include_queued_control=False))
         chunks = []
         def encode(module, tensors):
             result = module(ObservationBatch.from_tensors(tensors))
@@ -56,7 +56,7 @@ class PolicyCore(nn.Module):
     def __call__(self, observation: ObservationBatch, state: tuple[mx.array, ...] | None = None) -> PolicyEncoding:
         observation.validate_shapes(control_width=self.config.control_width,
                                     maximum_surfaces=self.config.maximum_surfaces,
-                                    contexts=len(self.config.context_sizes))
+                                    contexts=len(self.config.context_sizes), model_schema_version=self.config.schema_version, packet_capacity=self.config.packet_capacity)
         visual = self.encode_visual(observation)
         temporal = self.temporal(visual.summary, observation, state)
         return PolicyEncoding(visual, temporal)

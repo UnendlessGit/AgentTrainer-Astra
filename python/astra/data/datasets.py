@@ -483,7 +483,7 @@ def build_dataset(destination: Path, *, recording_root: Path, selections: list[R
             raise RecordingError("Dataset index exceeds its supported size")
         with (staging / "index.sqlite").open("rb") as stream:
             index_digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        manifest = {"schemaVersion": 3, "maximumFrameAgeMs": MAXIMUM_FRAME_AGE_MS, "id": identifier, "model": config.to_dict(), "actions": vocabulary.to_dict(),
+        manifest = {"schemaVersion": 3, **({"observationSchemaVersion": 2} if config.schema_version == 3 else {}), "maximumFrameAgeMs": MAXIMUM_FRAME_AGE_MS, "id": identifier, "model": config.to_dict(), "actions": vocabulary.to_dict(),
                     "canonicalizerVersion": CANONICALIZER_VERSION, "pointerMode": pointer_mode, "splitSeed": split_seed,
                     "sources": sources, "steps": total, "warnings": warnings, "indexSHA256": index_digest}
         description = _dump(manifest).encode()
@@ -519,6 +519,10 @@ class DatasetReader:
             required = {"schemaVersion", "id", "model", "actions", "canonicalizerVersion", "pointerMode", "splitSeed", "sources", "steps", "warnings", "indexSHA256"}
             if isinstance(manifest, dict) and manifest.get("schemaVersion") == 3:
                 required.add("maximumFrameAgeMs")
+            if isinstance(manifest, dict) and isinstance(manifest.get("model"), dict) and manifest["model"].get("schema_version") == 3:
+                required.add("observationSchemaVersion")
+                if type(manifest.get("observationSchemaVersion")) is not int or manifest["observationSchemaVersion"] != 2:
+                    raise RecordingError("Queue-aware datasets require their explicit observation schema")
             if (not isinstance(manifest, dict) or set(manifest) != required
                 or type(manifest["schemaVersion"]) is not int or manifest["schemaVersion"] not in (1, 2, 3)
                 or manifest["id"] != str(uuid.UUID(self.directory.name))
@@ -751,8 +755,17 @@ class DatasetReader:
                 context = _json(row["context"])
                 if context != list(selection.context_ids) or any(type(value) is not int for value in context):
                     raise RecordingError("Dataset context differs from its immutable source selection")
+                extra = {}
+                if self.config.schema_version == 3:
+                    from astra.control_feedback import exclusion_covers
+                    from .queued_controls import prepare_queued_controls
+                    # Only the sealed exclusion interval certifies no Astra plans.
+                    # Shifted human commands are exclusively supervision targets.
+                    extra['queued_control'] = prepare_queued_controls(None, surfaces, self.config, cutoff_nanos=cutoff,
+                        known_empty=(reader.manifest['status'] == 'complete' and reader.manifest.get('indexPath', 'index.sqlite') == 'index.sqlite'
+                                     and exclusion_covers(reader.manifest.get('controlExclusion'), cutoff)))
                 observation = ObservationBatch(prepared, mx.array(controls)[None, None], mx.array([[self.config.period_ms / 1000]]),
-                                                mx.array(context, dtype=mx.int32)[None, None], mx.array([[row["step"] == 0]]), mx.array([[True]]))
+                                                mx.array(context, dtype=mx.int32)[None, None], mx.array([[row["step"] == 0]]), mx.array([[True]]), **extra)
                 commands = _json(row["commands"])
                 if not isinstance(commands, list):
                     raise RecordingError("Dataset commands must be an ordered packet")

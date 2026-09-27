@@ -126,15 +126,25 @@ class ObservationRecord:
     reset: bool
     last_input_nanos: int | None = None
     control_coverage_nanos: int | None = None
+    control_feedback_json: bytes | None = None
+    observation_schema_version: int = 1
 
     @classmethod
     def capture(cls, observation: EnvironmentObservation, *, events=(), elapsed_seconds: float, reset: bool,
                 last_input_nanos: int | None = None, spool: FrameSpool | None = None):
+        if observation.observation_schema_version == 2:
+            from astra.control_feedback import validate_control_feedback
+            validate_control_feedback(observation.control_feedback, cutoff_nanos=observation.cutoff_nanos,
+                geometry_revision=observation.geometry_revision, surfaces=[frame.metadata['surface'] for frame in observation.frames], require_available=True)
+        elif observation.observation_schema_version != 1 or observation.control_feedback is not None:
+            raise ValueError('Invalid observation schema at immutable capture')
         images = tuple(ObservationImage(spool.append(frame.pixels) if spool is not None else _frozen_array(frame.pixels),
                                         _json(frame.metadata)) for frame in observation.frames)
         record = cls(images, observation.id, observation.episode_id, observation.cutoff_nanos, observation.geometry_revision,
                      _json(observation.control_state), _json(events), elapsed_seconds, reset, last_input_nanos,
-                     observation.control_coverage_nanos)
+                     observation.control_coverage_nanos,
+                     None if observation.control_feedback is None else _json(observation.control_feedback),
+                     observation.observation_schema_version)
         if spool is not None:
             spool.reserve_metadata(record.metadata_byte_count)
         return record
@@ -158,14 +168,24 @@ class ObservationRecord:
 
     @property
     def metadata_byte_count(self):
-        return sum(len(image.metadata_json) + 512 for image in self.images) + len(self.controls_json) + len(self.events_json) + 512
+        return sum(len(image.metadata_json) + 512 for image in self.images) + len(self.controls_json) + len(self.events_json) + len(self.control_feedback_json or b'') + 512
 
     def prepare(self, model, context_ids) -> ObservationBatch:
+        expected_schema = 2 if model.schema_version == 3 else 1
+        if self.observation_schema_version != expected_schema or (expected_schema == 1 and self.control_feedback_json is not None):
+            raise ValueError("Rollout observation schema differs from its original policy")
+        extra = {}
+        if expected_schema == 2:
+            from astra.control_feedback import validate_control_feedback
+            feedback = None if self.control_feedback_json is None else json.loads(self.control_feedback_json)
+            validate_control_feedback(feedback, cutoff_nanos=self.cutoff_nanos, geometry_revision=self.geometry_revision,
+                surfaces=[image.metadata['surface'] for image in self.images], require_available=True)
+            extra['control_feedback'] = feedback
         return make_observation([(image.pixels, image.metadata) for image in self.images], json.loads(self.controls_json),
                                 cutoff_nanos=self.cutoff_nanos, elapsed_seconds=self.elapsed_seconds,
                                 reset=self.reset, config=model, context_ids=context_ids,
                                 executed_events=json.loads(self.events_json), last_input_nanos=self.last_input_nanos,
-                                maximum_timestamp=2**64-1)
+                                maximum_timestamp=2**64-1, **extra)
 
 
 @dataclass(frozen=True)
@@ -299,7 +319,7 @@ class ReinforcementTrainer:
                  config: ReinforcementConfig = ReinforcementConfig(), *, policy_id: str | None = None,
                  context_ids: tuple[int, ...] = (), restored_state: dict | None = None,
                  scratch_directory: Path | None = None):
-        adapter = PracticeAdapter(environment) if isinstance(environment, PracticeEnvironment) else environment
+        adapter = PracticeAdapter(environment, control_feedback=policy.config.schema_version == 3) if isinstance(environment, PracticeEnvironment) else environment
         if not isinstance(policy, AgentPolicy) or not isinstance(adapter, EnvironmentAdapter):
             raise ValueError("This collector requires AgentPolicy and a validated environment adapter")
         adapter.spec.validate()

@@ -94,6 +94,7 @@ private final class MonitorFailure: @unchecked Sendable {
 
 private struct ObservationRequest: Decodable {
     var afterSequence: UInt64?
+    var feedbackCursor: ControlFeedbackCursor?
 }
 
 private actor ControlServer {
@@ -135,6 +136,9 @@ private actor ControlServer {
             case "permissions": payload = try .encode(PermissionSnapshot.current())
             case "arm":
                 let request = try message.payload.decode(ArmRequest.self)
+                guard request.controlFeedbackVersion == nil || request.controlFeedbackVersion == ControlFeedbackLimits.version else {
+                    throw AstraError("control.feedbackVersion", "The helper does not support the requested queued-control feedback.")
+                }
                 guard message.runID == request.runID else { throw AstraError("control.session", "Arm request identity does not match its envelope.") }
                 guard executor.currentRunID == nil, protection == nil else { throw AstraError("control.busy", "Disarm the current control run before arming another.") }
                 guard let recovery = request.recovery, recovery.runID == request.runID else {
@@ -181,10 +185,14 @@ private actor ControlServer {
                     try monitoring.check()
                     throw error
                 }
-                payload = .object(["armed": .bool(true), "leaseNanos": .unsigned(ControlLease.durationNanos),
+                var fields: [String: JSONValue] = ["armed": .bool(true), "leaseNanos": .unsigned(ControlLease.durationNanos),
                                    "nextPacketSequence": .unsigned(executor.nextPacketSequence),
                                    "recoveryLedgerID": .string(journal.descriptor.ledgerID.uuidString),
-                                   "guardianPID": .integer(Int64(pair.guardianPID))])
+                                   "guardianPID": .integer(Int64(pair.guardianPID))]
+                if let epoch = executor.controlEpochID {
+                    fields["controlFeedbackVersion"] = .integer(1); fields["controlEpochID"] = .string(epoch.uuidString)
+                }
+                payload = .object(fields)
             case "heartbeat":
                 guard let runID = message.runID else { throw AstraError("control.session", "Heartbeat requires a run identity.") }
                 try executor.heartbeat(runID: runID); payload = .object(["alive": .bool(true)])
@@ -205,7 +213,20 @@ private actor ControlServer {
                     throw AstraError("control.session", "Input observation requires the active control run.")
                 }
                 let request = try message.payload.decode(ObservationRequest.self)
-                payload = try .encode(executor.observation(afterSequence: request.afterSequence))
+                let observation = try executor.observation(afterSequence: request.afterSequence, feedbackCursor: request.feedbackCursor)
+                payload = try .encode(observation)
+                if let feedback = observation.controlFeedback {
+                    do {
+                        guard try JSONEncoder().encode(feedback).count <= ControlFeedbackLimits.maximumBytes else {
+                            throw AstraError("control.feedbackCapacity", "Queued-control evidence exceeded its byte reservation.")
+                        }
+                        // Check the combined message, not only its feedback part.
+                        _ = try WireMessage(kind: "ack", sequence: UInt64.max, requestID: message.requestID, runID: runID, payload: payload).framed()
+                    } catch {
+                        executor.requestDisarm(reason: "Queued-control observation exceeded its transport budget.")
+                        throw error
+                    }
+                }
             case "state": payload = .object(["state": try .encode(executor.state()), "cleanupSettled": .bool(executor.cleanupSettled)])
             case "shutdown":
                 executor.requestDisarm(reason: "Control helper shutdown.", cause: .shutdown); await monitor.stop()
@@ -258,6 +279,7 @@ private actor ControlServer {
             let server = try ControlServer(output: output)
             output.send("hello", .object(["role": .string("control"), "protocolVersion": .integer(1), "recoveryVersion": .integer(1),
                 "initialPacketSequenceVersion": .integer(1),
+                "controlFeedbackVersions": .array([.integer(1)]),
                 "capabilities": .array(["ping", "permissions", "arm", "heartbeat", "execute", "disarm", "observation", "state", "shutdown"].map(JSONValue.string))]))
             let sleep = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { @Sendable _ in
                 server.stopImmediately(reason: "The Mac is going to sleep.", cause: .sleep)

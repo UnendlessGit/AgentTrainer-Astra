@@ -119,6 +119,8 @@ def read_prelude(directory: Path, descriptor: dict) -> dict:
         first = previous = None
         surfaces = None
         retained = 0
+        previous_feedback = None
+        has_feedback = None
         from .environments.interface import control_observation, EnvironmentError
         for row in rows:
             if type(row) is not dict or set(row) != {'actorInput', 'frames'}:
@@ -126,7 +128,7 @@ def read_prelude(directory: Path, descriptor: dict) -> dict:
             observed = row['actorInput']
             required = {'observationID', 'episodeID', 'previousStateID', 'cutoffNanos', 'geometryRevision',
                         'controlState', 'executedEvents', 'intervalCovered', 'contextIDs'}
-            if type(observed) is not dict or not required <= set(observed) or set(observed) - required - {'controlCoverageNanos'}:
+            if type(observed) is not dict or not required <= set(observed) or set(observed) - required - {'controlCoverageNanos', 'controlFeedback'}:
                 raise RecordingError('Correction observation does not contain original actor input')
             identifier = _uuid(observed['observationID']); _uuid(observed['episodeID']); _uuid(observed['previousStateID'])
             cutoff = _integer(observed['cutoffNanos']); _integer(observed['geometryRevision'])
@@ -186,6 +188,24 @@ def read_prelude(directory: Path, descriptor: dict) -> dict:
                 row_surfaces.append(metadata['surface'])
             if len({surface['id'] for surface in row_surfaces}) != len(row_surfaces) or surfaces is not None and row_surfaces != surfaces:
                 raise RecordingError('Correction pre-roll source membership or geometry changed')
+            supplied_feedback = 'controlFeedback' in observed
+            if has_feedback is not None and has_feedback != supplied_feedback:
+                raise RecordingError('Correction pre-roll changed its queued-control schema')
+            has_feedback = supplied_feedback
+            if supplied_feedback:
+                from .control_feedback import ControlFeedbackError, validate_control_feedback, validate_feedback_continuation
+                try:
+                    feedback = observed['controlFeedback']
+                    validate_control_feedback(feedback, cutoff_nanos=cutoff, geometry_revision=observed['geometryRevision'],
+                        run_id=value['sourceRunID'], surfaces=row_surfaces, require_available=True)
+                    if observed.get('controlCoverageNanos') != cutoff:
+                        raise RecordingError('Correction queued controls lack same-cutoff actual-control coverage')
+                    # A bounded prelude may start mid-epoch, after older cursor acknowledgements.
+                    if previous_feedback is not None:
+                        validate_feedback_continuation(previous_feedback, feedback)
+                    previous_feedback = feedback
+                except ControlFeedbackError as error:
+                    raise RecordingError(str(error)) from error
             surfaces = row_surfaces; previous = cutoff
         position = 0
         for block in sorted(blocks.values(), key=lambda block: block['offset']):

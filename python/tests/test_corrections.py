@@ -1,5 +1,6 @@
 """Correction labels start at the explicit gate; agent lead-up stays review-only."""
 import hashlib
+from copy import deepcopy
 import json
 import struct
 import uuid
@@ -41,6 +42,31 @@ def write_prelude(source, prelude):
     manifest = json.loads((source / 'manifest.json').read_bytes())
     manifest['correction'] = {'schemaVersion': 1, 'path': 'correction/prelude.json', 'sha256': hashlib.sha256(data).hexdigest()}
     (source / 'manifest.json').write_text(json.dumps(manifest))
+
+
+def test_queued_correction_suffix_retains_original_feedback_without_expert_features(tmp_path):
+    source = _recording(tmp_path / 'sources', [_frame('front', time, time) for time in (0, 20, 40, 60, 80)], roles=['front'])
+    prelude = add_correction(source)
+    first = prelude['observations'][0]['actorInput']
+    cutoff = first['cutoffNanos']
+    packet = dict(id=str(uuid.uuid4()), runID=prelude['sourceRunID'], sequence=10,
+        observationID=str(uuid.uuid4()), geometryRevision=1, executeAtNanos=20 * MS, durationMs=100, commands=[])
+    feedback = dict(version=1, controlEpochID=str(uuid.uuid4()), runID=prelude['sourceRunID'], geometryRevision=1,
+        cutoffNanos=cutoff, coverageNanos=cutoff, acknowledgedThrough=2, throughSequence=2, changes=[],
+        packets=[dict(packet=packet, admissionSequence=2, admittedNanos=5 * MS, progress=[])])
+    first['controlFeedback'] = feedback; first['controlCoverageNanos'] = cutoff
+    second = deepcopy(prelude['observations'][0]); observed = second['actorInput']
+    observed.update(observationID=str(uuid.uuid4()), cutoffNanos=15 * MS, controlCoverageNanos=15 * MS)
+    observed['controlFeedback'].update(cutoffNanos=15 * MS, coverageNanos=15 * MS)
+    prelude['observations'].append(second); write_prelude(source, prelude)
+    with RecordingReader(source) as recording:
+        assert recording.correction['observations'][0]['actorInput']['controlFeedback'] == feedback
+    # A retained suffix may begin after earlier acknowledgements, but cannot
+    # revise its original outstanding plan on the next cut.
+    observed['controlFeedback']['packets'][0]['packet']['executeAtNanos'] += 1
+    write_prelude(source, prelude)
+    with pytest.raises(RecordingError, match='changed'):
+        RecordingReader(source)
 
 
 def test_correction_gate_applies_to_dataset_and_prefix_is_review_only(tmp_path):

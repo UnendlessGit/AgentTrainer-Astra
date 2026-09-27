@@ -26,6 +26,7 @@ import AstraCore
         try await store.saveCheckpoint(initial)
         let multiple = environment["ASTRA_HOST_QUALIFICATION_MULTI_SURFACE"] == "1"
         let liveValues = environment["ASTRA_HOST_QUALIFICATION_LIVE_VALUES"] == "1"
+        let queuedControl = environment["ASTRA_HOST_QUALIFICATION_QUEUED_CONTROL"] == "1"
         let capture = HostQualificationCapture(multiSurface: multiple), owner = NativeControlOwner()
         let controls = HostQualificationControls(surfaces: capture.surfaces)
         let processes = HostQualificationProcesses(executable: bundle.bundleURL.appendingPathComponent("Contents/Helpers/AstraCompute.app/Contents/MacOS/AstraCompute"))
@@ -76,7 +77,7 @@ import AstraCore
             try #require(snapshot.agents.first?.selectedCheckpointID == saved.id)
             try #require(snapshot.learningRuns.contains { $0.checkpointID == saved.id && $0.status == .completed })
             try #require(readyConfirmations >= 2 && owner.priorCleanupJoined && capture.hasJoined)
-            if !multiple && !liveValues {
+            if !multiple && !liveValues && !queuedControl {
                 let previousChildren = controls.all.count
                 options.initialCheckpointID = saved.id; options.resume = true; options.iterations = 2
                 try host.start(agent: agent, source: capture.source, program: program, options: options)
@@ -90,11 +91,17 @@ import AstraCore
             try #require(owner.priorCleanupJoined && controls.all.allSatisfy { $0.hasJoined && $0.backend.clean })
             try #require(capture.hasJoined && capture.produced > 0)
             let ended = await processes.statuses()
-            let expectedWorkers = multiple || liveValues ? 1 : 2
+            let expectedWorkers = multiple || liveValues || queuedControl ? 1 : 2
             try #require(ended["actor"]?.count == expectedWorkers && ended["collector"]?.count == expectedWorkers)
             try #require(ended.values.flatMap { $0 }.allSatisfy { $0 == 0 })
             let executed = controls.all.flatMap(\.receipts).filter { $0.status == .executed }
             try #require(!executed.isEmpty && controls.all.reduce(0) { $0 + $1.backend.posted } > 0)
+            if queuedControl {
+                let feedback = controls.all.flatMap(\.feedback)
+                try #require(!feedback.isEmpty && feedback.contains { !$0.packets.isEmpty })
+                try #require(Set(feedback.map(\.controlEpochID)).count >= 2)
+                try #require(controls.all.flatMap(\.packets).allSatisfy { $0.durationMs == 100 })
+            }
             if let telemetry {
                 try #require(telemetry.issue == nil, "Generated telemetry: \(telemetry.issue ?? "")")
                 try #require(Set(telemetry.receipts.compactMap { $0.fields?["bindingID"]?.uuid }).count >= 2)
@@ -110,7 +117,10 @@ import AstraCore
         let sourceFrames = try capture.metadata.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) }
         let sourceSurfaces = try capture.surfaces.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) }
         let report: [String: Any] = ["completed": failure == nil, "issue": failure ?? NSNull(),
-            "multiSurface": multiple, "liveValues": liveValues, "sourceFrames": sourceFrames, "sourceSurfaces": sourceSurfaces,
+            "multiSurface": multiple, "liveValues": liveValues, "queuedControl": queuedControl,
+            "controlFeedbackSnapshots": try JSONSerialization.jsonObject(with: JSONEncoder().encode(controls.all.flatMap(\.feedback))),
+            "submittedPackets": try JSONSerialization.jsonObject(with: JSONEncoder().encode(controls.all.flatMap(\.packets))),
+            "sourceFrames": sourceFrames, "sourceSurfaces": sourceSurfaces,
             "liveSignalID": liveValues ? score.id.uuidString.lowercased() : NSNull(),
             "telemetryReceipts": try JSONSerialization.jsonObject(with: JSONEncoder().encode(telemetry?.receipts ?? [])),
             "telemetryJoined": telemetry?.hasJoined ?? true,

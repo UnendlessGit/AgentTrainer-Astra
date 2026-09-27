@@ -14,6 +14,7 @@ struct ReinforcementOptions: Sendable {
     var periodMS = 100
     var leadMS = 100
     var packetCapacity = 16
+    var queuedActionMemory = false
     var rolloutDecisions = 512
     var epochs = 4
     var sequenceLength = 64
@@ -55,8 +56,10 @@ struct ReinforcementOptions: Sendable {
     }
 
     var model: JSONValue {
-        contextVocabulary.applying(to: .object(["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
-                 "packet_capacity": .integer(Int64(packetCapacity))]))
+        var fields: [String: JSONValue] = ["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
+            "packet_capacity": .integer(Int64(packetCapacity))]
+        if queuedActionMemory { fields["schema_version"] = .integer(3) }
+        return contextVocabulary.applying(to: .object(fields))
     }
     var actions: JSONValue {
         .object(["keyCodes": .array((task == "delayed_memory" ? [123, 124] : []).map { .integer(Int64($0)) }),
@@ -245,6 +248,7 @@ struct PracticeReinforcementTrainingView: View {
                                 if options.task == "pointing" { numberField("Distance shaping", value: $options.shapingScale) }
                                 TextField("Experiment seed", value: $options.seed, format: .number.grouping(.never)).textFieldStyle(.roundedBorder)
                                 if options.initialCheckpointID == nil {
+                                    QueuedActionMemoryOption(enabled: $options.queuedActionMemory)
                                     Picker("Decision rate", selection: $options.periodMS) { Text("10 Hz").tag(100); Text("20 Hz").tag(50) }
                                     Stepper("Execution lead: \(options.leadMS) ms", value: $options.leadMS, in: 0...2000, step: 5)
                                     Picker("Commands per decision", selection: $options.packetCapacity) {

@@ -20,6 +20,7 @@ public struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
     /// Fixed model-role order for this recording; absent in legacy single-source files.
     public var surfaceIDs: [String]?
     public var correction: CorrectionReference?
+    public var controlExclusion: RecordingControlExclusion?
     /// Recovery publishes a new index without altering the original source
     /// database or its WAL. Nil is the original `index.sqlite` location.
     public var indexPath: String?
@@ -56,6 +57,13 @@ public struct RecordingManifest: Codable, Hashable, Identifiable, Sendable {
         }
         if status == .complete, frameCount == 0 || firstInvalidObservedNanos != nil || issue != nil {
             throw AstraError("recording.completion", "A complete recording must contain frames and have no invalid interval.")
+        }
+        _ = try controlExclusion?.validated(recordingID: id)
+        if let proof = controlExclusion {
+            guard firstObservedNanos.map({ $0 >= proof.startedNanos }) ?? true,
+                  proof.throughNanos.map({ through in stoppedNanos.map { through <= $0 } ?? (status == .recording) }) ?? true else {
+                throw AstraError("recording.controlExclusion", "Control-exclusion evidence lies outside its recording interval.")
+            }
         }
         _ = try correction?.validated()
         _ = try indexComponents()
@@ -264,6 +272,9 @@ enum RecordingRecovery {
         try RecordingFiles.createSchema(database)
         var manifest = original
         manifest.frameCount = 0; manifest.eventCount = 0; manifest.storedBytes = 0; manifest.firstObservedNanos = nil
+        if var proof = manifest.controlExclusion {
+            proof.throughNanos = nil; proof.producersJoinedNanos = nil; manifest.controlExclusion = proof
+        }
         var issues = initialIssues
         var latestObserved: UInt64 = 0
         var inputThrough: UInt64?
@@ -447,7 +458,8 @@ public final class RecordingWriter: @unchecked Sendable {
     public init(directory: URL, manifest: RecordingManifest) throws {
         let value = try manifest.validated()
         guard value.status == .recording, value.frameCount == 0, value.eventCount == 0,
-              value.firstInvalidObservedNanos == nil, value.issue == nil, value.indexPath == nil else {
+              value.firstInvalidObservedNanos == nil, value.issue == nil, value.indexPath == nil,
+              value.controlExclusion == nil else {
             throw AstraError("recording.initialState", "A new recording must begin with an empty manifest.")
         }
         self.directory = directory; self.manifest = value
@@ -469,6 +481,31 @@ public final class RecordingWriter: @unchecked Sendable {
     }
 
     public var snapshot: RecordingManifest { lock.withLock { manifest } }
+
+    public func beginControlExclusion(_ proof: RecordingControlExclusion) throws {
+        try lock.withLock {
+            try requireAccepting()
+            _ = try proof.validated(recordingID: manifest.id)
+            guard manifest.controlExclusion == nil, manifest.frameCount == 0, manifest.eventCount == 0,
+                  pendingFrames.isEmpty, pendingEvents.isEmpty, proof.throughNanos == nil else {
+                throw AstraError("recording.controlExclusion", "Acquire recording exclusion before admitting frames or input events.")
+            }
+            manifest.controlExclusion = proof
+            try RecordingFiles.writeManifest(manifest, in: directory)
+        }
+    }
+    public func sealControlExclusion(ownershipID: UUID, through: UInt64, producersJoined: UInt64) throws {
+        try lock.withLock {
+            try requireOpen()
+            guard var proof = manifest.controlExclusion, proof.ownershipID == ownershipID, proof.throughNanos == nil else {
+                throw AstraError("recording.controlExclusion", "This exclusion interval is missing, already sealed or belongs to another owner.")
+            }
+            proof.throughNanos = through; proof.producersJoinedNanos = producersJoined
+            manifest.controlExclusion = try proof.validated(recordingID: manifest.id)
+            // This is published with the final frame/index/manifest seal. A
+            // crash before that seal cannot convert an unfinished proof to empty.
+        }
+    }
 
     public func attachCorrection(_ seed: CorrectionRecordingSeed, supervisionStartNanos: UInt64) throws {
         try lock.withLock {

@@ -7,7 +7,7 @@ atomic rename; no reader observes an incomplete checkpoint or overwritten ID.
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -226,6 +226,40 @@ class LoadedCheckpoint:
     manifest: dict
     policy: AgentPolicy
     training_state: Any
+
+
+def add_queued_control(source: Path, destination: Path, *, seed: int = 0,
+                       cancelled=lambda: False) -> dict:
+    """Explicit architectural warm start; never an optimizer/actor resumption."""
+    if type(seed) is not int or not 0 <= seed < 2**63:
+        raise CheckpointError("The initialization seed must be a nonnegative integer")
+    loaded = load_checkpoint(source)
+    if loaded.policy.config.schema_version != 2:
+        raise CheckpointError("This checkpoint already has queued action memory")
+    random_state = list(mx.random.state)
+    try:
+        mx.random.seed(seed)
+        policy = AgentPolicy(replace(loaded.policy.config, schema_version=3), loaded.policy.actions.vocabulary)
+        original = dict(tree_flatten(loaded.policy.parameters()))
+        expanded = dict(tree_flatten(policy.parameters()))
+        added = expanded.keys() - original.keys()
+        if (not added or any(not name.startswith("temporal.queued_control.") for name in added)
+                or not original.keys() <= expanded.keys()
+                or any(original[name].shape != expanded[name].shape for name in original)):
+            raise CheckpointError("The queued-control warm start changed existing parameter shapes")
+        policy.load_weights(list(original.items()), strict=False)
+        _restore_frozen_parameters(policy, loaded.manifest["frozenParameters"])
+        mx.eval(policy.parameters())
+        if cancelled():
+            raise InterruptedError("Queued action initialization cancelled before publication")
+        return save_checkpoint(destination, policy, kind="initial", step=0, parent_id=loaded.manifest["id"],
+            training_config={"initialSeed": seed, "warmStart": {
+                "kind": "add_queued_control_v1", "sourceCheckpointID": loaded.manifest["id"],
+                "sourcePolicySignature": loaded.manifest["policySignature"],
+                "sourcePolicySHA256": loaded.manifest["artifacts"]["policy.safetensors"]["sha256"],
+                "optimizerAndActorStateRetained": False}})
+    finally:
+        restore_mlx_random_state(random_state)
 
 
 def save_checkpoint(destination: Path, policy: AgentPolicy, *, kind: str, step: int,

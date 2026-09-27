@@ -1,6 +1,6 @@
 # Proposed three-seed GRU loss/clipping comparison
 
-Status: implemented; matched campaign running as recorded below. No production defaults changed. This is the next bounded optimization diagnosis after [the exposure pilot](gru-exposure-diagnosis.md), not a repeat of the shallow 192-update screen and not a queued-control experiment.
+Status: completed; see [matched results and limitations](gru-loss-clipping-results.md). No production defaults changed. This is the next bounded optimization diagnosis after [the exposure pilot](gru-exposure-diagnosis.md), not a repeat of the shallow 192-update screen and not a queued-control experiment.
 
 ## Question
 
@@ -57,4 +57,4 @@ Default inputs refer to the retained private generated studies; explicit CLI pat
 
 The runner records per-update loss, exact pair identities/exposures, pre/post-clip and module gradient norms, clip multipliers and cue-summary gradients. Evaluations retain full-packet correct/wrong factors and separate actual greedy/two-sampled packet outcomes. These packets run through the real isolated practice scheduler **after a passive readiness history**, followed only by empty packets; they do not represent autonomous waiting behavior. Unused return rasters are cached during physics stepping, and the true readiness raster, control state and oracle label are checked against the ranked source before execution. No clock/state jump or future policy input is substituted.
 
-The active campaign is `.local/gru-loss-clipping-2026-09-27`. Its CPU audit verified 384 episodes and 384 visual entries (2,931,607,680 bytes), including 53,888 preparatory decisions / 384 supervised packets. Independent initial checkpoints and a real one-update 835 save/resume/readout check were completed before sustained training. The matched campaign was then explicitly authorized; results are pending until complete endpoints have been evaluated. Reserved test layouts remain untouched and production defaults remain unchanged.
+The active campaign is `.local/gru-loss-clipping-2026-09-27`. Its CPU audit verified 384 episodes and 384 visual entries (2,931,607,680 bytes), including 53,888 preparatory decisions / 384 supervised packets. Independent initial checkpoints and a real one-update 835 save/resume/readout check were completed before sustained training. The matched campaign was then explicitly authorized; all nine matched endpoints have now been evaluated; see the separate results document. Reserved test layouts remain untouched and production defaults remain unchanged.

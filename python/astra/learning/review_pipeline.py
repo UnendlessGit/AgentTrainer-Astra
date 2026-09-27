@@ -96,7 +96,7 @@ def publish_review_projection(working, destination, binding, rollout):
 
 def validate_manifest_extension(manifest):
     fields(manifest, ('schemaVersion','id','status','binding','actorProgress','controlClosureKnown','artifacts',
-        'actorSampling','rolloutID','decisions','collectionSeconds','reason','behaviorBatchID','reviewSource','revisionChain'))
+        'actorSampling','rolloutID','decisions','collectionSeconds','reason','behaviorBatchID','reviewSource','revisionChain'), ('observationSchemaVersion',))
     binding = manifest['binding']
     if binding['purpose'] != 'retrospective' or uuid_key(manifest['behaviorBatchID']) != uuid_key(binding['behaviorBatchID']):
         raise EnvironmentError('Review package behavior identity mismatch')
@@ -211,7 +211,7 @@ def materialize(source_path, manifest_sha256, revision_directory, references, de
 def validate_derived(path, manifest):
     """Re-derive the only allowed modification before learner consumption."""
     source_ref=manifest['reviewSource'];original,source=verified_source(source_ref['path'],source_ref['manifestSHA256'])
-    if any(manifest[key]!=original[key] for key in ('binding','actorProgress','controlClosureKnown','actorSampling','rolloutID','decisions','collectionSeconds','behaviorBatchID')):
+    if manifest.get('observationSchemaVersion') != original.get('observationSchemaVersion') or any(manifest[key]!=original[key] for key in ('binding','actorProgress','controlClosureKnown','actorSampling','rolloutID','decisions','collectionSeconds','behaviorBatchID')):
         raise EnvironmentError('Reviewed input changed immutable behavior identity')
     for name in (*SOURCE_FILES,*REVIEW_FILES):
         if name!='decisions.ndjson' and manifest['artifacts'][name]!=original['artifacts'][name]:

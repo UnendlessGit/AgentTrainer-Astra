@@ -7,6 +7,7 @@ import mlx.core as mx
 from astra.model.actions import PacketBatch
 from astra.model.config import ModelConfig
 from astra.model.observation import ObservationBatch, SurfaceBatch
+from astra.model.queued_control import QueuedControlBatch
 from astra.model.vision import VisualFeatures, position_features
 from .actions import encode_commands
 
@@ -76,6 +77,15 @@ def stack_observations(rows: Sequence[Sequence[ObservationBatch]]) -> Observatio
         result.append(SurfaceBatch(**images, **rectangles, **other))
     fields = {name: mx.stack([getattr(sample, name)[0, 0] for sample in flat]).reshape(batch, time, *getattr(flat[0], name).shape[2:])
               for name in ("controls", "elapsed_seconds", "context_ids", "reset", "valid")}
+    queues = [sample.queued_control for sample in flat]
+    if any(queue is not None for queue in queues):
+        if any(queue is None for queue in queues):
+            raise ValueError("A batch cannot mix legacy and queued-control observation schemas")
+        # Each sample retains its fixed packet/command prefixes; stacking only
+        # adds B,T axes and never reconstructs feedback from teacher packets.
+        fields["queued_control"] = QueuedControlBatch(**{
+            name: mx.stack([getattr(queue, name)[0, 0] for queue in queues]).reshape(batch, time, *getattr(queues[0], name).shape[2:])
+            for name in QueuedControlBatch.__dataclass_fields__})
     return ObservationBatch(tuple(result), **fields)
 
 
@@ -116,7 +126,8 @@ def training_batch(rows: Sequence[Sequence[LearningSample | None]], config: Mode
     rows = [row[:last_active + 1] for row in rows]
     from dataclasses import replace
     template = examples[0].observation
-    padding = replace(template, valid=mx.zeros((1, 1), dtype=mx.bool_), reset=mx.zeros((1, 1), dtype=mx.bool_))
+    padding = replace(template, valid=mx.zeros((1, 1), dtype=mx.bool_), reset=mx.zeros((1, 1), dtype=mx.bool_),
+                      queued_control=None if template.queued_control is None else QueuedControlBatch.empty(1, 1, config.packet_capacity))
     observation = stack_observations([[sample.observation if sample is not None else padding for sample in row] for row in rows])
     layout = pointing_layout(observation)
     packets = []

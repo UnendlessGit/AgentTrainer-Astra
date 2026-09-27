@@ -148,12 +148,14 @@ struct InferencePolicyDetails: Sendable {
     let capacity: Int
     let capabilities: ActionCapabilities
     let contextSizes: [Int]
+    let controlFeedbackVersion: Int?
+    var collectionVersion: Int { controlFeedbackVersion == nil ? 1 : 2 }
 
     init(_ payload: JSONValue, checkpoint: CheckpointDocument, runID: UUID, ringID: UUID) throws {
         guard payload.fields?["runID"]?.uuid == runID, payload.fields?["checkpointID"]?.uuid == checkpoint.id,
               payload.fields?["policySignature"]?.text == checkpoint.policySignature,
               payload.fields?["ringID"]?.uuid == ringID, let model = payload.fields?["model"]?.fields,
-              model["schema_version"]?.int == 2, let period = model["period_ms"]?.int, (1...1000).contains(period),
+              let schema = model["schema_version"]?.int, [2, 3].contains(schema), let period = model["period_ms"]?.int, (1...1000).contains(period),
               let lead = model["lead_ms"]?.int, (1...2000).contains(lead),
               let capacity = model["packet_capacity"]?.int, [16, 32, 64].contains(capacity),
               case .array(let contexts) = model["context_sizes"], contexts.count <= 32,
@@ -163,6 +165,10 @@ struct InferencePolicyDetails: Sendable {
         capabilities = try payload.required("actions").decode(ActionCapabilities.self)
         guard !capabilities.isEmpty else { throw AstraError("inference.controls", "This checkpoint has no controls available to execute.") }
         periodMS = period; leadMS = lead; self.capacity = capacity; contextSizes = contexts.compactMap(\.int)
+        controlFeedbackVersion = schema == 3 ? 1 : nil
+        if schema == 3, (lead + period - 1) / period + 1 > 32 {
+            throw AstraError("inference.queueTiming", "This model's execution lead and decision rate require more than 32 outstanding packets. Create a model with a shorter lead or slower decision rate for desktop control.")
+        }
     }
 }
 
@@ -441,13 +447,14 @@ struct InferencePolicyDetails: Sendable {
                                      wholeDesktop: source.kind == .desktop, stopOnPhysicalInput: true, geometryRevision: geometryRevision)
             try checkRunning()
             let configuration = try NativeControlConfiguration(runID: run, scope: scope, capabilities: details.capabilities,
-                packetCapacity: details.capacity, recoveryDirectory: directory)
+                packetCapacity: details.capacity, controlFeedbackVersion: details.controlFeedbackVersion, recoveryDirectory: directory)
             let control = makeControl(configuration: configuration); self.control = control
             _ = try await control.start()
             try checkRunning()
             phase = "Agent running · move the pointer or press a key to take over"
             var nextDecision = MonotonicClock.now
             var lastEventSequence: UInt64?
+            var lastFeedbackSequence: UInt64?
             while true {
                 try checkRunning()
                 try await sleep(until: nextDecision)
@@ -458,7 +465,7 @@ struct InferencePolicyDetails: Sendable {
                 guard images.map(\.metadata.surface) == initialSurfaces else {
                     throw AstraError("inference.geometryChanged", "The environment changed size or position. Select the environment again before restarting.")
                 }
-                let observed = try await observation(control, after: lastEventSequence)
+                let observed = try await observation(control, after: lastEventSequence, afterFeedback: lastFeedbackSequence)
                 try checkRunning()
                 let begin = MonotonicClock.now
                 let sink = collectionSink, correctionBuffer = correctionBuffer
@@ -487,7 +494,7 @@ struct InferencePolicyDetails: Sendable {
                 }
                 let submitted = try await control.submit(packet)
                 guard submitted.admitted else { throw AstraError("inference.admission", "The control helper did not admit the action packet.") }
-                decisions += 1; lastEventSequence = observed.lastSequence
+                decisions += 1; lastEventSequence = observed.lastSequence; lastFeedbackSequence = observed.controlFeedback?.throughSequence
                 let addition = observed.cutoffNanos.addingReportingOverflow(UInt64(details.periodMS) * 1_000_000)
                 guard !addition.overflow else { throw AstraError("inference.clock", "The decision clock is exhausted.") }
                 nextDecision = addition.partialValue
@@ -548,10 +555,10 @@ struct InferencePolicyDetails: Sendable {
         throw AstraError("inference.captureTimeout", "The selected environment did not produce a frame in time.")
     }
 
-    private func observation(_ control: NativeControlSession, after: UInt64?) async throws -> AstraPlatform.ControlObservation {
+    private func observation(_ control: NativeControlSession, after: UInt64?, afterFeedback: UInt64?) async throws -> AstraPlatform.ControlObservation {
         let deadline = MonotonicClock.now + 20_000_000
         while true {
-            let value = try await control.observation(afterSequence: after)
+            let value = try await control.observation(afterSequence: after, afterFeedbackSequence: afterFeedback)
             guard value.intervalCovered, value.cutoffNanos <= MonotonicClock.now, value.controlState.observedNanos <= value.cutoffNanos, value.controlState.pointer.isFinite,
                   value.executedEvents.count <= 2048 else { throw AstraError("inference.inputCoverage", "Executed input history is unavailable or incomplete.") }
             var previous = after

@@ -116,6 +116,7 @@ class PracticeObservation:
     metadata: dict  # exact native FrameMetadata, no task answer/layout fields
     control_state: dict  # exact native ControlState
     episode_id: str
+    control_feedback: dict | None = None
 
     @property
     def frame_metadata(self) -> dict:
@@ -146,6 +147,7 @@ class _Scheduled:
     command: dict = field(compare=False)
     reference: tuple[int, int] | None = field(compare=False)
     provenance: str = field(compare=False)
+    semantic_index: int = field(compare=False, default=0)
 
 
 class PracticeEnvironment:
@@ -178,6 +180,20 @@ class PracticeEnvironment:
         self._serial = 0
         self._reset_count = 0
         self.current_seed: int | None = None
+        self._feedback_run_id = None
+        self._feedback = None
+        self._feedback_ends = []
+        self._feedback_packet_ids = {}
+        self._feedback_delivered = None
+        self._observation_id = None
+
+    def enable_control_feedback(self, run_id: str | None = None):
+        """Opt in before reset; legacy simulator timing/config signatures stay exact."""
+        if self._outcome == "continuing":
+            raise PracticeError("Queued control requires a fresh practice episode")
+        from astra.environments.interface import identifier
+        self._feedback_run_id = identifier(run_id or str(uuid.uuid4()))
+        return self
 
     @property
     def action_vocabulary(self) -> ActionVocabulary:
@@ -209,6 +225,10 @@ class PracticeEnvironment:
         self._episode_id = str(uuid.uuid4())
         self._outcome = "continuing"
         self._pending.clear(); self._commands.clear()
+        self._feedback_ends.clear(); self._feedback_packet_ids.clear(); self._feedback_delivered = None
+        if self._feedback_run_id is not None:
+            from .practice_feedback import PracticePacketLedger
+            self._feedback = PracticePacketLedger(self._feedback_run_id)
         self._keys.clear(); self._buttons.clear()
         self._revision = 0; self._event_sequence = 0; self._packet_sequence = 0; self._serial = 0
         x, y, width, height = self.config.logical_bounds
@@ -261,15 +281,30 @@ class PracticeEnvironment:
                 if op == "pointerAbsolute":
                     if command["surfaceID"] != "practice" or any(not 0 <= command[name] < 1 for name in names):
                         raise PracticeError("Absolute pointer exceeds the observed surface")
-                elif any(abs(command[name]) > 32768 or command[name] != int(command[name]) for name in names):
+                elif any(abs(command[name]) > 32768 or command[name] != int(command[name]) or
+                         (self._feedback_run_id is not None and command[name] > 32767) for name in names):
                     raise PracticeError("Relative pointer requires bounded integer raw counts")
             result.append(copy.deepcopy(command))
         return result
 
-    def _schedule(self, commands: list[dict], provenance: str) -> None:
+    def _schedule(self, commands: list[dict], provenance: str, context=None) -> None:
         packet = self._packet_sequence
-        self._packet_sequence += 1
         start = self._now + self.config.lead_ms * 1_000_000
+        if self._feedback is not None:
+            if context is not None:
+                context.validate()
+                if (context.run_id != self._feedback_run_id or context.episode_id != self._episode_id or
+                        context.observation_id != self._observation_id or context.cutoff_nanos != self._now or context.geometry_revision != 0):
+                    raise PracticeError("Practice queued packet does not bind the current observation")
+            identity = context.packet_id if context is not None else str(uuid.uuid4())
+            original = {"id": identity, "runID": self._feedback_run_id, "sequence": packet,
+                        "observationID": self._observation_id, "geometryRevision": 0,
+                        "executeAtNanos": start, "durationMs": self.config.period_ms, "commands": commands}
+            self._feedback.acknowledge(self._feedback_delivered)
+            self._feedback.admit(original, self._now)
+            self._feedback_packet_ids[packet] = identity
+            heapq.heappush(self._feedback_ends, (start + self.config.period_ms * 1_000_000, packet, identity))
+        self._packet_sequence += 1
         previous_motion = None
         for index, command in enumerate(commands):
             scheduled = start + command["offsetMs"] * 1_000_000
@@ -286,6 +321,7 @@ class PracticeEnvironment:
                     for tick in range(1, length):
                         fraction = tick / length
                         sample = dict(command)
+                        sample["offsetMs"] = previous_motion["offsetMs"] + tick
                         if command["operation"] == "pointerAbsolute":
                             for name in ("x", "y"):
                                 sample[name] = previous_motion[name] + fraction * (command[name] - previous_motion[name])
@@ -294,19 +330,19 @@ class PracticeEnvironment:
                             sample["dx"], sample["dy"] = (cumulative[axis] - last[axis] for axis in range(2))
                             last = cumulative
                         self._push(start + (previous_motion["offsetMs"] + tick) * 1_000_000,
-                                   packet, -1, sample, None, provenance)
+                                   packet, -1, sample, None, provenance, index)
                     if command["operation"] == "pointerRelative":
                         command = dict(command)
                         command["dx"] -= last[0]; command["dy"] -= last[1]
                 previous_motion = commands[index]
-            self._push(scheduled, packet, index, command, reference, provenance)
+            self._push(scheduled, packet, index, command, reference, provenance, index)
 
-    def _push(self, time, packet, order, command, reference, provenance):
-        heapq.heappush(self._pending, _Scheduled(time, packet, order, self._serial, command, reference, provenance))
+    def _push(self, time, packet, order, command, reference, provenance, semantic_index):
+        heapq.heappush(self._pending, _Scheduled(time, packet, order, self._serial, command, reference, provenance, semantic_index))
         self._serial += 1
 
     def step(self, commands: list[dict], episode_id: str | None = None,
-             provenance: Literal["agent", "oracle"] = "agent") -> PracticeTransition:
+             provenance: Literal["agent", "oracle"] = "agent", *, context=None) -> PracticeTransition:
         if self._episode_id is None or self._outcome != "continuing":
             raise PracticeError("Reset is required before stepping a completed environment")
         if episode_id is not None and episode_id != self._episode_id:
@@ -314,15 +350,27 @@ class PracticeEnvironment:
         if provenance not in ("agent", "oracle"):
             raise PracticeError("Unknown command provenance")
         validated = self._validate_commands(commands)  # Atomic rejection before clock/queue mutation.
-        self._schedule(validated, provenance)
+        self._schedule(validated, provenance, context)
         duration = min(self.config.period_ms, self.config.time_limit_ms - self.elapsed_ms)
         end = self._now + duration * 1_000_000
         initial_potential = self._potential()
         events, results, reward = [], [], 0.0
-        while self._pending and self._pending[0].time < end:
+        while ((self._pending and self._pending[0].time < end) or
+               (self._feedback_ends and self._feedback_ends[0][0] < end)):
+            if self._feedback_ends and (not self._pending or
+                    (self._feedback_ends[0][0], self._feedback_ends[0][1], 2**63 - 1) <
+                    (self._pending[0].time, self._pending[0].packet, self._pending[0].order)):
+                time, packet_sequence, identity = heapq.heappop(self._feedback_ends)
+                self._now = time
+                self._feedback.finish(identity, "executed", time)
+                self._feedback_packet_ids.pop(packet_sequence)
+                continue
             item = heapq.heappop(self._pending)
             self._now = item.time
             status, task_reward = self._execute(item, events)
+            if self._feedback is not None:
+                self._feedback.complete(self._feedback_packet_ids[item.packet], item.semantic_index, item.command,
+                                        endpoint=item.reference is not None, status=status, now=self._now)
             reward += task_reward
             if item.reference is not None:
                 result = self._commands.pop(item.reference)
@@ -388,7 +436,7 @@ class PracticeEnvironment:
             else:
                 point = (min(x + width, max(x, old_x + command["dx"])),
                          min(y + height, max(y, old_y + command["dy"])))
-            if point == self._pointer and not (op == "pointerRelative" and (command["dx"] or command["dy"])):
+            if self._feedback is None and point == self._pointer and not (op == "pointerRelative" and (command["dx"] or command["dy"])):
                 return "noOp", 0.0
             self._pointer = point; self._revision += 1
             dx, dy = (command["dx"], command["dy"]) if op == "pointerRelative" else (point[0] - old_x, point[1] - old_y)
@@ -448,6 +496,10 @@ class PracticeEnvironment:
             self._emit(events, "buttonUp", "cleanup", origin="boundary", button=button)
         results = [{**value, "status": "cancelled", "message": "Episode boundary cancelled queued work"}
                    for _, value in sorted(self._commands.items())]
+        if self._feedback is not None:
+            for identity in self._feedback_packet_ids.values():
+                self._feedback.finish(identity, "cancelled", self._now)
+            self._feedback_packet_ids.clear(); self._feedback_ends.clear()
         self._pending.clear(); self._commands.clear(); self._keys.clear(); self._buttons.clear()
         self._revision += bool(events)
         return events, results
@@ -487,7 +539,11 @@ class PracticeEnvironment:
         controls = {"keys": sorted(self._keys), "buttons": sorted(self._buttons), "modifiers": 0,
                     "pointer": {"x": self._pointer[0], "y": self._pointer[1]},
                     "observedNanos": self._now, "revision": self._revision, "valid": True}
-        return PracticeObservation(self._render(), metadata, controls, self._episode_id)
+        self._observation_id = metadata["id"]
+        feedback = None if self._feedback is None else self._feedback.snapshot(self._now)
+        if feedback is not None:
+            self._feedback_delivered = feedback.get("throughSequence")
+        return PracticeObservation(self._render(), metadata, controls, self._episode_id, feedback)
 
     def _render(self) -> np.ndarray:
         width, height = self.config.pixel_width, self.config.pixel_height

@@ -530,3 +530,252 @@ func executorStoppedArmingCannotPublishALateLease(cause: ControlStopCause) throw
     covered.intervalCovered = false
     #expect(throws: AstraError.self) { try covered.validateControlCoverage() }
 }
+
+private func armFeedback(_ fixture: ExecutorFixture, capacity: Int = 16) throws -> ControlFeedbackCursor {
+    var request = fixture.arm; request.controlFeedbackVersion = 1; request.packetCapacity = capacity
+    try fixture.executor.arm(request)
+    return ControlFeedbackCursor(controlEpochID: try #require(fixture.executor.controlEpochID))
+}
+private func feedbackSnapshot(_ fixture: ExecutorFixture, cursor: ControlFeedbackCursor, raw: UInt64? = nil) throws -> ControlObservation {
+    let observation = try fixture.executor.observation(afterSequence: raw, feedbackCursor: cursor)
+    let feedback = try #require(observation.controlFeedback)
+    try feedback.validate(cursor: cursor, runID: fixture.run, geometryRevision: 0, cutoffNanos: observation.cutoffNanos)
+    return observation
+}
+
+@Test func executorFeedbackPreservesLegacyShapeAndRejectsUnnegotiatedRequests() throws {
+    let f = ExecutorFixture(); try f.executor.arm(f.arm)
+    #expect(f.executor.controlEpochID == nil)
+    #expect(try JSONValue.encode(f.arm).fields?["controlFeedbackVersion"] == nil)
+    let observation = try f.executor.observation()
+    #expect(try JSONValue.encode(observation).fields?["controlFeedback"] == nil)
+    #expect(throws: AstraError.self) { try f.executor.observation(feedbackCursor: .init(controlEpochID: UUID())) }
+    f.executor.disarm()
+    var bad = f.arm; bad.controlFeedbackVersion = 2
+    #expect(throws: AstraError.self) { try f.executor.arm(bad) }
+    let cursor = try armFeedback(f)
+    #expect(throws: AstraError.self) { try f.executor.observation() }
+    #expect(try feedbackSnapshot(f, cursor: cursor).controlFeedback?.packets.isEmpty == true)
+    f.executor.disarm()
+}
+
+@Test func executorFeedbackRetainsNoOpAndEmptyLifetimesAcrossCuts() throws {
+    let f = ExecutorFixture(); var cursor = try armFeedback(f)
+    let before = try feedbackSnapshot(f, cursor: cursor)
+    let packet = f.packet([.init(offsetMs: 0, operation: .keyUp, keyCode: 0)], leadMS: 2)
+    try f.executor.execute(packet)
+    let admitted = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback)
+    #expect(before.controlFeedback?.packets.isEmpty == true)
+    #expect(admitted.packets.first?.packet == packet && admitted.changes.map(\.kind) == [.admitted])
+    cursor.afterSequence = admitted.throughSequence
+    f.clock.advance(ms: 2); f.executor.service()
+    let middle = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback)
+    #expect(middle.changes.isEmpty && middle.packets.first?.progress.first?.status == .noOp)
+    #expect(f.backend.posted.isEmpty)
+    f.clock.advance(ms: 10); f.executor.service()
+    let terminal = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback)
+    #expect(terminal.changes.map(\.kind) == [.terminal] && terminal.packets.first?.packet == packet)
+    #expect(terminal.packets.first?.terminal?.status == .executed)
+    cursor.afterSequence = terminal.throughSequence
+    #expect(try feedbackSnapshot(f, cursor: cursor).controlFeedback?.packets.isEmpty == true)
+    let empty = f.packet([], sequence: 1, duration: 3)
+    try f.executor.execute(empty)
+    f.executor.service()
+    let pending = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback)
+    #expect(pending.packets.count == 1 && pending.packets[0].terminal == nil && pending.packets[0].progress.isEmpty)
+    f.clock.advance(ms: 3); f.executor.service()
+    let ended = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback)
+    #expect(ended.changes.map(\.kind) == [.admitted, .terminal])
+    #expect(ended.packets.count == 1 && ended.packets[0].terminal?.status == .executed)
+    #expect(pending.packets[0].terminal == nil) // Prior snapshots are values, not a mutable ledger view.
+    f.executor.disarm()
+}
+
+@Test func executorFeedbackCapturesPartialRelativeMotionWithoutRewritingOriginalKnots() throws {
+    let f = ExecutorFixture(); let cursor = try armFeedback(f)
+    let packet = f.packet([.init(offsetMs: 0, operation: .pointerRelative, dx: 3, dy: -3),
+                           .init(offsetMs: 2, operation: .keyUp, keyCode: 0),
+                           .init(offsetMs: 4, operation: .pointerRelative, dx: 7, dy: -7)], duration: 5)
+    try f.executor.execute(packet)
+    for _ in 0..<3 { f.executor.service(); f.clock.advance(ms: 1) }
+    let observation = try feedbackSnapshot(f, cursor: cursor)
+    let row = try #require(observation.controlFeedback?.packets.first)
+    #expect(row.packet == packet && row.progress[0].emittedDx == 3)
+    #expect(row.progress[2].status == .partial && row.progress[2].completedSampleCount == 2)
+    #expect(row.progress[2].emittedDx == 4 && row.progress[2].emittedDy == -4)
+    #expect(row.progress[2].lastCompletedOffsetMs == 2 && row.progress[1].status == .noOp)
+    var corrupted = try #require(observation.controlFeedback)
+    corrupted.packets[0].progress[2].emittedDx = 3
+    #expect(throws: AstraError.self) { try corrupted.validate(cursor: cursor, runID: f.run, geometryRevision: 0, cutoffNanos: observation.cutoffNanos) }
+    corrupted = observation.controlFeedback!
+    corrupted.packets[0].progress[2].completedSampleCount = 1
+    #expect(throws: AstraError.self) { try corrupted.validate(cursor: cursor, runID: f.run, geometryRevision: 0, cutoffNanos: observation.cutoffNanos) }
+    #expect(f.receipts.all.allSatisfy { $0.status == .admitted })
+    for _ in 0..<3 { f.executor.service(); f.clock.advance(ms: 1) }
+    let final = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback?.packets.first)
+    #expect(final.packet.commands[2].dx == 7 && final.progress[2].emittedDx == 7 && final.progress[2].completedSampleCount == 4)
+    #expect(final.progress[2].status == .posted && final.terminal?.status == .executed)
+    #expect(row.progress[2].emittedDx == 4)
+    f.executor.disarm()
+}
+
+@Test func executorFeedbackAbsoluteSurfaceJumpDoesNotInventInterpolation() throws {
+    let f = ExecutorFixture(); var arm = f.arm; arm.controlFeedbackVersion = 1
+    var second = arm.scope.surfaces[0]; second.id = "second"; second.globalBounds.x = 100
+    arm.scope.surfaces.append(second); try f.executor.arm(arm)
+    let cursor = ControlFeedbackCursor(controlEpochID: try #require(f.executor.controlEpochID))
+    let packet = f.packet([.init(offsetMs: 0, operation: .pointerAbsolute, surfaceID: "fixture", x: 0.1, y: 0.2),
+                           .init(offsetMs: 4, operation: .pointerAbsolute, surfaceID: "second", x: 0.8, y: 0.9)], duration: 5)
+    try f.executor.execute(packet); f.executor.service(); f.clock.advance(ms: 2); f.executor.service()
+    let row = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback?.packets.first)
+    #expect(row.progress[0].status == .posted && row.progress[1].status == .pending && row.progress[1].completedSampleCount == 0)
+    #expect(f.backend.posted.count == 1 && row.packet == packet)
+    f.clock.advance(ms: 2); f.executor.service()
+    let final = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback?.packets.first)
+    #expect(final.progress[1].completedSampleCount == 1 && final.progress[1].status == .posted)
+    f.executor.disarm()
+}
+
+@Test func executorFeedbackValidatesBothCursorsBeforeEitherPrunes() throws {
+    let f = ExecutorFixture(); var cursor = try armFeedback(f)
+    try f.executor.execute(f.packet([.init(offsetMs: 0, operation: .keyDown, keyCode: 0)])); f.executor.service()
+    let first = try feedbackSnapshot(f, cursor: cursor)
+    var bad = cursor; bad.afterSequence = 99
+    #expect(throws: AstraError.self) { try f.executor.observation(afterSequence: first.lastSequence, feedbackCursor: bad) }
+    #expect(try feedbackSnapshot(f, cursor: cursor).executedEvents.count == 1)
+    cursor.afterSequence = first.controlFeedback?.throughSequence
+    #expect(throws: AstraError.self) { try f.executor.observation(afterSequence: 99, feedbackCursor: cursor) }
+    cursor.afterSequence = nil
+    #expect(try feedbackSnapshot(f, cursor: cursor).controlFeedback?.changes.count == 1)
+    cursor.afterSequence = first.controlFeedback?.throughSequence
+    let consumed = try feedbackSnapshot(f, cursor: cursor, raw: first.lastSequence)
+    #expect(consumed.executedEvents.isEmpty && consumed.controlFeedback?.changes.isEmpty == true)
+    #expect(consumed.controlFeedback?.packets.count == 1)
+    #expect(throws: AstraError.self) { try f.executor.observation(afterSequence: first.lastSequence, feedbackCursor: .init(controlEpochID: cursor.controlEpochID)) }
+    #expect(throws: AstraError.self) { try f.executor.observation(afterSequence: first.lastSequence, feedbackCursor: .init(controlEpochID: UUID(), afterSequence: cursor.afterSequence)) }
+    f.executor.disarm()
+    let next = try armFeedback(f)
+    #expect(next.controlEpochID != cursor.controlEpochID)
+    #expect(throws: AstraError.self) { try f.executor.observation(feedbackCursor: cursor) }
+    #expect(try feedbackSnapshot(f, cursor: next).controlFeedback?.packets.isEmpty == true)
+    f.executor.disarm()
+}
+
+@Test func executorFeedbackKeepsSelectedPreflightPendingAndBlockedPostUnavailable() throws {
+    for blockingPost in [false, true] {
+        let f = ExecutorFixture(); let cursor = try armFeedback(f)
+        f.backend.blockDown = blockingPost; f.backend.blockValidation = !blockingPost
+        try f.executor.execute(f.packet([.init(offsetMs: 0, operation: .keyDown, keyCode: 0)]))
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { f.executor.service(); finished.signal() }
+        #expect(f.backend.entering.wait(timeout: .now() + 2) == .success)
+        let cut = try feedbackSnapshot(f, cursor: cursor)
+        #expect(cut.controlFeedback?.packets.first?.progress.first?.status == .pending)
+        #expect(cut.controlFeedback?.coverageNanos == (blockingPost ? nil : cut.cutoffNanos))
+        #expect(cut.controlState.valid == !blockingPost)
+        if blockingPost {
+            #expect(cut.controlFeedback?.unavailableReason == .postInFlight)
+            // An unavailable diagnostic must not authorize acknowledgement.
+            #expect(throws: AstraError.self) { try f.executor.observation(feedbackCursor: .init(controlEpochID: cursor.controlEpochID, afterSequence: 0)) }
+            f.executor.disarm()
+        }
+        f.backend.unblock.signal()
+        #expect(finished.wait(timeout: .now() + 2) == .success)
+        let after = try feedbackSnapshot(f, cursor: cursor)
+        #expect(after.controlFeedback?.packets.first?.progress.first?.status == .posted)
+        if blockingPost {
+            #expect(after.controlFeedback?.unavailableReason == .stopping)
+            #expect(after.controlFeedback?.packets.first?.terminal?.status == .cancelled)
+            #expect(f.backend.ownedKeys.isEmpty && f.executor.cleanupSettled)
+        }
+        f.executor.disarm()
+    }
+}
+
+@Test func executorFeedbackRetainsTerminalCapacityAndRejectsBeforeConsumingSequence() throws {
+    let f = ExecutorFixture(); var cursor = try armFeedback(f)
+    for sequence in 0..<64 {
+        try f.executor.execute(f.packet([], sequence: UInt64(sequence), duration: 1))
+        f.clock.advance(ms: 1); f.executor.service()
+    }
+    #expect(f.executor.nextPacketSequence == 64)
+    #expect(throws: AstraError.self) { try f.executor.execute(f.packet([], sequence: 64, duration: 1)) }
+    #expect(f.executor.nextPacketSequence == 64)
+    let snapshot = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback)
+    #expect(snapshot.packets.count == 64 && snapshot.changes.count == 128)
+    #expect(snapshot.packets.allSatisfy { $0.terminal?.status == .executed })
+    cursor.afterSequence = snapshot.throughSequence
+    #expect(try feedbackSnapshot(f, cursor: cursor).controlFeedback?.packets.isEmpty == true)
+    try f.executor.execute(f.packet([], sequence: 64, duration: 1))
+    f.executor.disarm()
+}
+
+@Test(arguments: [16, 32, 64]) func executorFeedbackMeasuresOptInByteCapacity(capacity: Int) throws {
+    let f = ExecutorFixture(); let cursor = try armFeedback(f, capacity: capacity)
+    var admitted = 0
+    for sequence in 0..<32 {
+        let commands = (0..<capacity).map { _ in TimedCommand(offsetMs: 0, operation: .keyUp, keyCode: 0) }
+        let packet = f.packet(commands, sequence: UInt64(sequence), duration: 1, leadMS: UInt64(100 + sequence))
+        do { try f.executor.execute(packet); admitted += 1 }
+        catch { #expect((error as? AstraError)?.code == "control.feedbackCapacity"); break }
+    }
+    #expect(admitted > 0 && f.executor.nextPacketSequence == UInt64(admitted))
+    for _ in 0...140 { f.executor.service(); f.clock.advance(ms: 1) }
+    let snapshot = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback)
+    #expect(snapshot.packets.count == admitted && snapshot.packets.allSatisfy { $0.terminal?.status == .executed })
+    let actual = try JSONEncoder().encode(snapshot).count
+    let reserved = try snapshot.packets.reduce(ControlFeedbackLimits.envelopeReservation) { try $0 + ControlFeedbackLimits.reservation(for: $1.packet) }
+    #expect(actual <= reserved && reserved <= ControlFeedbackLimits.maximumBytes)
+    print("FEEDBACK CAPACITY commands=\(capacity) packets=\(admitted) actualBytes=\(actual) reservedBytes=\(reserved)")
+    f.executor.disarm()
+}
+
+@Test(arguments: [0, 200, 400, 500, 1_000, 2_000])
+func executorFeedbackMeasuresContinuousLeadWithFull64CommandPackets(leadMS: Int) throws {
+    let f = ExecutorFixture(); var cursor = try armFeedback(f, capacity: 64)
+    var admitted = 0, maximumRows = 0
+    for decision in 0..<25 {
+        if decision > 0 {
+            for _ in 0..<100 { f.clock.advance(ms: 1); f.executor.service() }
+            try f.executor.heartbeat(runID: f.run)
+        }
+        let snapshot = try #require(try feedbackSnapshot(f, cursor: cursor).controlFeedback)
+        maximumRows = max(maximumRows, snapshot.packets.count)
+        cursor.afterSequence = snapshot.throughSequence
+        let commands = (0..<64).map { _ in TimedCommand(offsetMs: 0, operation: .keyUp, keyCode: 0) }
+        do {
+            try f.executor.execute(f.packet(commands, sequence: UInt64(decision), duration: 100, leadMS: UInt64(leadMS)))
+            admitted += 1; f.executor.service()
+        } catch {
+            #expect((error as? AstraError)?.code == "control.feedbackCapacity")
+            break
+        }
+    }
+    if leadMS <= 400 { #expect(admitted == 25) } else { #expect(admitted == 6) }
+    print("FEEDBACK STREAM periodMs=100 leadMs=\(leadMS) commands=64 decisions=\(admitted) maximumRows=\(maximumRows)")
+    f.executor.disarm()
+}
+
+@Test func executorFeedbackCombinedWireLimitIncludesBoundedRawHistory() throws {
+    let f = ExecutorFixture(); var arm = f.arm; arm.controlFeedbackVersion = 1
+    let sourceID = String(repeating: "\u{1}", count: 256)
+    arm.scope.surfaces[0].id = sourceID; try f.executor.arm(arm)
+    let cursor = ControlFeedbackCursor(controlEpochID: try #require(f.executor.controlEpochID))
+    for sequence in 0..<2 {
+        try f.executor.execute(f.packet([.init(offsetMs: 0, operation: .pointerAbsolute, surfaceID: sourceID, x: 0.1, y: 0.2),
+                                          .init(offsetMs: 1_000, operation: .pointerAbsolute, surfaceID: sourceID, x: 0.8, y: 0.9)],
+                                         sequence: UInt64(sequence), duration: 1_000, leadMS: UInt64(sequence * 1_000)))
+    }
+    for step in 0...2_000 {
+        if step % 100 == 0 { try f.executor.heartbeat(runID: f.run) }
+        f.executor.service()
+        if step < 2_000 { f.clock.advance(ms: 1) }
+    }
+    let observation = try feedbackSnapshot(f, cursor: cursor)
+    #expect(observation.executedEvents.count == 2_002 && observation.controlState.valid)
+    let feedback = try #require(observation.controlFeedback)
+    #expect(try JSONEncoder().encode(feedback).count < ControlFeedbackLimits.maximumBytes)
+    let reply = WireMessage(kind: "ack", sequence: UInt64.max, requestID: UUID(), runID: f.run, payload: try .encode(observation))
+    #expect(throws: AstraError.self) { try reply.framed() }
+    f.executor.disarm()
+}

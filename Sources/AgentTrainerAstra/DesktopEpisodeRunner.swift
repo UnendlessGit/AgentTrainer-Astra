@@ -211,20 +211,21 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
             }.value
             let evidence = try await DesktopEpisodeEvidence.prepare(identity: identity, episodeID: episodeID, generationID: generationID,
                 policyID: checkpoint.id, policySignature: checkpoint.policySignature, collector: collector, sequence: sequence,
-                program: program, scope: scope, assetRoot: assetRoot, warmupFrames: warm, limits: limits, deferManualFeedback: deferManualFeedback, detector: detector,
+                program: program, scope: scope, assetRoot: assetRoot, warmupFrames: warm, limits: limits, deferManualFeedback: deferManualFeedback, collectionVersion: binding.policy.collectionVersion, detector: detector,
                 onTerminal: { [weak self] in self?.receivedTerminal($0) },
                 onFault: { [weak self] in self?.sourceFailed($0.error, generation: $0.generationID) })
             lock.withLock { bridge = evidence }
             try evidence.offer(.prepared(runID: identity.runID, actor: .object([
                 "checkpointID": .string(binding.checkpoint.id.uuidString.lowercased()),
-                "policySignature": .string(binding.checkpoint.policySignature), "collectionVersion": .integer(1),
+                "policySignature": .string(binding.checkpoint.policySignature), "collectionVersion": .integer(Int64(binding.policy.collectionVersion)),
                 "deterministic": .bool(false), "nextPacketSequence": .unsigned(binding.state.nextPacketSequence)])), generation: generationID)
             try await evidence.confirmReady(ready)
             try checkAdmission()
             try await verifyCurrentScope()
             let configured = try NativeControlConfiguration(runID: identity.runID, scope: scope,
                 capabilities: binding.policy.capabilities, packetCapacity: binding.policy.capacity,
-                initialPacketSequence: binding.state.nextPacketSequence, recoveryDirectory: recoveryDirectory)
+                initialPacketSequence: binding.state.nextPacketSequence, controlFeedbackVersion: binding.policy.controlFeedbackVersion,
+                recoveryDirectory: recoveryDirectory)
             let native = NativeControlSession(configuration: configured, owner: controlOwner, runtimeFactory: factory,
                 onEvent: { [weak self, evidence] event in
                     guard let self else { throw AstraError("desktop.episodeOwner", "The episode owner was retired before control joined.") }
@@ -240,11 +241,11 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
             _ = try currentFrames()
             watchdog = startWatchdog(native)
             setPhase(.running)
-            var nextCutoff = clock(), cursor: UInt64?
+            var nextCutoff = clock(), cursor: UInt64?, feedbackCursor: UInt64?
             while lock.withLock({ ending == nil }) {
                 try await sleepUntil(nextCutoff); try checkAdmission()
                 let frames = try currentFrames()
-                let controls = try await settledObservation(native, after: cursor)
+                let controls = try await settledObservation(native, after: cursor, afterFeedback: feedbackCursor)
                 try checkAdmission()
                 let cutoff = controls.cutoffNanos
                 let deadline = cutoff.addingReportingOverflow(UInt64(binding.policy.leadMS) * 1_000_000)
@@ -282,7 +283,7 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
                 let submission = try await native.submitPreservingStoppedPacket(result.packet)
                 if submission.admitted { admitted += 1 }
                 else if lock.withLock({ ending == nil }) { throw AstraError("desktop.admission", "The helper rejected the policy packet.") }
-                cursor = controls.lastSequence
+                cursor = controls.lastSequence; feedbackCursor = controls.controlFeedback?.throughSequence
                 let next = cutoff.addingReportingOverflow(UInt64(binding.policy.periodMS) * 1_000_000)
                 guard !next.overflow else { throw AstraError("desktop.clock", "The episode cadence clock is exhausted.") }
                 nextCutoff = next.partialValue
@@ -385,11 +386,11 @@ final class DesktopEpisodeRunner: @unchecked Sendable {
             try await Task.sleep(for: .milliseconds(5))
         }
     }
-    private func settledObservation(_ native: NativeControlSession, after cursor: UInt64?) async throws -> ControlObservation {
+    private func settledObservation(_ native: NativeControlSession, after cursor: UInt64?, afterFeedback: UInt64?) async throws -> ControlObservation {
         let deadline = clock().addingReportingOverflow(20_000_000)
         guard !deadline.overflow else { throw AstraError("desktop.clock", "The control wait clock is exhausted.") }
         while true {
-            let observed = try await native.observation(afterSequence: cursor)
+            let observed = try await native.observation(afterSequence: cursor, afterFeedbackSequence: afterFeedback)
             guard observed.intervalCovered, observed.cutoffNanos <= clock() else { throw AstraError("desktop.controlCoverage", "The control producer cannot prove observation coverage.") }
             if observed.controlState.valid {
                 guard observed.controlCoverageNanos == observed.cutoffNanos else { throw AstraError("desktop.controlCoverage", "The control producer did not verify unchanged input through this cutoff.") }

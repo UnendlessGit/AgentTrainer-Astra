@@ -57,6 +57,9 @@ def progress(value,run_id):
 
 def _observation(record):
     if record is None:return None
+    if (type(record.observation_schema_version) is not int or record.observation_schema_version not in (1, 2) or
+            (record.control_feedback_json is not None) != (record.observation_schema_version == 2)):
+        raise EnvironmentError('Invalid original observation schema at rollout publication')
     images=[]
     for image in record.images:
         if not isinstance(image.storage,StoredFrame):raise EnvironmentError('External experience must own spooled source images')
@@ -67,7 +70,9 @@ def _observation(record):
         'cutoff_nanos':record.cutoff_nanos,'geometry_revision':record.geometry_revision,
         'controls':json.loads(record.controls_json),'events':json.loads(record.events_json),
         'elapsed_seconds':record.elapsed_seconds,'reset':record.reset,'last_input_nanos':record.last_input_nanos,
-        **({} if record.control_coverage_nanos is None else {'control_coverage_nanos':record.control_coverage_nanos})}
+        **({} if record.control_coverage_nanos is None else {'control_coverage_nanos':record.control_coverage_nanos}),
+        **({} if record.observation_schema_version == 1 else {'observation_schema_version':record.observation_schema_version,
+            'control_feedback':json.loads(record.control_feedback_json)})}
 
 
 def publish_package(working,destination,*,binding,status,actor_progress,control_closure_known,rollout=None,reason=None):
@@ -105,6 +110,8 @@ def publish_package(working,destination,*,binding,status,actor_progress,control_
         'actorSampling':None if rollout is None else list(rollout.actor_sampling),
         'rolloutID':None if rollout is None else rollout.id,'decisions':0 if rollout is None else len(rollout.decisions),
         'collectionSeconds':0 if rollout is None else rollout.collection_seconds,'reason':reason}
+    if binding['model'].get('schema_version') == 3:
+        manifest['observationSchemaVersion'] = 2
     if retrospective:
         manifest.update(schemaVersion=2,behaviorBatchID=binding['behaviorBatchID'],reviewSource=None,revisionChain=[])
     (working/'manifest.json').write_bytes(encoded(manifest));_sync(working/'manifest.json')
@@ -126,7 +133,7 @@ def inspect_package(path, *, expected_manifest_sha256=None):
         return inspect_fragment_batch(path,manifest)
     fields(manifest,('schemaVersion','id','status','binding','actorProgress','controlClosureKnown','artifacts',
                      'actorSampling','rolloutID','decisions','collectionSeconds','reason'),
-                     ('behaviorBatchID','reviewSource','revisionChain') if version==2 else ())
+                     (('behaviorBatchID','reviewSource','revisionChain') if version==2 else ()) + ('observationSchemaVersion',))
     if uuid_key(path.name)!=manifest['id']:
         raise EnvironmentError('Rollout package identity/version mismatch')
     if manifest['status'] not in (('sealed','audited','aborted','awaiting_manual_review') if version==2 else ('sealed','audited','aborted')) or type(manifest['controlClosureKnown']) is not bool:
@@ -145,7 +152,12 @@ def inspect_package(path, *, expected_manifest_sha256=None):
                     'environment','model','training','contextIDs','purpose','previousActorProgress'),
                     ('retrospective','behaviorBatchID','continuationSource') if version==2 else ())
     for name in ('runID','clockID','policyID','actorSourceID','environmentSourceID'):uuid_key(binding[name])
-    EnvironmentSpec.from_dict(binding['environment']);ModelConfig.from_dict(binding['model'])
+    EnvironmentSpec.from_dict(binding['environment']); model = ModelConfig.from_dict(binding['model'])
+    if model.schema_version == 3:
+        if type(manifest.get('observationSchemaVersion')) is not int or manifest['observationSchemaVersion'] != 2:
+            raise EnvironmentError('Queue-aware rollout requires its original observation schema')
+    elif 'observationSchemaVersion' in manifest:
+        raise EnvironmentError('Legacy rollout cannot be upgraded to queued-control observations')
     if version==2:
         from .review_pipeline import validate_manifest_extension
         validate_manifest_extension(manifest)
@@ -206,7 +218,14 @@ def load_rollout(path,manifest,training,*,allow_partial=False,shared_store=None,
     def observation(value):
         if value is None:return None
         fields(value,('images','observation_id','episode_id','cutoff_nanos','geometry_revision','controls','events',
-                      'elapsed_seconds','reset','last_input_nanos'),('control_coverage_nanos',))
+                      'elapsed_seconds','reset','last_input_nanos') + (('observation_schema_version','control_feedback') if model.schema_version == 3 else ()),('control_coverage_nanos',))
+        if model.schema_version == 3:
+            from astra.control_feedback import validate_control_feedback
+            if type(value['observation_schema_version']) is not int or value['observation_schema_version'] != 2:
+                raise EnvironmentError('Imported queued-control observation has a different schema')
+            validate_control_feedback(value['control_feedback'], cutoff_nanos=value['cutoff_nanos'],
+                geometry_revision=value['geometry_revision'], run_id=manifest['binding']['runID'],
+                surfaces=[image['metadata']['surface'] for image in value['images']], require_available=True)
         control_observation(value['controls'],integer(value['cutoff_nanos']),value.get('control_coverage_nanos'),
             maximum_age_ms=EnvironmentSpec.from_dict(manifest['binding']['environment']).maximum_frame_age_ms)
         if type(value['images']) is not list or not 1<=len(value['images'])<=model.maximum_surfaces:
@@ -219,7 +238,8 @@ def load_rollout(path,manifest,training,*,allow_partial=False,shared_store=None,
             images.append(ObservationImage(frame,encoded(image['metadata'])))
         return ObservationRecord(tuple(images),uuid_key(value['observation_id']),uuid_key(value['episode_id']),
             integer(value['cutoff_nanos']),integer(value['geometry_revision']),encoded(value['controls']),encoded(value['events']),
-            value['elapsed_seconds'],value['reset'],value['last_input_nanos'],value.get('control_coverage_nanos'))
+            value['elapsed_seconds'],value['reset'],value['last_input_nanos'],value.get('control_coverage_nanos'),
+            None if model.schema_version == 2 else encoded(value['control_feedback']), value.get('observation_schema_version', 1))
     try:
         decisions=[]
         fd,_=_file(Path(path)/'decisions.ndjson',training.maximum_rollout_bytes)
@@ -241,8 +261,17 @@ def load_rollout(path,manifest,training,*,allow_partial=False,shared_store=None,
                 states=tuple(_frozen_array(row,np.float32) for row in states)
                 if any(row.shape!=(1,model.recurrent_width) or not np.isfinite(row).all() for row in states):
                     raise EnvironmentError('Invalid imported recurrent anchor')
+                extra = {}
+                if model.schema_version == 3 and manifest['schemaVersion'] == 2:
+                    if not all(name in data for name in ('endpoint_observation', 'retrospective', 'automaticReward')):
+                        raise EnvironmentError('Queue-aware retrospective experience lost original endpoint evidence')
+                    endpoint = observation(data['endpoint_observation'])
+                    if (endpoint is None or endpoint.reset or endpoint.episode_id != scalar.episode_id or
+                            endpoint.cutoff_nanos != scalar.next_decision_nanos):
+                        raise EnvironmentError('Imported review endpoint differs from its original interval')
+                    extra = dict(endpoint_observation=endpoint, retrospective_json=encoded(data['retrospective']))
                 decisions.append(CollectedDecision(scalar,observation(data['observation']),tuple(tuple(row) for row in packet),states,
-                    observation(data['bootstrap_observation']),data['outcome_detail'],encoded(data['commands'])))
+                    observation(data['bootstrap_observation']),data['outcome_detail'],encoded(data['commands']), **extra))
         if len(decisions)!=count:raise EnvironmentError('Imported rollout is incomplete')
         binding=manifest['binding']
         return CollectedRollout(uuid_key(manifest['rolloutID']),Rollout(tuple(row.transition for row in decisions)),tuple(decisions),

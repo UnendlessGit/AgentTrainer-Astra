@@ -7,6 +7,7 @@ import mlx.nn as nn
 
 from .config import ModelConfig
 from .observation import ObservationBatch
+from .queued_control import QueuedControlEncoder
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,8 @@ class TemporalCore(nn.Module):
         self.norms = [nn.LayerNorm(hidden) for _ in self.layers]
         self.value_hidden = nn.Linear(hidden, hidden // 2)
         self.value_head = nn.Linear(hidden // 2, 1)
+        if config.schema_version == 3:
+            self.queued_control = QueuedControlEncoder(config)
 
     def initial_state(self, batch_size: int) -> tuple[mx.array, ...]:
         return tuple(mx.zeros((batch_size, self.config.recurrent_width)) for _ in self.layers)
@@ -42,7 +45,12 @@ class TemporalCore(nn.Module):
         elapsed = mx.maximum(observation.elapsed_seconds, 0)
         timing = mx.stack((mx.minimum(elapsed, 60) / 60, mx.log1p(elapsed)), axis=-1)
         contexts = [embedding(observation.context_ids[..., index]) for index, embedding in enumerate(self.context_embeddings)]
-        x = self.input_norm(self.input_projection(mx.concatenate((visual_summary, observation.controls, timing, *contexts), axis=-1)))
+        projected = self.input_projection(mx.concatenate((visual_summary, observation.controls, timing, *contexts), axis=-1))
+        if self.config.schema_version == 3:
+            if observation.queued_control is None:
+                raise ValueError("Schema 3 requires explicit queued-control observations")
+            projected = projected + self.queued_control(observation.queued_control, observation.valid)
+        x = self.input_norm(projected)
         current = list(state)
         outputs = []
         for step in range(time):

@@ -59,7 +59,7 @@ def policy_gradients(policy, observation: ObservationBatch, packets: PacketBatch
     until every stage completes and the caller admits the assembled gradient.
     """
     observation.validate_shapes(control_width=policy.config.control_width, maximum_surfaces=policy.config.maximum_surfaces,
-                                contexts=len(policy.config.context_sizes))
+                                contexts=len(policy.config.context_sizes), model_schema_version=policy.config.schema_version, packet_capacity=policy.config.packet_capacity)
     if type(action_microbatch) is not int or not 1 <= action_microbatch <= 64:
         raise ValueError("Invalid action backward microbatch")
     batch, time = observation.shape
@@ -69,7 +69,7 @@ def policy_gradients(policy, observation: ObservationBatch, packets: PacketBatch
     def check_cancel():
         if cancelled():
             raise InterruptedError("Learning cancelled during bounded gradient computation")
-    flattened = tree_map(lambda value: value.reshape(count, 1, *value.shape[2:]), observation.as_tensors())
+    flattened = tree_map(lambda value: value.reshape(count, 1, *value.shape[2:]), observation.as_tensors(include_queued_control=False))
     def slice_observation(first, last):
         return ObservationBatch.from_tensors(tree_map(lambda value: value[first:last], flattened))
     visual_microbatch = policy._vision_microbatch

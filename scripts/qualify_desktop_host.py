@@ -2,6 +2,7 @@
 """Real desktop host, generated pixels and virtual InputExecutor only; no TCC."""
 from __future__ import annotations
 import argparse
+from dataclasses import replace
 import json
 import math
 import os
@@ -24,8 +25,9 @@ def main():
     parser.add_argument('--feedback',action='store_true',help='Exercise original-frame review through the native UI model before PPO')
     parser.add_argument('--multi-surface',action='store_true',help='Exercise two independent generated source streams through native actor/collector/PPO')
     parser.add_argument('--live-values',action='store_true',help='Exercise authenticated loopback state values through native readiness, reward sealing and PPO')
+    parser.add_argument('--queued-control',action='store_true',help='Exercise opt-in schema3 queued control at200ms lead through native actor/collector/PPO')
     args=parser.parse_args()
-    if sum((args.multi_surface,args.feedback,args.live_values))>1:parser.error('Choose one focused multi-source, feedback or live-value workflow')
+    if sum((args.multi_surface,args.feedback,args.live_values,args.queued_control))>1:parser.error('Choose one focused multi-source, feedback, live-value or queued-control workflow')
     output=(args.output or ROOT/'.local/verification'/('desktop-host-'+str(uuid.uuid4()))).resolve()
     if output.exists():parser.error('Choose a new output directory to preserve evidence')
     output.mkdir(parents=True)
@@ -53,17 +55,19 @@ def main():
     from astra.model.config import ModelConfig
     from astra.model.policy import AgentPolicy
     mx.random.seed(3107)
-    policy=AgentPolicy(ModelConfig.test_small(),ActionVocabulary((0,),(),False,False,False))
+    model=replace(ModelConfig.test_small(),schema_version=3,lead_ms=200) if args.queued_control else ModelConfig.test_small()
+    policy=AgentPolicy(model,ActionVocabulary((0,),(),False,False,False))
     destination=output/'Library/Models'/str(uuid.uuid4())
     manifest=save_checkpoint(destination,policy,kind='initial',step=0)
     (output/'initial.json').write_text(json.dumps({'id':manifest['id'],'policySignature':manifest['policySignature'],
         'parameterCount':policy.config.parameter_count}))
     environment={**os.environ,'ASTRA_HOST_QUALIFICATION_ROOT':str(output),'ASTRA_HOST_QUALIFICATION_BUNDLE':str(bundle)}
-    for flag in ('ASTRA_HOST_QUALIFICATION_FEEDBACK','ASTRA_HOST_QUALIFICATION_MULTI_SURFACE','ASTRA_HOST_QUALIFICATION_LIVE_VALUES'):
+    for flag in ('ASTRA_HOST_QUALIFICATION_FEEDBACK','ASTRA_HOST_QUALIFICATION_MULTI_SURFACE','ASTRA_HOST_QUALIFICATION_LIVE_VALUES','ASTRA_HOST_QUALIFICATION_QUEUED_CONTROL'):
         environment.pop(flag,None)
     if args.feedback:environment['ASTRA_HOST_QUALIFICATION_FEEDBACK']='1'
     if args.multi_surface:environment['ASTRA_HOST_QUALIFICATION_MULTI_SURFACE']='1'
     if args.live_values:environment['ASTRA_HOST_QUALIFICATION_LIVE_VALUES']='1'
+    if args.queued_control:environment['ASTRA_HOST_QUALIFICATION_QUEUED_CONTROL']='1'
     suite='DesktopFeedbackQualificationTests' if args.feedback else 'DesktopHostQualificationTests'
     with (output/'swift-test.log').open('wb') as log:
         process=subprocess.Popen([str(ROOT/'script/swift.sh'),'test','--filter',suite],
@@ -79,6 +83,7 @@ def main():
     report_path=output/'desktop-host-report.json'
     if report_path.exists():
         preview=json.loads(report_path.read_text());preview.pop('sourceFrames',None);preview.pop('telemetryReceipts',None)
+        preview.pop('controlFeedbackSnapshots',None);preview.pop('submittedPackets',None)
         print(json.dumps(preview,indent=2,sort_keys=True),flush=True)
     if returncode:
         print((output/'swift-test.log').read_text()[-16000:],flush=True)
@@ -87,6 +92,46 @@ def main():
     if not report['completed'] or report['privacyPermissionsUsed'] or not report['controlCleanupConfirmed']:
         raise RuntimeError('Real desktop host qualification did not complete')
     learned=load_checkpoint(output/'Library/Models'/report['learnedCheckpointID'],include_training=True)
+    if args.queued_control:
+        from astra.control_feedback import validate_control_feedback, validate_feedback_continuation
+        from astra.learning.rollout_artifacts import inspect_package
+        assert report['queuedControl'] and model.schema_version==3 and model.lead_ms==200
+        assert learned.training_state['learner']['optimizerUpdates']>0
+        assert learned.manifest['artifacts']['policy.safetensors']!=manifest['artifacts']['policy.safetensors']
+        packages=[path.parent for path in (output/'Library/DesktopRuns').glob('*/Collections/*/manifest.json')
+            if json.loads(path.read_text())['status']=='sealed']
+        assert len(packages)==1
+        rollout=inspect_package(packages[0]);assert rollout['decisions']>=6 and rollout['observationSchemaVersion']==2
+        originals={row['id'].lower():row for row in report['submittedPackets']}
+        snapshots={(row['controlEpochID'].lower(),row['cutoffNanos']):row for row in report['controlFeedbackSnapshots']}
+        original_frames={row['id'].lower():row for row in report['sourceFrames']}
+        decisions=0;with_outstanding=0;with_progress=0;with_terminals=0;previous_by_episode={};epochs=set()
+        with (packages[0]/'decisions.ndjson').open() as stream:
+            for line in stream:
+                decision=json.loads(line);observed=decision['observation'];feedback=observed['control_feedback']
+                assert observed['observation_schema_version']==2
+                validate_control_feedback(feedback,cutoff_nanos=observed['cutoff_nanos'],geometry_revision=observed['geometry_revision'],
+                    run_id=rollout['binding']['runID'],surfaces=[image['metadata']['surface'] for image in observed['images']],require_available=True)
+                assert feedback==snapshots[(feedback['controlEpochID'].lower(),observed['cutoff_nanos'])]
+                validate_feedback_continuation(previous_by_episode.get(observed['episode_id']),feedback)
+                previous_by_episode[observed['episode_id']]=feedback;epochs.add(feedback['controlEpochID'].lower())
+                assert all(image['metadata']==original_frames[image['metadata']['id'].lower()] for image in observed['images'])
+                for row in feedback['packets']:
+                    assert row['packet']==originals[row['packet']['id'].lower()]
+                    assert row['packet']['id'].lower()!=decision['transition']['packet_id'].lower()
+                    assert row['admittedNanos']<=observed['cutoff_nanos']
+                    with_outstanding+=row.get('terminal') is None
+                    with_progress+=any(progress['completedSampleCount']>0 for progress in row['progress'])
+                    with_terminals+=row.get('terminal') is not None
+                decisions+=1
+        assert decisions==rollout['decisions'] and with_outstanding>0 and with_progress>0 and with_terminals>0 and len(epochs)>=2
+        report.update(bundle=str(bundle),model=model.to_dict(),verificationModel='numerical_test_small',
+            learnedWeightsChanged=True,admittedDecisions=decisions,originalQueuedSnapshotsPreserved=True,
+            originalQueuedPacketsPreserved=True,originalSourceMetadataPreserved=True,
+            outstandingPacketRows=with_outstanding,rowsWithProgress=with_progress,rowsWithTerminals=with_terminals,
+            independentControlEpochs=len(epochs),periodMS=model.period_ms,leadMS=model.lead_ms)
+        report_path.write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+        return
     if args.live_values:
         assert report['liveValues'] and report['telemetryJoined']
         assert learned.training_state['learner']['optimizerUpdates']>0

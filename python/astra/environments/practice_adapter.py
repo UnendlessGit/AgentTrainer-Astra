@@ -6,10 +6,12 @@ from .practice import PracticeEnvironment
 
 
 class PracticeAdapter:
-    def __init__(self, environment: PracticeEnvironment):
+    def __init__(self, environment: PracticeEnvironment, *, control_feedback=False):
         self.environment = environment
         config = environment.config
         self.run_id = str(uuid.uuid4())
+        if control_feedback:
+            environment.enable_control_feedback(self.run_id)
         self.spec = EnvironmentSpec(identity='practice:' + config.task, action_vocabulary=environment.action_vocabulary,
             period_ms=config.period_ms, lead_ms=config.lead_ms, maximum_episode_ms=config.time_limit_ms,
             maximum_observation_bytes=config.pixel_width * config.pixel_height * 4, maximum_surfaces=1,
@@ -30,7 +32,8 @@ class PracticeAdapter:
         metadata = value.metadata
         return EnvironmentObservation(metadata['id'], value.episode_id, metadata['observedNanos'],
             metadata['surface']['geometryRevision'], (SurfaceObservation(value.pixels, metadata, metadata['observedNanos']),),
-            value.control_state).validate(self.spec)
+            value.control_state, control_feedback=value.control_feedback,
+            observation_schema_version=2 if value.control_feedback is not None else 1).validate(self.spec)
 
     def reset(self, *, seed, cancelled):
         if cancelled(): raise InterruptedError('Environment reset cancelled')
@@ -39,7 +42,7 @@ class PracticeAdapter:
     def step(self, commands, *, context, cancelled):
         if cancelled(): raise InterruptedError('Environment decision cancelled')
         context.validate()
-        result = self.environment.step(commands, episode_id=context.episode_id, provenance='agent')
+        result = self.environment.step(commands, episode_id=context.episode_id, provenance='agent', context=context)
         return EnvironmentTransition(self.observation(result.observation), result.reward, result.duration_ms,
             result.outcome, tuple(result.raw_events), tuple(result.command_results), result.provenance, result.reason,
             result.outcome)

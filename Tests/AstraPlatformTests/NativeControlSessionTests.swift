@@ -33,6 +33,13 @@ final class ControlRuntimeFixture: @unchecked Sendable {
     private var joined = false
     let blockArm: Bool, blockHeartbeat: Bool, blockShutdown: Bool, earlyTerminal: Bool, blockExecute: Bool, rejectOrdinary: Bool, exitStatus: Int32
     var wrongOrigin = false
+    var supportsFeedback = false
+    var feedbackFault: String?
+    private var feedbackClock: UInt64 = 0
+    private var feedbackEnabled = false
+    private var feedbackLedger: ControlFeedbackLedger?
+    private var observationPayloads: [JSONValue] = []
+    var observationRequests: [JSONValue] { lock.withLock { observationPayloads } }
     init(blockArm: Bool = false, blockHeartbeat: Bool = false, blockShutdown: Bool = false, earlyTerminal: Bool = false, blockExecute: Bool = false, rejectOrdinary: Bool = false, exitStatus: Int32 = 0) {
         self.blockArm = blockArm; self.blockHeartbeat = blockHeartbeat; self.blockShutdown = blockShutdown
         self.earlyTerminal = earlyTerminal; self.blockExecute = blockExecute; self.rejectOrdinary = rejectOrdinary; self.exitStatus = exitStatus
@@ -49,8 +56,10 @@ final class ControlRuntimeFixture: @unchecked Sendable {
             self.lock.withLock { self.events = events; self.failure = failure }
             return .init(start: {
                 self.lock.withLock { self.starts += 1 }
-                return WireMessage(kind: "hello", sequence: 0, payload: .object(["role": .string("control"), "protocolVersion": .integer(1),
-                    "recoveryVersion": .integer(1), "initialPacketSequenceVersion": .integer(1)]))
+                var fields: [String: JSONValue] = ["role": .string("control"), "protocolVersion": .integer(1),
+                    "recoveryVersion": .integer(1), "initialPacketSequenceVersion": .integer(1)]
+                if self.supportsFeedback { fields["controlFeedbackVersions"] = .array([.integer(1)]) }
+                return WireMessage(kind: "hello", sequence: 0, payload: .object(fields))
             }, request: { kind, payload, run, _ in
                 try await withTaskCancellationHandler { try await self.request(kind, payload, run) } onCancel: { self.lock.withLock { self.cancellations += 1 } }
             }, shutdown: {
@@ -73,6 +82,14 @@ final class ControlRuntimeFixture: @unchecked Sendable {
             if blockArm { await armGate.wait() }
             lock.withLock { activeRun = run }
             value = .object(["armed": .bool(true), "nextPacketSequence": .unsigned((arm.initialPacketSequence ?? 0) + (wrongOrigin ? 1 : 0))])
+            if arm.controlFeedbackVersion != nil {
+                let ledger = ControlFeedbackLedger(request: arm)
+                lock.withLock { feedbackEnabled = true; feedbackLedger = ledger }
+                var fields = value.fields!
+                fields["controlFeedbackVersion"] = .integer(1)
+                if feedbackFault != "armEpoch" { fields["controlEpochID"] = .string(ledger.epochID.uuidString) }
+                value = .object(fields)
+            }
         case "heartbeat":
             lock.withLock { heartbeats += 1 }
             if blockHeartbeat { await heartbeatGate.wait() }
@@ -83,6 +100,14 @@ final class ControlRuntimeFixture: @unchecked Sendable {
             if blockExecute { await executeGate.wait() }
             let live = lock.withLock { pending[packet.id] = (packet, request); return activeRun == run && !rejectOrdinary }
             if live {
+                if let ledger = lock.withLock({ feedbackLedger }) {
+                    let reservation = try ControlFeedbackLimits.reservation(for: packet)
+                    try lock.withLock {
+                        try ledger.reserveAdmission(packet, bytes: reservation)
+                        feedbackClock = max(feedbackClock, MonotonicClock.now)
+                        ledger.admit(packet, reservation: reservation, at: feedbackClock)
+                    }
+                }
                 sendReceipt(packet, request: request, status: .admitted)
                 if earlyTerminal { try await Task.sleep(for: .milliseconds(3)); complete(packet.id) }
                 value = .object(["admitted": .bool(true)])
@@ -96,14 +121,38 @@ final class ControlRuntimeFixture: @unchecked Sendable {
             for id in identifiers { complete(id, status: .cancelled) }
             value = .object(["stopped": .bool(true), "cleanupSettled": .bool(true)])
         case "observation":
-            var state = ControlState(); state.valid = true; state.observedNanos = MonotonicClock.now
-            value = try .encode(ControlObservation(controlState: state, executedEvents: [], intervalCovered: true, cutoffNanos: state.observedNanos, lastSequence: nil))
+            lock.withLock { observationPayloads.append(payload) }
+            var state = ControlState(); state.valid = true; state.observedNanos = lock.withLock { max(feedbackClock, MonotonicClock.now) }
+            var observation = ControlObservation(controlState: state, executedEvents: [], intervalCovered: true, cutoffNanos: state.observedNanos, lastSequence: nil)
+            if lock.withLock({ feedbackEnabled }), feedbackFault != "missing" {
+                let cursor = try payload.required("feedbackCursor").decode(ControlFeedbackCursor.self)
+                var feedback = try lock.withLock {
+                    let ledger = feedbackLedger!; try ledger.validate(cursor); ledger.acknowledge(cursor.afterSequence)
+                    return ledger.snapshot(cutoff: state.observedNanos, unavailable: nil)
+                }
+                if feedbackFault == "epoch" { feedback.controlEpochID = UUID() }
+                if feedbackFault == "cutoff" { feedback.cutoffNanos += 1 }
+                if feedbackFault == "packet", !feedback.packets.isEmpty { feedback.packets[0].packet.commands[0].operation = .keyUp }
+                observation.controlCoverageNanos = state.observedNanos; observation.controlFeedback = feedback
+            }
+            value = try .encode(observation)
         default: break
         }
         return WireMessage(kind: reply, sequence: 0, requestID: request, runID: run, payload: value)
     }
     func complete(_ id: UUID, status: ReceiptStatus = .executed) {
         guard let value = lock.withLock({ pending.removeValue(forKey: id) }) else { return }
+        lock.withLock {
+            let now = max(feedbackClock, max(MonotonicClock.now, value.0.executeAtNanos + UInt64(value.0.durationMs) * 1_000_000))
+            feedbackClock = now
+            if status == .executed {
+                for (index, command) in value.0.commands.enumerated() {
+                    feedbackLedger?.completeSample(packetID: id, commandIndex: index, command: command, endpoint: true,
+                        status: .posted, postedNanos: now, availableNanos: now)
+                }
+            }
+            feedbackLedger?.finish(id, status: status, at: now)
+        }
         sendReceipt(value.0, request: value.1, status: status)
     }
     private func sendReceipt(_ packet: ActionPacket, request: UUID, status: ReceiptStatus) {
@@ -358,4 +407,79 @@ func controlWait(_ condition: () -> Bool) async throws {
     #expect(fixture.sentPackets == [packet.id])
     #expect(await session.shutdown().cleanupConfirmed)
     await #expect(throws: AstraError.self) { try await session.submitPreservingStoppedPacket(controlPacket(config, sequence: 1)) }
+}
+
+@Test func nativeControlFeedbackNegotiatesEpochAndPreservesLegacyObservationPayload() async throws {
+    for optIn in [false, true] {
+        let fixture = ControlRuntimeFixture(), owner = NativeControlOwner(); fixture.supportsFeedback = true
+        let base = try controlConfiguration(root: FileManager.default.temporaryDirectory)
+        let config = try NativeControlConfiguration(runID: base.runID, scope: base.scope, capabilities: base.capabilities,
+            controlFeedbackVersion: optIn ? 1 : nil, recoveryDirectory: base.recoveryDirectory)
+        let session = NativeControlSession(configuration: config, owner: owner, runtimeFactory: fixture.factory)
+        _ = try await session.start()
+        let observation = try await session.observation()
+        #expect((session.controlEpochID != nil) == optIn)
+        #expect((observation.controlFeedback != nil) == optIn)
+        let fields = try #require(fixture.observationRequests.first?.fields)
+        if optIn {
+            let cursor = try #require(fields["feedbackCursor"]).decode(ControlFeedbackCursor.self)
+            #expect(cursor.controlEpochID == session.controlEpochID && cursor.afterSequence == nil && cursor.version == 1)
+            let packet = controlPacket(config), submission = try await session.submit(packet)
+            fixture.complete(packet.id); _ = try await submission.terminalReceipt()
+            let terminal = try await session.observation()
+            #expect(terminal.controlFeedback?.packets.first?.packet == packet)
+            _ = try await session.observation(afterSequence: 12, afterFeedbackSequence: terminal.controlFeedback?.throughSequence)
+            let request = try #require(fixture.observationRequests.last)
+            #expect(request.fields?["afterSequence"]?.int == 12)
+            #expect(try request.required("feedbackCursor").decode(ControlFeedbackCursor.self).afterSequence == terminal.controlFeedback?.throughSequence)
+        } else { #expect(fields.isEmpty) }
+        let completion = await session.shutdown()
+        #expect(completion.cleanupConfirmed && owner.priorCleanupJoined)
+    }
+}
+
+@Test(arguments: ["unsupported", "armEpoch", "missing", "epoch", "cutoff"])
+func nativeControlFeedbackRejectsMissingOrForeignEvidence(fault: String) async throws {
+    let fixture = ControlRuntimeFixture(), owner = NativeControlOwner()
+    fixture.supportsFeedback = fault != "unsupported"; fixture.feedbackFault = fault
+    let base = try controlConfiguration(root: FileManager.default.temporaryDirectory)
+    let config = try NativeControlConfiguration(runID: base.runID, scope: base.scope, capabilities: base.capabilities,
+        controlFeedbackVersion: 1, recoveryDirectory: base.recoveryDirectory)
+    let session = NativeControlSession(configuration: config, owner: owner, runtimeFactory: fixture.factory)
+    if fault == "unsupported" || fault == "armEpoch" {
+        await #expect(throws: AstraError.self) { try await session.start() }
+        if fault == "unsupported" { #expect(!fixture.log.contains("arm")) }
+    } else {
+        _ = try await session.start()
+        await #expect(throws: AstraError.self) { try await session.observation() }
+    }
+    let completion = await session.shutdown()
+    #expect(completion.cleanupConfirmed && owner.priorCleanupJoined && fixture.hasJoined)
+}
+
+@Test func nativeControlFeedbackAuthenticatesCompletedOriginalsUntilTerminalAcknowledgement() async throws {
+    let fixture = ControlRuntimeFixture(), owner = NativeControlOwner(); fixture.supportsFeedback = true
+    let base = try controlConfiguration(root: FileManager.default.temporaryDirectory)
+    let config = try NativeControlConfiguration(runID: base.runID, scope: base.scope, capabilities: base.capabilities,
+        controlFeedbackVersion: 1, recoveryDirectory: base.recoveryDirectory)
+    let session = NativeControlSession(configuration: config, owner: owner, runtimeFactory: fixture.factory)
+    _ = try await session.start()
+    var acknowledged: UInt64?
+    // More identities than the bounded retained map permits proves terminal
+    // acknowledgement releases retention while terminal receipt alone does not.
+    for sequence in 0..<100 {
+        let packet = controlPacket(config, sequence: UInt64(sequence)), submission = try await session.submit(packet)
+        fixture.complete(packet.id); _ = try await submission.terminalReceipt()
+        let cut = try await session.observation(afterFeedbackSequence: acknowledged)
+        #expect(cut.controlFeedback?.packets.last?.packet == packet)
+        acknowledged = cut.controlFeedback?.throughSequence
+    }
+    let clean = try await session.observation(afterFeedbackSequence: acknowledged)
+    #expect(clean.controlFeedback?.packets.isEmpty == true)
+    let next = controlPacket(config, sequence: 100), submission = try await session.submit(next)
+    fixture.complete(next.id); _ = try await submission.terminalReceipt()
+    fixture.feedbackFault = "packet"
+    await #expect(throws: AstraError.self) { try await session.observation(afterFeedbackSequence: acknowledged) }
+    let completion = await session.shutdown()
+    #expect(completion.cleanupConfirmed && owner.priorCleanupJoined)
 }

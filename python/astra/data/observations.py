@@ -10,13 +10,15 @@ from astra.model.observation import ObservationBatch
 from astra.recordings import RecordingError, validate_frame, validate_event
 from .history import ControlHistory
 from .preprocessing import prepare_surface
+from .queued_controls import prepare_queued_controls
 
 
 def make_observation(frames: Sequence[tuple[object, dict]], control_state: dict, *, cutoff_nanos: int,
                      elapsed_seconds: float, reset: bool, config: ModelConfig,
                      context_ids: tuple[int, ...] = (), executed_events: Sequence[dict] = (),
                      interval_covered: bool = True, surface_preparer=prepare_surface,
-                     maximum_timestamp: int = 2**63 - 1, last_input_nanos: int | None = None) -> ObservationBatch:
+                     maximum_timestamp: int = 2**63 - 1, last_input_nanos: int | None = None,
+                     control_feedback: dict | None = None, control_feedback_known_empty: bool = False) -> ObservationBatch:
     if (type(maximum_timestamp) is not int or maximum_timestamp not in (2**63 - 1, 2**64 - 1)
         or type(cutoff_nanos) is not int or not 0 <= cutoff_nanos <= maximum_timestamp
         or not math.isfinite(elapsed_seconds) or elapsed_seconds < 0):
@@ -70,4 +72,6 @@ def make_observation(frames: Sequence[tuple[object, dict]], control_state: dict,
     controls = history.features(cutoff_nanos, surfaces, interval_covered=interval_covered)
     return ObservationBatch(tuple(prepared), mx.array(controls)[None, None], mx.array([[elapsed_seconds]], dtype=mx.float32),
                             mx.array(context_ids, dtype=mx.int32)[None, None], mx.array([[reset]], dtype=mx.bool_),
-                            mx.array([[control_state["valid"] and interval_covered]], dtype=mx.bool_))
+                            mx.array([[control_state["valid"] and interval_covered]], dtype=mx.bool_),
+                            prepare_queued_controls(control_feedback, surfaces, config, cutoff_nanos=cutoff_nanos,
+                                                    known_empty=control_feedback_known_empty))

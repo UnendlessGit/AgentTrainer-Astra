@@ -28,11 +28,13 @@ public struct ControlObservation: Codable, Sendable {
     /// Fresh authority for this exact atomic cutoff; never a replacement for
     /// the last state-observation timestamp or input-event time.
     public var controlCoverageNanos: UInt64? = nil
+    public var controlFeedback: ControlFeedbackSnapshot? = nil
 
     public init(controlState: ControlState, executedEvents: [RawInputEvent], intervalCovered: Bool,
-                cutoffNanos: UInt64, lastSequence: UInt64?, controlCoverageNanos: UInt64? = nil) {
+                cutoffNanos: UInt64, lastSequence: UInt64?, controlCoverageNanos: UInt64? = nil, controlFeedback: ControlFeedbackSnapshot? = nil) {
         self.controlState = controlState; self.executedEvents = executedEvents; self.intervalCovered = intervalCovered
         self.cutoffNanos = cutoffNanos; self.lastSequence = lastSequence; self.controlCoverageNanos = controlCoverageNanos
+        self.controlFeedback = controlFeedback
     }
 
     public func validateControlCoverage(maximumAgeNanos: UInt64 = 250_000_000) throws {
@@ -113,6 +115,7 @@ public final class InputExecutor: @unchecked Sendable {
     private struct Scheduled {
         var time: UInt64; var packet: ActionPacket; var command: TimedCommand?
         var index: Int?; var order: Int
+        var semanticIndex: Int? = nil
     }
     private struct Pending { var packet: ActionPacket; var results: [CommandResult] = [] }
     private let lock = NSLock()
@@ -131,6 +134,7 @@ public final class InputExecutor: @unchecked Sendable {
     private var ownedKeys: Set<Int> = [], ownedButtons: Set<Int> = []
     private var scheduled: [Scheduled] = []
     private var pending: [UUID: Pending] = [:]
+    private var feedback: ControlFeedbackLedger?
     private var epoch: UInt64 = 0
     private var driving = false
     private var inFlightPacketID: UUID?
@@ -177,19 +181,23 @@ public final class InputExecutor: @unchecked Sendable {
     }
     public var currentRunID: UUID? { lock.withLock { lease.request?.runID } }
     public var nextPacketSequence: UInt64 { lock.withLock { lease.nextSequence } }
+    public var controlEpochID: UUID? { lock.withLock { feedback?.epochID } }
     /// Disarm invalidates admission immediately. Settlement additionally proves
     /// every possibly posted hold was released or transferred to a physical hold.
     public var cleanupSettled: Bool {
         lock.withLock { lease.request == nil && !arming && !driving && inFlightPacketID == nil && cleaning == 0 && ownedKeys.isEmpty && ownedButtons.isEmpty && interruption == nil }
     }
 
-    public func observation(afterSequence: UInt64? = nil) throws -> ControlObservation {
+    public func observation(afterSequence: UInt64? = nil, feedbackCursor: ControlFeedbackCursor? = nil) throws -> ControlObservation {
         var healthFailure: (reason: String, generation: UInt64)?
         defer {
             if let healthFailure { requestDisarm(reason: healthFailure.reason, expectedGeneration: healthFailure.generation) }
         }
         return try lock.withLock {
             let cutoff = clock()
+            // Validate both acknowledgements before either releases history.
+            if let feedback { try feedback.validate(feedbackCursor) }
+            else if feedbackCursor != nil { throw AstraError("control.feedbackCursor", "Queued-control feedback was not enabled for this arm.") }
             // These probes read cached backend proofs and atomic guardian state;
             // neither performs OS IPC. Holding the observation lock prevents an
             // input post/history mutation from crossing this causal cut.
@@ -217,16 +225,24 @@ public final class InputExecutor: @unchecked Sendable {
             } else if acknowledgedEventSequence != nil {
                 throw AstraError("control.historyCursor", "This input history requires its previous acknowledgement cursor.")
             }
+            feedback?.acknowledge(feedbackCursor?.afterSequence)
             var value = observed
-            value.valid = value.valid && lease.request != nil && cutoff < lease.expiresAtNanos && inFlightPacketID == nil && !arming && cleaning == 0 && interruption == nil
+            value.valid = value.valid && lease.request != nil && cutoff < lease.expiresAtNanos && inFlightPacketID == nil && !arming && cleaning == 0 && interruption == nil && feedback?.interrupted != true
             deliveredEventSequence = nextEventSequence == 0 ? nil : nextEventSequence - 1
+            let unavailable: ControlFeedbackUnavailable? = inFlightPacketID != nil ? .postInFlight
+                : arming ? .arming : (lease.request == nil || cleaning != 0 || interruption != nil || feedback?.interrupted == true) ? .stopping
+                : !historyCovered ? .historyGap : !value.valid || value.observedNanos > cutoff ? .untrustedState : nil
             return ControlObservation(controlState: value, executedEvents: executedEvents, intervalCovered: historyCovered,
                                       cutoffNanos: cutoff, lastSequence: nextEventSequence == 0 ? nil : nextEventSequence - 1,
-                                      controlCoverageNanos: value.valid && historyCovered && value.observedNanos <= cutoff ? cutoff : nil)
+                                      controlCoverageNanos: value.valid && historyCovered && value.observedNanos <= cutoff ? cutoff : nil,
+                                      controlFeedback: feedback?.snapshot(cutoff: cutoff, unavailable: unavailable))
         }
     }
 
     public func arm(_ request: ArmRequest, recovery: ControlRecoveryLedger? = nil, desktopLease: DesktopControlLock? = nil) throws {
+        guard request.controlFeedbackVersion == nil || request.controlFeedbackVersion == ControlFeedbackLimits.version else {
+            throw AstraError("control.feedbackVersion", "This helper does not support the requested control feedback version.")
+        }
         let generation = try lock.withLock { () throws -> UInt64 in
             guard !arming, !driving, cleaning == 0, lease.request == nil, interruption == nil, ownedKeys.isEmpty, ownedButtons.isEmpty else { throw AstraError("control.busy", "Desktop control is still armed or cleaning up.") }
             arming = true; armingRunID = request.runID; return epoch
@@ -254,6 +270,7 @@ public final class InputExecutor: @unchecked Sendable {
             try lease.arm(request, now: clock()); desktopLock = owner
             observed = initial; ownedKeys = []; ownedButtons = []; lastEnd = 0
             executedEvents = []; nextEventSequence = 0; acknowledgedEventSequence = nil; deliveredEventSequence = nil; historyCovered = true
+            feedback = request.controlFeedbackVersion == nil ? nil : ControlFeedbackLedger(request: request)
         }
     }
 
@@ -264,6 +281,8 @@ public final class InputExecutor: @unchecked Sendable {
 
     public func execute(_ packet: ActionPacket) throws {
         do {
+            let feedbackEpoch = lock.withLock { feedback?.epochID }
+            let reservation = try feedbackEpoch.map { _ in try ControlFeedbackLimits.reservation(for: packet) }
             let receipt = try lock.withLock { () throws -> ExecutionReceipt in
                 guard interruption == nil else { throw AstraError("control.stopping", "Desktop control is stopping.") }
                 guard pending.count < 32, pending[packet.id] == nil, packet.executeAtNanos >= lastEnd else {
@@ -276,11 +295,15 @@ public final class InputExecutor: @unchecked Sendable {
                 }) else { throw AstraError("control.rawCounts", "Relative pointer commands require whole raw motion counts.") }
                 let events = Self.expand(packet)
                 guard scheduled.count + events.count <= 8192 else { throw AstraError("control.backpressure", "The scheduled motion queue is full.") }
+                guard feedback?.epochID == feedbackEpoch else { throw AstraError("control.feedbackEpoch", "Control changed while preparing packet admission.") }
+                if let feedback, let reservation { try feedback.reserveAdmission(packet, bytes: reservation) }
                 lease = candidate; lastEnd = packet.executeAtNanos + UInt64(packet.durationMs) * 1_000_000
                 pending[packet.id] = Pending(packet: packet)
                 scheduled.append(contentsOf: events)
                 scheduled.sort { ($0.time, $0.packet.sequence, $0.order) < ($1.time, $1.packet.sequence, $1.order) }
-                return ExecutionReceipt(packet: packet, status: .admitted, observedNanos: clock(), resultingState: observed)
+                let admittedAt = clock()
+                if let feedback, let reservation { feedback.admit(packet, reservation: reservation, at: admittedAt) }
+                return ExecutionReceipt(packet: packet, status: .admitted, observedNanos: admittedAt, resultingState: observed)
             }
             onReceipt(receipt)
         } catch {
@@ -342,7 +365,8 @@ public final class InputExecutor: @unchecked Sendable {
                 let cancelled = value.packet.commands.indices.filter { !completed.contains($0) }.map {
                     CommandResult(commandIndex: $0, scheduledNanos: value.packet.executeAtNanos + UInt64(value.packet.commands[$0].offsetMs) * 1_000_000, status: .cancelled, message: finalReason)
                 }
-                return ExecutionReceipt(packet: value.packet, status: .cancelled, observedNanos: clock(),
+                let at = clock(); feedback?.finish(value.packet.id, status: .cancelled, at: at)
+                return ExecutionReceipt(packet: value.packet, status: .cancelled, observedNanos: at,
                                         commandResults: (value.results + cancelled).sorted { $0.commandIndex < $1.commandIndex }, resultingState: observed)
             }
             pending = pending.filter { $0.key == inFlightPacketID }; cleaning += 1
@@ -371,8 +395,9 @@ public final class InputExecutor: @unchecked Sendable {
             if event.command == nil {
                 let receipt = lock.withLock { () -> ExecutionReceipt? in
                     guard epoch == generation, let value = pending.removeValue(forKey: event.packet.id) else { return nil }
+                    let at = clock(); feedback?.finish(value.packet.id, status: .executed, at: at)
                     return ExecutionReceipt(packet: value.packet, status: .executed,
-                                            observedNanos: clock(), commandResults: value.results.sorted { $0.commandIndex < $1.commandIndex }, resultingState: observed)
+                                            observedNanos: at, commandResults: value.results.sorted { $0.commandIndex < $1.commandIndex }, resultingState: observed)
                 }
                 if let receipt { onReceipt(receipt) }; continue
             }
@@ -444,6 +469,11 @@ public final class InputExecutor: @unchecked Sendable {
                     // snapshots. A racing snapshot cannot omit an event whose
                     // reported availability is already before its cutoff.
                     observed.observedNanos = clock(); observed.revision &+= 1
+                    if let index = event.semanticIndex {
+                        feedback?.completeSample(packetID: event.packet.id, commandIndex: index, command: command, endpoint: event.index != nil,
+                            status: postError != nil ? .failed : emission == nil ? .noOp : .posted,
+                            postedNanos: emission == nil || postError != nil ? nil : postedAt, availableNanos: observed.observedNanos)
+                    }
                     if let emission, postError == nil {
                         if executedEvents.count >= historyCapacity || nextEventSequence == UInt64.max {
                             historyCovered = false; historyOverflow = true; observed.valid = false
@@ -466,6 +496,13 @@ public final class InputExecutor: @unchecked Sendable {
                     let receipt = lock.withLock { () -> ExecutionReceipt? in
                         inFlightPacketID = nil
                         guard var value = pending.removeValue(forKey: event.packet.id) else { return nil }
+                        let at = clock()
+                        if let index = event.semanticIndex {
+                            feedback?.completeSample(packetID: event.packet.id, commandIndex: index, command: command, endpoint: event.index != nil,
+                                status: postError != nil ? .failed : emission == nil ? .noOp : .posted,
+                                postedNanos: emission == nil || postError != nil ? nil : postedAt, availableNanos: at)
+                        }
+                        feedback?.finish(event.packet.id, status: .cancelled, at: at)
                         if let index = event.index {
                             value.results.append(CommandResult(commandIndex: index, scheduledNanos: event.time,
                                 postedNanos: emission == nil || postError != nil ? nil : postedAt,
@@ -476,7 +513,7 @@ public final class InputExecutor: @unchecked Sendable {
                         for index in event.packet.commands.indices where !done.contains(index) {
                             value.results.append(CommandResult(commandIndex: index, scheduledNanos: event.packet.executeAtNanos + UInt64(event.packet.commands[index].offsetMs) * 1_000_000, status: .cancelled))
                         }
-                        return ExecutionReceipt(packet: event.packet, status: .cancelled, observedNanos: clock(), commandResults: value.results.sorted { $0.commandIndex < $1.commandIndex }, resultingState: observed)
+                        return ExecutionReceipt(packet: event.packet, status: .cancelled, observedNanos: at, commandResults: value.results.sorted { $0.commandIndex < $1.commandIndex }, resultingState: observed)
                     }
                     if let receipt { onReceipt(receipt) }; return
                 }
@@ -496,7 +533,8 @@ public final class InputExecutor: @unchecked Sendable {
             let cancelled = packet.commands.indices.filter { !done.contains($0) }.map {
                 CommandResult(commandIndex: $0, scheduledNanos: packet.executeAtNanos + UInt64(packet.commands[$0].offsetMs) * 1_000_000, status: .cancelled, message: "Execution deadline missed.")
             }
-            return ExecutionReceipt(packet: packet, status: .late, observedNanos: clock(), commandResults: value.results + cancelled, resultingState: observed)
+            let at = clock(); feedback?.finish(packet.id, status: .late, at: at)
+            return ExecutionReceipt(packet: packet, status: .late, observedNanos: at, commandResults: value.results + cancelled, resultingState: observed)
         }
         if let receipt { onReceipt(receipt) }
     }
@@ -572,13 +610,13 @@ public final class InputExecutor: @unchecked Sendable {
                             let cumulative = Point2D(x: (command.dx! * fraction).rounded(.toNearestOrEven), y: (command.dy! * fraction).rounded(.toNearestOrEven))
                             sample.dx = cumulative.x - last.x; sample.dy = cumulative.y - last.y; last = cumulative
                         }
-                        events.append(Scheduled(time: packet.executeAtNanos + UInt64(sample.offsetMs) * 1_000_000, packet: packet, command: sample, index: nil, order: -1))
+                        events.append(Scheduled(time: packet.executeAtNanos + UInt64(sample.offsetMs) * 1_000_000, packet: packet, command: sample, index: nil, order: -1, semanticIndex: index))
                     }
                     if command.operation == .pointerRelative { command.dx! -= last.x; command.dy! -= last.y }
                 }
                 previous = original
             }
-            events.append(Scheduled(time: packet.executeAtNanos + UInt64(command.offsetMs) * 1_000_000, packet: packet, command: command, index: index, order: index))
+            events.append(Scheduled(time: packet.executeAtNanos + UInt64(command.offsetMs) * 1_000_000, packet: packet, command: command, index: index, order: index, semanticIndex: index))
         }
         events.append(Scheduled(time: packet.executeAtNanos + UInt64(packet.durationMs) * 1_000_000, packet: packet, command: nil, index: nil, order: Int.max))
         return events

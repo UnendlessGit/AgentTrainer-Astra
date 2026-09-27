@@ -20,6 +20,7 @@ struct BehaviorOptions: Sendable {
     var periodMS = 100
     var leadMS = 100
     var packetCapacity = 16
+    var queuedActionMemory = false
     var sequenceLength = 64
     var lanes = 2
     var seed = 0
@@ -52,8 +53,10 @@ struct BehaviorOptions: Sendable {
     }
 
     var model: JSONValue {
-        contextVocabulary.applying(to: .object(["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
-                 "packet_capacity": .integer(Int64(packetCapacity))]))
+        var fields: [String: JSONValue] = ["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
+            "packet_capacity": .integer(Int64(packetCapacity))]
+        if queuedActionMemory { fields["schema_version"] = .integer(3) }
+        return contextVocabulary.applying(to: .object(fields))
     }
     var training: JSONValue {
         .object(["epochs": .integer(Int64(epochs)), "learning_rate": .number(learningRate),
@@ -772,6 +775,55 @@ struct BehaviorEvaluation: Sendable {
 }
 
 extension LearningCoordinator {
+    func createQueuedActionCheckpoint(agent: AgentDocument, checkpoint: CheckpointDocument) async throws -> CheckpointDocument {
+        guard !isBusy else { throw AstraError("learning.busy", "Finish the current learning operation first.") }
+        try store.layout.requireAvailable(.models)
+        try Task.checkCancellation()
+        begin(agentID: agent.id); activeRun = nil
+        let generation = workGeneration
+        let operation = Task { () throws -> CheckpointDocument in
+            do {
+                guard try await self.store.checkpointIDs(for: agent.id).contains(checkpoint.id),
+                      try await self.store.snapshot().checkpoints.contains(where: { $0.matchesIdentity(of: checkpoint) }) else {
+                    throw AstraError("learning.checkpointOwner", "Choose a checkpoint linked to this agent.")
+                }
+                self.phase = "Adding queued action memory…"
+                try await self.openProcess()
+                let id = UUID()
+                let result = try await self.job("checkpoint.addQueuedControl", .object([
+                    "checkpointPath": .string(self.artifact("Models", checkpoint.id).path),
+                    "destination": .string(self.artifact("Models", id).path), "seed": .integer(0)]))
+                try result.requireComplete()
+                let manifest = try result.result.required("manifest")
+                guard manifest.fields?["parentID"]?.uuid == checkpoint.id,
+                      manifest.fields?["model"]?.fields?["schema_version"]?.int == 3,
+                      manifest.fields?["policySignature"]?.text != checkpoint.policySignature,
+                      manifest.fields?["kind"] == .string("initial"), manifest.fields?["step"]?.int == 0,
+                      manifest.fields?["trainingConfig"]?.fields?["warmStart"]?.fields?["sourcePolicySignature"]?.text == checkpoint.policySignature else {
+                    throw AstraError("learning.warmStart", "The runtime returned an inconsistent model copy. Its files were preserved.")
+                }
+                try await self.publishCheckpoint(result.result, agent: agent, runID: nil, expectedID: id,
+                    name: "\(String(checkpoint.name.prefix(100))) · Queued actions")
+                guard let document = try await self.store.snapshot().checkpoints.first(where: { $0.id == id }) else {
+                    throw AstraError("learning.checkpoint", "The copied policy is missing from the workspace catalog.")
+                }
+                self.phase = "Queued action copy ready"
+                await self.finish(); return document
+            } catch {
+                self.phase = "Model copy needs attention"
+                if !(error is CancellationError) { self.failure = error.localizedDescription }
+                await self.finish(); throw error
+            }
+        }
+        work = Task { _ = try? await operation.value }
+        return try await withTaskCancellationHandler { try await operation.value } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, self.workGeneration == generation else { return }
+                await self.requestStop()
+            }
+        }
+    }
+
     func feedbackOperation(agentID: UUID, kind: String, payload: JSONValue) async throws -> JSONValue {
         guard ["feedback.inspect", "feedback.materialize", "feedback.combine"].contains(kind), !isBusy else {
             throw AstraError("feedback.job", "Finish the current learning operation before inspecting or publishing feedback.")

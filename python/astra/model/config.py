@@ -5,6 +5,7 @@ import hashlib
 import json
 
 from .contexts import ContextField, vocabulary
+from .queue_layout import parameter_count as queued_parameter_count
 
 MAXIMUM_PARAMETERS = 500_000_000
 
@@ -34,14 +35,20 @@ class ModelConfig:
     context_sizes: tuple[int, ...] = ()
     context_width: int = 32
     context_vocabulary: tuple[ContextField, ...] = ()
+    queued_command_width: int = 64
+    queued_packet_width: int = 128
 
     def validate(self) -> ModelConfig:
         if type(self.context_vocabulary) is not tuple:
             raise ValueError("Context vocabulary must be immutable")
         if self.context_vocabulary:
             vocabulary([field.to_dict() for field in self.context_vocabulary], self.context_sizes)
-        if self.schema_version != 2:
-            raise ValueError("Unsupported model schema; version 2 requires internal visual padding masks")
+        if self.schema_version not in (2, 3):
+            raise ValueError("Unsupported model schema; schema 3 explicitly adds causal queued-control features")
+        if any(type(value) is not int or not 8 <= value <= 512 for value in (self.queued_command_width, self.queued_packet_width)):
+            raise ValueError("Queued-control GRU widths must be bounded positive integers")
+        if self.schema_version == 2 and (self.queued_command_width, self.queued_packet_width) != (64, 128):
+            raise ValueError("Queued-control width settings require explicit model schema 3")
         if any(type(value) is not tuple for value in
                (self.detail_channels, self.backbone_dims, self.backbone_depths, self.context_sizes)):
             raise ValueError("Model layouts and vocabularies must be immutable tuples")
@@ -109,10 +116,14 @@ class ModelConfig:
         actions += (sum(categories) + self.maximum_surfaces) * decoder
         actions += sum(linear(decoder, count) for count in categories)
         actions += 2 * linear(decoder, spatial) + linear(spatial, decoder)
-        return vision + temporal + actions
+        queued = queued_parameter_count(maximum_surfaces=self.maximum_surfaces, command_width=self.queued_command_width,
+                                         packet_width=self.queued_packet_width, recurrent_width=hidden) if self.schema_version == 3 else 0
+        return vision + temporal + actions + queued
 
     def to_dict(self) -> dict:
         value = asdict(self)
+        if self.schema_version == 2:
+            value.pop("queued_command_width"); value.pop("queued_packet_width")
         for field in ("detail_channels", "backbone_dims", "backbone_depths", "context_sizes"):
             value[field] = list(value[field])
         if self.context_vocabulary:

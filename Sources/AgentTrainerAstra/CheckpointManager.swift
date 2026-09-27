@@ -10,6 +10,7 @@ struct CheckpointManager: View {
     @State private var issue: String?
     @State private var result: String?
     @State private var working = false
+    @State private var queuedCopy: CheckpointDocument?
     private var checkpoints: [CheckpointDocument] {
         model.checkpoints.filter { model.checkpointLinks[agent.id]?.contains($0.id) == true }
             .sorted { $0.isPinned != $1.isPinned ? $0.isPinned : $0.createdAt > $1.createdAt }
@@ -38,6 +39,9 @@ struct CheckpointManager: View {
                             do { try await model.updateCheckpoint(checkpoint, name: name, pinned: pinned) }
                             catch { issue = error.localizedDescription }
                         }.disabled(working || model.checkpointManagementUnavailableReason != nil)
+                        Button("Create Queued-Action Copy…", systemImage: "square.on.square") {
+                            issue = nil; result = nil; queuedCopy = checkpoint
+                        }.controlSize(.small).disabled(working || model.checkpointManagementUnavailableReason != nil)
                         Divider()
                     }
                 }
@@ -110,6 +114,11 @@ struct CheckpointManager: View {
         }.padding(24).frame(minWidth: 620, idealWidth: 740, maxWidth: 880)
             .onChange(of: model.checkpoints) { _, _ in preview = nil }
             .interactiveDismissDisabled(working)
+            .sheet(item: $queuedCopy) { checkpoint in
+                QueuedActionCheckpointSheet(agent: agent, checkpoint: checkpoint, model: model) { copy in
+                    preview = nil; result = "Created \(copy.name). Choose it as the starting point for a new training run."
+                }
+            }
     }
 }
 

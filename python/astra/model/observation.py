@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import mlx.core as mx
+from .queued_control import QueuedControlBatch
 
 
 @dataclass(frozen=True)
@@ -39,12 +40,13 @@ class ObservationBatch:
     context_ids: mx.array  # B,T,number of immutable context vocabularies
     reset: mx.array  # B,T bool; reset *before* this observation
     valid: mx.array  # B,T bool; padding never advances persistent state
+    queued_control: QueuedControlBatch | None = None  # Explicit model schema 3 only.
 
     @property
     def shape(self) -> tuple[int, int]:
         return self.controls.shape[:2]
 
-    def validate_shapes(self, *, control_width: int, maximum_surfaces: int, contexts: int) -> None:
+    def validate_shapes(self, *, control_width: int, maximum_surfaces: int, contexts: int, model_schema_version: int = 2, packet_capacity: int | None = None) -> None:
         if self.controls.ndim != 3 or self.controls.shape[-1] != control_width:
             raise ValueError("Invalid observed-control tensor shape")
         batch, time = self.shape
@@ -55,6 +57,12 @@ class ObservationBatch:
                 raise ValueError("Temporal masks and elapsed time must match B,T")
         if self.context_ids.shape != (batch, time, contexts):
             raise ValueError("Context vocabulary dimensions do not match the checkpoint")
+        if model_schema_version == 3:
+            if self.queued_control is None or packet_capacity is None:
+                raise ValueError("Schema 3 requires explicit queued-control tensors, including unavailable/empty evidence")
+            self.queued_control.validate_shapes(batch, time, packet_capacity)
+        elif self.queued_control is not None:
+            raise ValueError("Schema 2 observations must retain their exact original tensor path")
         for surface in self.surfaces:
             for image in (surface.global_image, surface.detail_image, surface.cursor_image):
                 if image.ndim != 5 or image.shape[:2] != (batch, time) or image.shape[-1] != 3 or min(image.shape[2:4]) < 32:
@@ -68,14 +76,19 @@ class ObservationBatch:
     def slice_time(self, start: int, end: int) -> ObservationBatch:
         return ObservationBatch(tuple(surface.slice_time(start, end) for surface in self.surfaces),
                                 self.controls[:, start:end], self.elapsed_seconds[:, start:end],
-                                self.context_ids[:, start:end], self.reset[:, start:end], self.valid[:, start:end])
+                                self.context_ids[:, start:end], self.reset[:, start:end], self.valid[:, start:end],
+                                None if self.queued_control is None else self.queued_control.slice_time(start, end))
 
-    def as_tensors(self) -> dict:
-        return {"surfaces": [{name: getattr(surface, name) for name in SurfaceBatch.__dataclass_fields__}
-                             for surface in self.surfaces],
-                **{name: getattr(self, name) for name in self.__dataclass_fields__ if name != "surfaces"}}
+    def as_tensors(self, *, include_queued_control: bool = True) -> dict:
+        result = {"surfaces": [{name: getattr(surface, name) for name in SurfaceBatch.__dataclass_fields__}
+                                for surface in self.surfaces],
+                  **{name: getattr(self, name) for name in self.__dataclass_fields__ if name not in ("surfaces", "queued_control")}}
+        if include_queued_control and self.queued_control is not None:
+            result["queued_control"] = self.queued_control.as_tensors()
+        return result
 
     @classmethod
     def from_tensors(cls, value: dict) -> ObservationBatch:
         return cls(surfaces=tuple(SurfaceBatch(**surface) for surface in value["surfaces"]),
-                   **{name: field for name, field in value.items() if name != "surfaces"})
+                   **{name: field for name, field in value.items() if name not in ("surfaces", "queued_control")},
+                   queued_control=QueuedControlBatch.from_tensors(value["queued_control"]) if "queued_control" in value else None)

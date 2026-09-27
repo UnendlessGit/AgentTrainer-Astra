@@ -172,6 +172,7 @@ struct BehaviorTrainingView: View {
                                     TextField("Experiment seed", value: $options.seed, format: .number.grouping(.never))
                                         .textFieldStyle(.roundedBorder)
                                     if options.initialCheckpointID == nil {
+                                        QueuedActionMemoryOption(enabled: $options.queuedActionMemory)
                                         Picker("Decision rate", selection: $options.periodMS) {
                                             Text("10 Hz").tag(100); Text("20 Hz").tag(50)
                                         }

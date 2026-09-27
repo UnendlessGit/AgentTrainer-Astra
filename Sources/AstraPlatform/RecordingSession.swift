@@ -24,6 +24,9 @@ public final class RecordingSession: @unchecked Sendable {
     }()
     private let writer: RecordingWriter
     private let correction: CorrectionRecordingSeed?
+    private let desktopLockURL: URL
+    private var controlExclusionLease: DesktopControlLock?
+    private var controlExclusionID: UUID?
     private let source: CaptureSource
     private let surfaceIDs: Set<String>
     private let fps: Int
@@ -51,10 +54,10 @@ public final class RecordingSession: @unchecked Sendable {
     private var healthWasAvailable: [String: Bool] = [:]
     private var finalized = false
 
-    public init(directory: URL, manifest: RecordingManifest, source: CaptureSource, correction: CorrectionRecordingSeed? = nil,
+    public init(directory: URL, manifest: RecordingManifest, source: CaptureSource, correction: CorrectionRecordingSeed? = nil, desktopLockURL: URL = DesktopControlLock.standardURL,
                 onProgress: @escaping @Sendable (RecordingProgress) -> Void,
                 onFault: @escaping @Sendable (String) -> Void) throws {
-        self.correction = correction
+        self.correction = correction; self.desktopLockURL = desktopLockURL
         self.source = source; fps = manifest.environment.captureFPS; showsCursor = manifest.environment.showsCursor
         let bindings = try source.captureBindings()
         surfaceIDs = Set(bindings.map(\.id))
@@ -70,7 +73,9 @@ public final class RecordingSession: @unchecked Sendable {
         // Normal ownership always awaits stop(). If a coordinator abandons a
         // session, still release the native producers and leave the append-only
         // package recoverable instead of keeping a hidden capture alive.
-        Task { [capture, input] in
+        let retainedExclusion = controlExclusionLease
+        Task { [capture, input, retainedExclusion] in
+            defer { withExtendedLifetime(retainedExclusion) {} }
             async let captureStop: Void = capture.stop()
             async let inputStop: Void = input.stop()
             _ = await (captureStop, inputStop)
@@ -85,6 +90,16 @@ public final class RecordingSession: @unchecked Sendable {
         defer { startingCompletion.finish() }
         do {
             try checkDisk()
+            let exclusion = try DesktopControlLock(url: desktopLockURL)
+            let proof = try lock.withLock {
+                guard acceptingFrames, finishTask == nil else { throw CancellationError() }
+                controlExclusionLease = exclusion
+                let proof = RecordingControlExclusion(recordingID: writer.snapshot.id, startedNanos: MonotonicClock.now)
+                controlExclusionID = proof.ownershipID
+                return proof
+            }
+            try await Task.detached { [writer] in try writer.beginControlExclusion(proof) }.value
+            try requireStarting()
             if let correction {
                 let gate = try lock.withLock {
                     guard acceptingFrames, finishTask == nil else { throw CancellationError() }
@@ -130,6 +145,7 @@ public final class RecordingSession: @unchecked Sendable {
                 async let captureStop: Void = capture.stop()
                 async let inputStop: Void = input.stop()
                 _ = await (captureStop, inputStop)
+                let producersJoined = MonotonicClock.now
                 lock.withLock { acceptingEvents = false }
                 await withCheckedContinuation { continuation in
                     DispatchQueue.global(qos: .userInitiated).async { [compressors] in
@@ -142,10 +158,17 @@ public final class RecordingSession: @unchecked Sendable {
                         timer?.cancel(); timer = nil
                         let (end, failure) = lock.withLock { (stopAt ?? MonotonicClock.now, firstFailure) }
                         do {
+                            if let owner = lock.withLock({ controlExclusionID }), writer.snapshot.controlExclusion != nil {
+                                try writer.sealControlExclusion(ownershipID: owner, through: end, producersJoined: producersJoined)
+                            }
                             let manifest = try writer.finish(at: end, status: failure == nil ? .complete : .interrupted, issue: failure)
                             finalized = true
+                            lock.withLock { controlExclusionLease = nil }
                             continuation.resume(returning: manifest)
-                        } catch { continuation.resume(throwing: error) }
+                        } catch {
+                            lock.withLock { controlExclusionLease = nil }
+                            continuation.resume(throwing: error)
+                        }
                     }
                 }
             }

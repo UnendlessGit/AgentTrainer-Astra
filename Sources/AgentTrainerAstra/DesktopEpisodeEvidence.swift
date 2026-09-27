@@ -20,6 +20,7 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
     private let program: RewardProgram, scope: ControlScope
     private let limits: Limits
     private let deferManualFeedback: Bool
+    private let collectionVersion: Int
     private let onTerminal: @Sendable (DesktopTerminalEvidence) -> Void
     private let onFault: @Sendable (DesktopEpisodeFault) -> Void
     private let owner = DispatchQueue(label: "astra.desktop.episodeEvidence", qos: .userInitiated)
@@ -72,9 +73,10 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
     }
     private init(identity: DesktopEvidenceIdentity, episodeID: UUID, generationID: UUID, policyID: UUID, policySignature: String,
                  collector: CollectorSession, sequence: DesktopEnvironmentSequence, program: RewardProgram, scope: ControlScope,
-                 limits: Limits, deferManualFeedback: Bool, onTerminal: @escaping @Sendable (DesktopTerminalEvidence) -> Void,
+                 limits: Limits, deferManualFeedback: Bool, collectionVersion: Int, onTerminal: @escaping @Sendable (DesktopTerminalEvidence) -> Void,
                  onFault: @escaping @Sendable (DesktopEpisodeFault) -> Void) throws {
         guard collector.runID == identity.runID, sequence.identity == identity, policySignature.utf8.count == 64,
+              [1, 2].contains(collectionVersion),
               (2 * AstraVersion.maximumMessageBytes...1024 * 1024 * 1024).contains(limits.maximumBytes),
               (1...128).contains(limits.maximumItems), (1...65_536).contains(limits.maximumEpisodeDecisions),
               limits.maximumPendingSeconds.isFinite, (0.01...3600).contains(limits.maximumPendingSeconds) else {
@@ -83,19 +85,19 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
         self.identity = identity; self.episodeID = episodeID; self.generationID = generationID
         self.policyID = policyID; self.policySignature = policySignature; self.collector = collector; self.sequence = sequence
         self.program = try program.validated(); self.scope = try scope.validated(); self.limits = limits
-        self.deferManualFeedback = deferManualFeedback
+        self.deferManualFeedback = deferManualFeedback; self.collectionVersion = collectionVersion
         self.onTerminal = onTerminal; self.onFault = onFault
     }
     static func prepare(identity: DesktopEvidenceIdentity, episodeID: UUID, generationID: UUID = UUID(),
                         policyID: UUID, policySignature: String, collector: CollectorSession, sequence: DesktopEnvironmentSequence,
                         program: RewardProgram, scope: ControlScope, assetRoot: URL, warmupFrames: [RewardImageFrame],
-                        limits: Limits = Limits(), deferManualFeedback: Bool = false, detector: @escaping RewardAnalysisQueue.Detector = {
+                        limits: Limits = Limits(), deferManualFeedback: Bool = false, collectionVersion: Int = 1, detector: @escaping RewardAnalysisQueue.Detector = {
                             try VisualRewardDetector.read(signals: $0, frames: $1, episodeID: $2, templates: $3)
                         }, onTerminal: @escaping @Sendable (DesktopTerminalEvidence) -> Void,
                         onFault: @escaping @Sendable (DesktopEpisodeFault) -> Void) async throws -> DesktopEpisodeEvidence {
         let result = try Self(identity: identity, episodeID: episodeID, generationID: generationID, policyID: policyID,
             policySignature: policySignature, collector: collector, sequence: sequence, program: program, scope: scope,
-            limits: limits, deferManualFeedback: deferManualFeedback, onTerminal: onTerminal, onFault: onFault)
+            limits: limits, deferManualFeedback: deferManualFeedback, collectionVersion: collectionVersion, onTerminal: onTerminal, onFault: onFault)
         result.analysis = try await RewardAnalysisQueue.prepare(program: program, scope: scope, episodeID: episodeID,
             assetRoot: assetRoot, warmupFrames: warmupFrames, detector: detector,
             onResult: { [weak result] value in
@@ -226,7 +228,7 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
         case .event(.prepared(let run, let actor)):
             guard run == identity.runID, actor.fields?["checkpointID"]?.uuid == policyID,
                   actor.fields?["policySignature"]?.text == policySignature,
-                  actor.fields?["collectionVersion"]?.int == 1, actor.fields?["deterministic"] == .bool(false),
+                  actor.fields?["collectionVersion"]?.int == collectionVersion, actor.fields?["deterministic"] == .bool(false),
                   produced == 0, actorNextSequence == nil else { throw AstraError("desktop.actorPreparation", "The prepared actor differs from this episode's categorical policy.") }
             actorNextSequence = try actor.required("nextPacketSequence").decode(UInt64.self)
         case .event(.observation(let observed)):
@@ -240,6 +242,15 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
             }
             let id = try observed.actorInput.required("observationID").decode(UUID.self)
             let cutoff = try observed.actorInput.required("cutoffNanos").decode(UInt64.self)
+            if collectionVersion == 2 {
+                let feedback = try observed.actorInput.required("controlFeedback").decode(ControlFeedbackSnapshot.self)
+                guard feedback.runID == identity.runID, feedback.geometryRevision == scope.geometryRevision,
+                      feedback.cutoffNanos == cutoff, feedback.coverageNanos == cutoff, feedback.unavailableReason == nil else {
+                    throw AstraError("desktop.controlFeedback", "The actor observation needs complete original queued-control evidence.")
+                }
+            } else if observed.actorInput.fields?["controlFeedback"] != nil {
+                throw AstraError("desktop.controlFeedback", "This policy does not accept queued-control observations.")
+            }
             guard cutoff >= ready!.nanos, lastObservationCutoff.map({ cutoff > $0 }) ?? true else {
                 throw AstraError("desktop.observationOrder", "Actor observation cutoffs must advance from actual physical readiness.")
             }
@@ -257,7 +268,7 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
                   try record.required("episodeID").decode(UUID.self) == episodeID,
                   try record.required("checkpointID").decode(UUID.self) == policyID,
                   try record.required("policySignature").decode(String.self) == policySignature,
-                  record.fields?["schemaVersion"]?.int == 1 else { throw AstraError("desktop.actorIdentity", "The actor result belongs to another episode, observation or policy.") }
+                  record.fields?["schemaVersion"]?.int == collectionVersion else { throw AstraError("desktop.actorIdentity", "The actor result belongs to another episode, observation or policy.") }
             let cutoff = try record.required("cutoffNanos").decode(UInt64.self)
             var value = try entry(id)
             guard value.response == nil, !value.actorOffered, value.cutoff == nil || value.cutoff == cutoff else {
@@ -341,6 +352,14 @@ final class DesktopEpisodeEvidence: @unchecked Sendable {
                   try record.required("geometryRevision").decode(UInt64.self) == scope.geometryRevision,
                   packet.geometryRevision == scope.geometryRevision else {
                 throw AstraError("desktop.actorSequence", "Actor sampling, packet counters or retained frames are inconsistent.")
+            }
+            if collectionVersion == 2 {
+                let original = try observation.actorInput.required("controlFeedback").decode(ControlFeedbackSnapshot.self)
+                guard try record.required("controlFeedback").decode(ControlFeedbackSnapshot.self) == original else {
+                    throw AstraError("desktop.controlFeedback", "The actor changed its original queued-control observation.")
+                }
+            } else if record.fields?["controlFeedback"] != nil {
+                throw AstraError("desktop.controlFeedback", "Legacy actor results cannot introduce queued-control evidence.")
             }
             let before = try record.required("previousStateID").decode(UUID.self)
             let after = try record.required("nextStateID").decode(UUID.self)

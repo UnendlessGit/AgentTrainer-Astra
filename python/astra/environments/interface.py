@@ -172,6 +172,8 @@ class EnvironmentObservation:
     frames: tuple[SurfaceObservation, ...]
     control_state: dict
     control_coverage_nanos: int | None = None
+    control_feedback: dict | None = None
+    observation_schema_version: int = 1
 
     def validate(self, spec: EnvironmentSpec):
         identifier(self.id); identifier(self.episode_id); integer(self.cutoff_nanos); integer(self.geometry_revision)
@@ -185,6 +187,15 @@ class EnvironmentObservation:
             raise EnvironmentError('Observation exceeds its declared byte capacity')
         control_observation(self.control_state,self.cutoff_nanos,self.control_coverage_nanos,
                             maximum_age_ms=spec.maximum_frame_age_ms)
+        if type(self.observation_schema_version) is not int or self.observation_schema_version not in (1, 2):
+            raise EnvironmentError('Unsupported observation schema')
+        if self.observation_schema_version == 1:
+            if self.control_feedback is not None:
+                raise EnvironmentError('Legacy observations cannot contain queued-control evidence')
+        else:
+            from astra.control_feedback import validate_control_feedback
+            validate_control_feedback(self.control_feedback, cutoff_nanos=self.cutoff_nanos,
+                geometry_revision=self.geometry_revision, surfaces=[frame.metadata['surface'] for frame in self.frames], require_available=True)
         return self
 
 

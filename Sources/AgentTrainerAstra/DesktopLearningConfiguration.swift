@@ -10,6 +10,7 @@ struct DesktopLearningOptions: Sendable {
     var periodMS = 100
     var leadMS = 100
     var packetCapacity = 16
+    var queuedActionMemory = false
     var actions = ActionCapabilities(mouseButtons: [0], absolutePointer: true)
     var contextIDs: [Int] = []
     var training = ReinforcementSettings()
@@ -34,8 +35,10 @@ struct DesktopLearningOptions: Sendable {
         return self
     }
     var model: JSONValue {
-        contextVocabulary.applying(to: .object(["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
-                 "packet_capacity": .integer(Int64(packetCapacity))]))
+        var fields: [String: JSONValue] = ["period_ms": .integer(Int64(periodMS)), "lead_ms": .integer(Int64(leadMS)),
+            "packet_capacity": .integer(Int64(packetCapacity))]
+        if queuedActionMemory { fields["schema_version"] = .integer(3) }
+        return contextVocabulary.applying(to: .object(fields))
     }
 }
 

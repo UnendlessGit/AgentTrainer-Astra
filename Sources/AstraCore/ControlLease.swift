@@ -38,10 +38,12 @@ public struct ArmRequest: Codable, Hashable, Sendable {
     /// A persistent collecting actor retains its packet counter across physical
     /// episodes. Omission preserves the zero-based standalone/reset protocol.
     public var initialPacketSequence: UInt64?
+    public var controlFeedbackVersion: Int?
     public init(runID: UUID, scope: ControlScope, capabilities: ActionCapabilities, packetCapacity: Int = 16,
-                recovery: ControlRecoveryDescriptor? = nil, initialPacketSequence: UInt64? = nil) {
+                recovery: ControlRecoveryDescriptor? = nil, initialPacketSequence: UInt64? = nil, controlFeedbackVersion: Int? = nil) {
         self.runID = runID; self.scope = scope; self.capabilities = capabilities; self.packetCapacity = packetCapacity; self.recovery = recovery
         self.initialPacketSequence = initialPacketSequence
+        self.controlFeedbackVersion = controlFeedbackVersion
     }
 }
 
@@ -62,6 +64,7 @@ public struct ControlLease: Sendable {
         _ = try request.scope.validated()
         _ = try request.capabilities.validated()
         guard !request.capabilities.isEmpty, [16, 32, 64].contains(request.packetCapacity),
+              request.controlFeedbackVersion == nil || request.controlFeedbackVersion == ControlFeedbackLimits.version,
               (request.initialPacketSequence ?? 0) < UInt64.max,
               !now.addingReportingOverflow(Self.durationNanos).overflow else {
             throw AstraError("control.configuration", "Select valid action capabilities before starting control.")

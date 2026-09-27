@@ -57,7 +57,8 @@ def _manifest(destination,references,manifests):
     return {'schemaVersion':3,'id':uuid_key(Path(destination).name),'status':'sealed','binding':first['binding'],
         'actorProgress':last['actorProgress'],'controlClosureKnown':True,'artifacts':{},'actorSampling':first['actorSampling'],
         'rolloutID':first['behaviorBatchID'],'decisions':decisions,'collectionSeconds':sum(row['collectionSeconds'] for row in manifests),
-        'reason':None,'behaviorBatchID':first['behaviorBatchID'],'fragments':references}
+        'reason':None,'behaviorBatchID':first['behaviorBatchID'],'fragments':references,
+        **({'observationSchemaVersion':2} if first.get('observationSchemaVersion') == 2 else {})}
 
 
 def combine(references,destination,cancelled=lambda:False):
@@ -76,7 +77,7 @@ def combine(references,destination,cancelled=lambda:False):
 
 
 def inspect_fragment_batch(path,manifest):
-    fields(manifest,BASE_FIELDS)
+    fields(manifest,BASE_FIELDS,('observationSchemaVersion',))
     expected=_manifest(path,manifest['fragments'],_fragments(manifest['fragments']))
     if manifest!=expected:raise EnvironmentError('Reviewed batch manifest differs from its authenticated original fragments')
     return manifest

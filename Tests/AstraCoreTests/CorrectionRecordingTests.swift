@@ -2,6 +2,34 @@ import Foundation
 import Testing
 @testable import AstraCore
 
+@Test func queuedCorrectionRetainsAnAuthenticatedMidEpochSuffix() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    let run = UUID(), cutoff: UInt64 = 1_000_000_000
+    let surface = SurfaceDescriptor(id: "fixture", globalBounds: .init(x: 0, y: 0, width: 16, height: 16), pixelWidth: 16, pixelHeight: 16)
+    let pixels = Data(repeating: 18, count: 1024)
+    let frame = FrameMetadata(eventNanos: cutoff, observedNanos: cutoff, surface: surface, byteCount: pixels.count, codec: "raw")
+    let packet = ActionPacket(runID: run, sequence: 10, observationID: UUID(), geometryRevision: 0,
+        executeAtNanos: cutoff + 100_000_000, durationMs: 100, commands: [])
+    let feedback = ControlFeedbackSnapshot(controlEpochID: UUID(), runID: run, geometryRevision: 0, cutoffNanos: cutoff,
+        unavailableReason: nil, acknowledgedThrough: 2, throughSequence: 2, changes: [],
+        packets: [.init(packet: packet, admissionSequence: 2, admittedNanos: cutoff - 50_000_000)])
+    var controls = ControlState(); controls.valid = true; controls.observedNanos = cutoff
+    let input: JSONValue = .object(["observationID": .string(UUID().uuidString), "cutoffNanos": .unsigned(cutoff),
+        "geometryRevision": .unsigned(0), "contextIDs": .array([]), "controlCoverageNanos": .unsigned(cutoff),
+        "episodeID": .string(UUID().uuidString), "previousStateID": .string(UUID().uuidString),
+        "controlState": try .encode(controls), "executedEvents": .array([]), "intervalCovered": .bool(true),
+        "controlFeedback": try .encode(feedback)])
+    let seed = CorrectionRecordingSeed(sourceRunID: run, sourceCheckpointID: UUID(), sourcePolicySignature: String(repeating: "a", count: 64),
+        contextIDs: [], requestedAtNanos: cutoff + 10_000_000, controlJoinedAtNanos: cutoff + 20_000_000,
+        observations: [.init(actorInput: input, frames: [.init(metadata: frame, pixels: pixels, coverage: nil)])])
+    let reference = try CorrectionPrelude.write(seed, supervisionStartNanos: cutoff + 30_000_000, in: directory)
+    let loaded = try CorrectionPrelude.load(in: directory, reference: reference)
+    #expect(try loaded.observations[0].actorInput.required("controlFeedback").decode(ControlFeedbackSnapshot.self) == feedback)
+    #expect(try loaded.pixels(for: loaded.observations[0].frames[0], in: directory) == pixels)
+}
+
 @Test func correctionArchiveSeparatesOriginalAgentHistoryFromExpertRecording() throws {
     let exported = ProcessInfo.processInfo.environment["ASTRA_CORRECTION_FIXTURE_ROOT"]
     let root = exported.map { URL(fileURLWithPath: $0) } ?? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

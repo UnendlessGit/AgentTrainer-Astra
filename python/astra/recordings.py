@@ -235,6 +235,18 @@ class RecordingReader:
                     _integer(manifest[field])
             if "surfaceIDs" in manifest:
                 validate_surface_ids(manifest["surfaceIDs"])
+            if manifest.get("controlExclusion") is not None:
+                from .control_feedback import validate_control_exclusion, ControlFeedbackError
+                try:
+                    validate_control_exclusion(manifest["controlExclusion"], recording_id=manifest["id"])
+                except ControlFeedbackError as error:
+                    raise RecordingError(str(error)) from error
+                if (manifest.get("firstObservedNanos") is not None and
+                        manifest["firstObservedNanos"] < manifest["controlExclusion"]["startedNanos"]):
+                    raise RecordingError("Recording frames precede their claimed control exclusion")
+                if (manifest["controlExclusion"].get("throughNanos") is not None and
+                        manifest["controlExclusion"]["throughNanos"] > manifest["stoppedNanos"]):
+                    raise RecordingError("Recording control exclusion exceeds its sealed interval")
             if "correction" in manifest:
                 from .corrections import read_prelude
                 self.correction = read_prelude(self.directory, manifest["correction"])

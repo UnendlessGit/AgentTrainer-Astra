@@ -7,14 +7,17 @@ public struct NativeControlConfiguration: Sendable {
     public let capabilities: ActionCapabilities
     public let packetCapacity: Int
     public let initialPacketSequence: UInt64
+    public let controlFeedbackVersion: Int?
     public let recoveryDirectory: URL
     public init(runID: UUID, scope: ControlScope, capabilities: ActionCapabilities, packetCapacity: Int = 16,
-                initialPacketSequence: UInt64 = 0, recoveryDirectory: URL) throws {
+                initialPacketSequence: UInt64 = 0, controlFeedbackVersion: Int? = nil, recoveryDirectory: URL) throws {
         self.runID = runID; self.scope = try scope.validated(); self.capabilities = try capabilities.validated()
-        guard !capabilities.isEmpty, [16, 32, 64].contains(packetCapacity), initialPacketSequence < UInt64.max else {
+        guard !capabilities.isEmpty, [16, 32, 64].contains(packetCapacity), initialPacketSequence < UInt64.max,
+              controlFeedbackVersion == nil || controlFeedbackVersion == ControlFeedbackLimits.version else {
             throw AstraError("control.configuration", "A control session needs supported actions, packet capacity and sequence origin.")
         }
         self.packetCapacity = packetCapacity; self.initialPacketSequence = initialPacketSequence; self.recoveryDirectory = recoveryDirectory
+        self.controlFeedbackVersion = controlFeedbackVersion
     }
 }
 
@@ -148,6 +151,11 @@ public final class NativeControlSession: @unchecked Sendable {
     private var ownsGate = false, armAttempted = false, armed = false, stopped = false, closing = false, callbacksOpen = true
     private var issue: AstraError?
     private var completedExecutionCount = 0
+    private var feedbackEpochID: UUID?
+    private struct FeedbackOriginal { let packet: ActionPacket; var terminalSequence: UInt64? }
+    private var feedbackOriginals: [UUID: FeedbackOriginal] = [:]
+    private var feedbackObservationBusy = false
+    public var controlEpochID: UUID? { lock.withLock { feedbackEpochID } }
     public var executedPacketCount: Int { lock.withLock { completedExecutionCount } }
     private var nextSequence: UInt64
     private var startTask: Task<WireMessage, any Error>?
@@ -228,10 +236,16 @@ public final class NativeControlSession: @unchecked Sendable {
                 throw AstraError("control.handshake", "The helper does not support this protected control session or packet sequence origin.")
             }
             try requireOpen()
+            if let version = configuration.controlFeedbackVersion {
+                guard case .array(let versions) = hello.payload.fields?["controlFeedbackVersions"], versions.contains(where: { $0.int == version }) else {
+                    throw AstraError("control.feedbackHandshake", "The helper does not support the requested queued-control feedback.")
+                }
+            }
             lock.withLock { armAttempted = true }
             let request = ArmRequest(runID: configuration.runID, scope: configuration.scope, capabilities: configuration.capabilities,
                 packetCapacity: configuration.packetCapacity, recovery: lock.withLock { recovery?.descriptor },
-                initialPacketSequence: configuration.initialPacketSequence == 0 ? nil : configuration.initialPacketSequence)
+                initialPacketSequence: configuration.initialPacketSequence == 0 ? nil : configuration.initialPacketSequence,
+                controlFeedbackVersion: configuration.controlFeedbackVersion)
             let reply = try await runtime.request("arm", .encode(request), configuration.runID, .seconds(20))
             guard reply.runID == configuration.runID else { throw AstraError("control.armIdentity", "The helper replied to arm for a different run.") }
             if reply.kind == "error" {
@@ -246,6 +260,12 @@ public final class NativeControlSession: @unchecked Sendable {
                 guard reply.payload.fields?["recoveryLedgerID"]?.uuid == recovery.descriptor.ledgerID,
                       reply.payload.fields?["guardianPID"]?.uint64 == UInt64(value.guardianPID), value.guardianReady,
                       value.everArmed, value.phase == .armed, value.executorPID > 0 else { throw AstraError("control.recoveryHandshake", "The helper did not establish independent cleanup protection.") }
+            }
+            if let version = configuration.controlFeedbackVersion {
+                guard reply.payload.fields?["controlFeedbackVersion"]?.int == version, let epoch = reply.payload.fields?["controlEpochID"]?.uuid else {
+                    throw AstraError("control.feedbackHandshake", "The helper did not establish the requested queued-control epoch.")
+                }
+                lock.withLock { feedbackEpochID = epoch }
             }
             lock.withLock { armed = true }
             if lock.withLock({ stopped || closing }) {
@@ -289,6 +309,7 @@ public final class NativeControlSession: @unchecked Sendable {
     }
     private func submit(_ packet: ActionPacket, mode: SubmissionMode) async throws -> NativeControlSubmission {
         _ = try packet.validated(capabilities: configuration.capabilities, surfaces: configuration.scope.surfaces, capacity: configuration.packetCapacity, expectedGeometryRevision: configuration.scope.geometryRevision)
+        let feedbackReservation = try configuration.controlFeedbackVersion.map { _ in try ControlFeedbackLimits.reservation(for: packet) }
         let promise = NativeReceiptPromise()
         let task = try lock.withLock { () throws -> Task<NativeControlSubmission, any Error> in
             let late = mode == .lateOnly || (mode == .preservingStop && stopped)
@@ -298,7 +319,16 @@ public final class NativeControlSession: @unchecked Sendable {
                   late ? stopped : (armed && !stopped) else {
                 throw AstraError("control.admission", "The packet is stale, duplicated, out of order or belongs to closed control admission.")
             }
-            if mode != .lateOnly { guard nextSequence < UInt64.max else { throw AstraError("control.sequence", "The control sequence is exhausted.") }; nextSequence += 1 }
+            if mode != .lateOnly, nextSequence == UInt64.max { throw AstraError("control.sequence", "The control sequence is exhausted.") }
+            if feedbackReservation != nil, !late {
+                // Include all existing in-flight reservations, so helper
+                // backpressure can produce its genuine rejection receipt.
+                guard feedbackOriginals.count < ControlFeedbackLimits.maximumPackets + 32, feedbackOriginals[packet.id] == nil else {
+                    throw AstraError("control.feedbackCapacity", "Submitted packet identity history requires acknowledgement before another packet can be reserved.")
+                }
+                feedbackOriginals[packet.id] = .init(packet: packet)
+            }
+            if mode != .lateOnly { nextSequence += 1 }
             pending[packet.id] = Pending(packet: packet, promise: promise)
             recent.append(packet.id); recentSet.insert(packet.id)
             if recent.count > 2048 { recentSet.remove(recent.removeFirst()) }
@@ -330,15 +360,69 @@ public final class NativeControlSession: @unchecked Sendable {
             return receipt
         } onCancel: { self.requestStop() }
     }
-    public func observation(afterSequence: UInt64? = nil) async throws -> ControlObservation {
+    public func observation(afterSequence: UInt64? = nil, afterFeedbackSequence: UInt64? = nil) async throws -> ControlObservation {
         try checkHealth()
-        let payload: JSONValue = .object(afterSequence.map { ["afterSequence": .unsigned($0)] } ?? [:])
+        if configuration.controlFeedbackVersion != nil {
+            try lock.withLock {
+                guard !feedbackObservationBusy else { throw AstraError("control.feedbackBusy", "Queued-control observations must be consumed in order.") }
+                feedbackObservationBusy = true
+            }
+        }
+        defer { if configuration.controlFeedbackVersion != nil { lock.withLock { feedbackObservationBusy = false } } }
+        var fields: [String: JSONValue] = afterSequence.map { ["afterSequence": .unsigned($0)] } ?? [:]
+        var cursor: ControlFeedbackCursor?
+        if configuration.controlFeedbackVersion != nil {
+            guard let epoch = lock.withLock({ feedbackEpochID }) else { throw AstraError("control.feedbackHandshake", "Queued-control feedback has not been armed.") }
+            cursor = .init(controlEpochID: epoch, afterSequence: afterFeedbackSequence)
+            fields["feedbackCursor"] = try .encode(cursor!)
+        } else if afterFeedbackSequence != nil { throw AstraError("control.feedbackCursor", "Queued-control feedback is not enabled for this session.") }
+        let payload: JSONValue = .object(fields)
         guard let runtime = lock.withLock({ runtime }) else { throw AstraError("control.closed", "The control helper is unavailable.") }
         let run = configuration.runID
         let request = Task { try await runtime.request("observation", payload, run, .seconds(2)) }
         let reply = try await withTaskCancellationHandler { try await request.value } onCancel: { self.requestStop() }
+        if configuration.controlFeedbackVersion != nil, reply.kind == "error", reply.runID == run {
+            let error = AstraError(reply.payload.fields?["code"]?.text ?? "control.feedbackEvidence",
+                                   reply.payload.fields?["message"]?.text ?? "Queued-control observation was rejected.")
+            fail(error); throw error
+        }
         guard reply.kind == "ack", reply.runID == run else { throw AstraError("control.observation", "The helper rejected input observation.") }
-        return try reply.payload.decode(ControlObservation.self)
+        do {
+            let observation = try reply.payload.decode(ControlObservation.self)
+            if let cursor {
+                guard let feedback = observation.controlFeedback else { throw AstraError("control.feedbackEvidence", "The helper omitted negotiated queued-control evidence.") }
+                try feedback.validate(cursor: cursor, runID: run, geometryRevision: configuration.scope.geometryRevision, cutoffNanos: observation.cutoffNanos)
+                if feedback.unavailableReason == nil {
+                    try observation.validateControlCoverage()
+                    guard observation.controlCoverageNanos == feedback.coverageNanos else { throw AstraError("control.feedbackEvidence", "Queued-control evidence does not share actual control coverage.") }
+                }
+                for row in feedback.packets {
+                    _ = try row.packet.validated(capabilities: configuration.capabilities, surfaces: configuration.scope.surfaces,
+                                                 capacity: configuration.packetCapacity, expectedGeometryRevision: configuration.scope.geometryRevision)
+                }
+                try lock.withLock {
+                    for row in feedback.packets {
+                        guard feedbackOriginals[row.packet.id]?.packet == row.packet else {
+                            throw AstraError("control.feedbackIdentity", "Queued-control evidence changed an original submitted packet.")
+                        }
+                    }
+                    // Authenticate originals only; never reconstruct progress from
+                    // host receipts. Retire after the helper acknowledges the real
+                    // previously observed terminal sequence, not on receipt arrival.
+                    if let acknowledged = feedback.acknowledgedThrough {
+                        let retired = feedbackOriginals.filter { $0.value.terminalSequence.map { $0 <= acknowledged } ?? false }.map(\.key)
+                        for id in retired { feedbackOriginals.removeValue(forKey: id) }
+                    }
+                    for row in feedback.packets {
+                        if let terminal = row.terminal { feedbackOriginals[row.packet.id]?.terminalSequence = terminal.sequence }
+                    }
+                }
+            } else if observation.controlFeedback != nil { throw AstraError("control.feedbackEvidence", "The helper supplied unrequested queued-control evidence.") }
+            return observation
+        } catch {
+            if configuration.controlFeedbackVersion != nil { fail((error as? AstraError) ?? .init("control.feedbackEvidence", error.localizedDescription)) }
+            throw error
+        }
     }
     public func requestStop() {
         let schedule = lock.withLock { stopped = true; return disarmTask == nil && !closing }
@@ -387,7 +471,11 @@ public final class NativeControlSession: @unchecked Sendable {
         let runtime = lock.withLock { self.runtime }
         let status = await runtime?.shutdown()
         let proof = await Self.recoveryProof(lock.withLock { recovery }, attempted: lock.withLock { armAttempted }, status: status)
-        let leftovers = lock.withLock { callbacksOpen = false; let values = Array(pending.values); pending = [:]; self.runtime = nil; return values }
+        let leftovers = lock.withLock {
+            callbacksOpen = false; let values = Array(pending.values); pending = [:]; self.runtime = nil
+            feedbackOriginals = [:]
+            return values
+        }
         for value in leftovers { value.timer?.cancel(); value.promise.finish(.failure(AstraError("control.missingReceipt", "The joined helper did not finish this packet's receipt."))) }
         let failure = lock.withLock { issue }
         let finalIssue = proof.0 ? failure : AstraError("control.cleanupUnconfirmed", [failure?.message,

@@ -106,6 +106,10 @@ class ActorRecord:
         if coverage is not None:integer(coverage)
         if type(snapshot) is not dict or coverage!=snapshot.get('controlCoverageNanos'):
             raise EnvironmentError('Actor and snapshot control coverage disagree before acquisition')
+        expected_schema = 2 if collection.get('schemaVersion') == 2 else 1
+        if (snapshot.get('observationSchemaVersion', 1) != expected_schema or
+                collection.get('controlFeedback') != snapshot.get('controlFeedback')):
+            raise EnvironmentError('Actor and snapshot queued-control evidence disagree before acquisition')
         decoded,events=SnapshotDecoder(spec,resolve_frame,on_consumed).decode(snapshot,episode=collection['episodeID'],
             expected_cutoff=collection.get('cutoffNanos'))
         return cls(copy.deepcopy(response['packet']),copy.deepcopy(collection),decoded,events)
@@ -115,14 +119,15 @@ class ActorRecord:
         images = tuple(SurfaceObservation(owned_bgra(frame.pixels), copy.deepcopy(frame.metadata),
                                           frame.coverage_nanos, frame.coverage_kind) for frame in observation.frames)
         return ActorRecord(copy.deepcopy(self.packet), copy.deepcopy(self.collection),
-            replace(observation, frames=images, control_state=copy.deepcopy(observation.control_state)),
+            replace(observation, frames=images, control_state=copy.deepcopy(observation.control_state),
+                    control_feedback=copy.deepcopy(observation.control_feedback)),
             tuple(copy.deepcopy(self.events)))
 
     def byte_count(self, limit):
         pixels=sum(frame.pixels.nbytes for frame in self.observation.frames)
         if pixels>=limit: raise EnvironmentError('One actor record exceeds ingress capacity')
         return pixels+_bounded_size([self.packet,self.collection,self.events,
-            self.observation.control_state,[frame.metadata for frame in self.observation.frames]],limit-pixels)
+            self.observation.control_state, self.observation.control_feedback, [frame.metadata for frame in self.observation.frames]],limit-pixels)
 
 
 @dataclass
@@ -405,9 +410,12 @@ class AsyncRolloutAssembler:
         required = ('schemaVersion','checkpointID','policySignature','modelSignature','episodeID','episodeStep',
             'observationID','cutoffNanos','geometryRevision','frameIDs','contextIDs','previousStateID','nextStateID',
             'recurrentReset','elapsedSeconds','stateBefore','packetFields','logProbability','value','sampler','environmentResets')
-        fields(value, required, ('controlCoverageNanos',))
+        observation_schema = 2 if self.model.schema_version == 3 else 1
+        fields(value, required + (('controlFeedback',) if observation_schema == 2 else ()), ('controlCoverageNanos',))
+        if observed.observation_schema_version != observation_schema:
+            raise EnvironmentError('Actor observation schema differs from its immutable policy')
         fields(packet, ('id','runID','sequence','observationID','geometryRevision','executeAtNanos','durationMs','commands'))
-        if integer(value['schemaVersion'],1,1) != 1 or not same_id(value['checkpointID'],self.policy_id) or value['policySignature'] != self.policy_signature or value['modelSignature'] != self.model.signature:
+        if integer(value['schemaVersion'],2,1) != observation_schema or not same_id(value['checkpointID'],self.policy_id) or value['policySignature'] != self.policy_signature or value['modelSignature'] != self.model.signature:
             raise EnvironmentError('Actor used a different policy or model configuration')
         episode_id = uuid_key(value['episodeID']); episode = self._episodes.get(episode_id)
         if episode is None: raise EnvironmentError('Actor decision has no confirmed episode readiness')
@@ -428,6 +436,14 @@ class AsyncRolloutAssembler:
             raise EnvironmentError('Actor snapshot clocks/geometry disagree')
         if type(value['frameIDs']) is not list or [uuid_key(item) for item in value['frameIDs']] != [uuid_key(frame.metadata['id']) for frame in observed.frames] or value['contextIDs'] != list(self.context_ids):
             raise EnvironmentError('Actor inputs differ from the retained source observation')
+        if observation_schema == 2:
+            from astra.control_feedback import validate_control_feedback, validate_feedback_continuation
+            if value['controlFeedback'] != observed.control_feedback:
+                raise EnvironmentError('Actor and retained queued-control inputs disagree')
+            validate_control_feedback(observed.control_feedback, cutoff_nanos=cutoff, geometry_revision=observed.geometry_revision,
+                run_id=self.run_id, surfaces=[frame.metadata['surface'] for frame in observed.frames], require_available=True)
+            previous_feedback = None if step == 0 else json.loads(episode.rows[-1].record.control_feedback_json)
+            validate_feedback_continuation(previous_feedback, observed.control_feedback)
         maximum = self.spec.period_ms * 1000000 + self.limits.maximum_cadence_delay_nanos
         if step == 0:
             if cutoff < episode.ready_nanos or actor.events: raise EnvironmentError('Initial actor input precedes readiness or includes pre-control events')
@@ -503,7 +519,8 @@ class AsyncRolloutAssembler:
             record=ObservationRecord((),observed.id,episode_id,cutoff,observed.geometry_revision,
                 json.dumps(observed.control_state,separators=(',',':')).encode(),
                 json.dumps(actor.events,separators=(',',':')).encode(),elapsed,step==0,episode.last_input_nanos,
-                observed.control_coverage_nanos)
+                observed.control_coverage_nanos, None if observed.control_feedback is None else
+                json.dumps(observed.control_feedback, sort_keys=True, separators=(',', ':')).encode(), observed.observation_schema_version)
             self._spool.reserve_metadata(record.metadata_byte_count)
         else:
             record=ObservationRecord.capture(observed, events=actor.events, elapsed_seconds=elapsed, reset=step==0,
@@ -586,6 +603,14 @@ class AsyncRolloutAssembler:
         episode=self._episodes.get(episode_id); row=self._rows.get(packet_id)
         if episode is None or row is None or row.record.episode_id!=episode_id or not same_id(observed.episode_id,episode_id):
             raise EnvironmentError('Bootstrap does not belong to its preceding actor decision')
+        observation_schema = 2 if self.model.schema_version == 3 else 1
+        if observed.observation_schema_version != observation_schema:
+            raise EnvironmentError('Bootstrap observation schema differs from its original policy')
+        if observation_schema == 2:
+            from astra.control_feedback import validate_control_feedback, validate_feedback_continuation
+            validate_control_feedback(observed.control_feedback, cutoff_nanos=observed.cutoff_nanos, geometry_revision=observed.geometry_revision,
+                run_id=self.run_id, surfaces=[frame.metadata['surface'] for frame in observed.frames], require_available=True)
+            validate_feedback_continuation(json.loads(row.record.control_feedback_json), observed.control_feedback)
         if observed.cutoff_nanos<=row.record.cutoff_nanos: raise EnvironmentError('Bootstrap must follow its actor decision')
         if observed.cutoff_nanos-row.record.cutoff_nanos>self.spec.period_ms*1000000+self.limits.maximum_cadence_delay_nanos:
             raise EnvironmentError('Bootstrap interval exceeds the cadence delay bound')

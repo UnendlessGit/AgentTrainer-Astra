@@ -25,6 +25,7 @@ class PracticeDemonstrations:
         self.config = model
         self.environment_config = environment
         env = PracticeEnvironment(environment)
+        if model.schema_version == 3: env.enable_control_feedback()
         self.vocabulary = env.action_vocabulary
         self.seeds_by_split = seeds_by_split
         for split, seeds in seeds_by_split.items():
@@ -60,6 +61,7 @@ class PracticeDemonstrations:
         # normalized image of a thirty-second memory trial on the GPU. Seeking
         # runs virtual time without neural preparation before the requested cut.
         env = PracticeEnvironment(self.environment_config)
+        if self.config.schema_version == 3: env.enable_control_feedback()
         current = env.reset(seed=episode["seed"])
         previous_events = []
         last_input_nanos = None
@@ -71,7 +73,8 @@ class PracticeDemonstrations:
                 observation = make_observation([(current.pixels, current.metadata)], current.control_state,
                                                 cutoff_nanos=current.metadata["observedNanos"], elapsed_seconds=self.config.period_ms / 1000,
                                                 reset=step == 0, config=self.config, context_ids=(0,) * len(self.config.context_sizes), executed_events=previous_events,
-                                                last_input_nanos=last_input_nanos)
+                                                last_input_nanos=last_input_nanos,
+                                                **({"control_feedback": current.control_feedback} if self.config.schema_version == 3 else {}))
                 yield LearningSample(observation, (current.metadata["surface"],), commands, episode_id, step)
             transition = env.step(list(commands), episode_id=current.episode_id, provenance="oracle")
             current = transition.observation; previous_events = transition.raw_events

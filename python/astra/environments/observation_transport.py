@@ -52,7 +52,11 @@ class SnapshotDecoder:
         self._last_event_sequence=None
 
     def decode(self, value, *, episode, expected_cutoff=None):
-        fields(value, ('id', 'episodeID', 'cutoffNanos', 'geometryRevision', 'frames', 'controlState', 'events'), ('controlCoverageNanos',))
+        fields(value, ('id', 'episodeID', 'cutoffNanos', 'geometryRevision', 'frames', 'controlState', 'events'), ('controlCoverageNanos', 'observationSchemaVersion', 'controlFeedback'))
+        observation_schema = value.get('observationSchemaVersion', 1)
+        if type(observation_schema) is not int or observation_schema not in (1, 2) or (
+                observation_schema == 1 and ('controlFeedback' in value or 'observationSchemaVersion' in value)):
+            raise EnvironmentError('Queued-control observation requires its explicit new schema')
         obs_id = identifier(value['id'])
         cutoff = integer(value['cutoffNanos'])
         if expected_cutoff is not None and cutoff != expected_cutoff:
@@ -64,6 +68,10 @@ class SnapshotDecoder:
         # State authority and input causality are checked before any lease copy.
         control_coverage=value.get('controlCoverageNanos')
         control_observation(value['controlState'],cutoff,control_coverage,maximum_age_ms=self.spec.maximum_frame_age_ms)
+        feedback = value.get('controlFeedback')
+        if observation_schema == 2:
+            from astra.control_feedback import validate_control_feedback
+            validate_control_feedback(feedback, cutoff_nanos=cutoff, geometry_revision=value['geometryRevision'], require_available=True)
         last_event_sequence=self._last_event_sequence
         if type(value['events']) is not list or len(value['events']) > 4096:
             raise EnvironmentError('Executed-input history exceeds its bounded window')
@@ -105,7 +113,7 @@ class SnapshotDecoder:
             # surface fails. Control authority/history were checked above.
             self._on_consumed(obs_id, [acknowledgements[-1]])
         observation = EnvironmentObservation(obs_id, episode, cutoff, integer(value['geometryRevision']),
-            tuple(prepared), copy.deepcopy(value['controlState']),control_coverage).validate(self.spec)
+            tuple(prepared), copy.deepcopy(value['controlState']), control_coverage, copy.deepcopy(feedback), observation_schema).validate(self.spec)
         geometry = (observation.geometry_revision, tuple(json_geometry(frame.metadata['surface']) for frame in prepared))
         if self._geometry is not None and geometry != self._geometry:
             raise EnvironmentError('Surface roles or geometry changed without a confirmed reset')

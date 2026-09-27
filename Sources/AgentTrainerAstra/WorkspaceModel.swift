@@ -474,6 +474,16 @@ enum AgentSection: String, CaseIterable, Identifiable {
         try await refresh()
     }
 
+    func createQueuedActionCheckpoint(agent: AgentDocument, checkpoint: CheckpointDocument) async throws -> CheckpointDocument {
+        guard checkpointManagementUnavailableReason == nil, let learning else {
+            throw AstraError("checkpoint.busy", checkpointManagementUnavailableReason ?? "The workspace is still opening.")
+        }
+        saving = true; defer { saving = false }
+        let copy = try await learning.createQueuedActionCheckpoint(agent: agent, checkpoint: checkpoint)
+        try await refresh()
+        return copy
+    }
+
     func previewCheckpointCleanup(agentID: UUID, keepNewest: Int) async throws -> CheckpointRetentionPreview {
         guard let store, checkpointManagementUnavailableReason == nil else {
             throw AstraError("checkpoint.busy", checkpointManagementUnavailableReason ?? "The workspace is still opening.")

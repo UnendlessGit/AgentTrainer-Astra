@@ -32,7 +32,7 @@ from astra.model.config import ModelConfig
 from astra.model.policy import AgentPolicy
 from astra.protocol import Message
 
-JOB_OPERATIONS = ("feedback.inspect", "feedback.materialize", "feedback.combine", "checkpoint.inspect", "checkpoint.create", "dataset.prepare", "train.behavioral", "evaluate.behavioral", "evaluate.closedLoop", "train.reinforcement", "train.reinforcement.external", "checkpoint.externalBoundary")
+JOB_OPERATIONS = ("feedback.inspect", "feedback.materialize", "feedback.combine", "checkpoint.inspect", "checkpoint.create", "checkpoint.addQueuedControl", "dataset.prepare", "train.behavioral", "evaluate.behavioral", "evaluate.closedLoop", "train.reinforcement", "train.reinforcement.external", "checkpoint.externalBoundary")
 TERMINAL = {"completed", "cancelled", "failed"}
 
 
@@ -123,6 +123,10 @@ def validate_request(request: Message) -> dict:
         _path(value["checkpointPath"])
         from astra.closed_loop import validate_protocol
         validate_protocol(value["protocol"])
+    elif request.kind == "checkpoint.addQueuedControl":
+        _object(value, ("checkpointPath", "destination", "seed"), ("checkpointPath", "destination"))
+        _path(value["checkpointPath"]); _path(value["destination"], destination=True)
+        _integer(value.get("seed", 0))
     elif request.kind == "checkpoint.create":
         _object(value, ("destination", "model", "actions", "seed", "pretrainedPath"), ("destination", "model", "actions"))
         _path(value["destination"], destination=True)
@@ -414,6 +418,12 @@ class JobManager:
             loaded = load_checkpoint(Path(value["path"]))
             return {"manifest": loaded.manifest, "path": value["path"], "integrityVerified": True,
                     "parameterCount": loaded.policy.config.parameter_count}
+        if operation == "checkpoint.addQueuedControl":
+            from astra.checkpoints import add_queued_control
+            manifest = add_queued_control(Path(value["checkpointPath"]), Path(value["destination"]),
+                seed=value.get("seed", 0), cancelled=job.cancel.is_set)
+            return {"checkpointPath": value["destination"], "manifest": manifest, "checkpointPublished": True,
+                    "parameterCount": ModelConfig.from_dict(manifest["model"]).parameter_count}
         if operation == "checkpoint.create":
             mx.random.seed(value.get("seed", 0))
             model = ModelConfig.from_dict(value["model"])

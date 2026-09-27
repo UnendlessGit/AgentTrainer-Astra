@@ -83,6 +83,7 @@ public struct CorrectionPrelude: Codable, Sendable {
         }
         var previous: UInt64?, first: UInt64?, bytes = 0
         var roles: [String]?
+        var hasFeedback: Bool?, priorFeedback: ControlFeedbackSnapshot?
         var observationIDs = Set<UUID>()
         for observation in observations {
             let cutoff = try observation.actorInput.required("cutoffNanos").decode(UInt64.self)
@@ -97,6 +98,29 @@ public struct CorrectionPrelude: Codable, Sendable {
                 throw AstraError("correction.sources", "Correction history changed its ordered source roles.")
             }
             roles = ids; first = first ?? cutoff; previous = cutoff
+            let hasCurrentFeedback = observation.actorInput.fields?["controlFeedback"] != nil
+            guard hasFeedback == nil || hasFeedback == hasCurrentFeedback else {
+                throw AstraError("correction.controlFeedback", "Correction history changed its queued-control schema.")
+            }
+            hasFeedback = hasCurrentFeedback
+            if hasCurrentFeedback {
+                let feedback = try observation.actorInput.required("controlFeedback").decode(ControlFeedbackSnapshot.self)
+                let revision = try observation.actorInput.required("geometryRevision").decode(UInt64.self)
+                guard feedback.unavailableReason == nil, feedback.coverageNanos == cutoff,
+                      observation.actorInput.fields?["controlCoverageNanos"]?.uint64 == cutoff else {
+                    throw AstraError("correction.controlFeedback", "Correction history lacks complete original queued controls.")
+                }
+                try feedback.validate(cursor: .init(controlEpochID: priorFeedback?.controlEpochID ?? feedback.controlEpochID,
+                    afterSequence: priorFeedback == nil ? feedback.acknowledgedThrough : priorFeedback?.throughSequence),
+                    runID: sourceRunID, geometryRevision: revision, cutoffNanos: cutoff)
+                let capabilities = ActionCapabilities(keyCodes: Set(0...127), mouseButtons: Set(0...31),
+                    absolutePointer: true, relativePointer: true, scroll: true)
+                for row in feedback.packets {
+                    _ = try row.packet.validated(capabilities: capabilities, surfaces: observation.frames.map(\.block.metadata.surface),
+                        capacity: 64, expectedGeometryRevision: revision)
+                }
+                priorFeedback = feedback
+            }
             guard cutoff - first! <= maximumDurationNanos else { throw AstraError("correction.duration", "The correction history exceeds its time limit.") }
             for frame in observation.frames {
                 let metadata = try frame.block.metadata.validated()

@@ -256,6 +256,10 @@ final class CollectorSession: @unchecked Sendable {
                 "controlState": try observation.actorInput.required("controlState"),
                 "events": try observation.actorInput.required("executedEvents")]
             if let controlCoverage { snapshot["controlCoverageNanos"] = .unsigned(controlCoverage) }
+            if let feedback = fields["controlFeedback"] {
+                guard feedback != .null else { throw AstraError("collector.controlFeedback", "A collected queued-control observation must contain original evidence.") }
+                snapshot["observationSchemaVersion"] = .integer(2); snapshot["controlFeedback"] = feedback
+            }
             return ("collector.actor", .object(["sourceID": .string(source.uuidString.lowercased()), "response": response, "observation": .object(snapshot)]))
         }
     }
